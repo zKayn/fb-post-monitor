@@ -41,7 +41,7 @@ import requests
 from datetime import datetime, timezone
 
 # ========================== CONFIG ==========================
-USER_ACCESS_TOKEN = "EAAgnXcXSwJUBSbvFMzr1dtquLmkctMN2T07apqzXOc7Kitnbuf7gfuZBFk30RPvonLnHPIsLXMNxRUkqIMXiOafZB0BrYn8kAa2aZABTnxUSm0ynnQeEbplyBCHPYns6o1f9WL1QuPWPCXqND6UEqA15bFnZAbFZBES7kyfL5PlgfCI8dUfsYKQOSZAn5lVZAA3nSgmJqfXB1O9xFkl"
+USER_ACCESS_TOKEN = "EAAgnXcXSwJUBSZA7u2ySKgEB8UGVvSTwEQLNw8jL159ZCn8293Eb7CAa7nnZBu7SPV5N4aje6158kfnMAGZBo4tuzJdhqDEzFEYNz0Mt1ZBrjg2yphct70kyc3dDpmmE0PfkN6hAdxJtLD8HHUIdaZCOKOcRsjadqMh12WH9i7BgJqbooZBDn3GZCJ8fBGPjqtla3pjMfFz8ZBp3CLnIo"
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
