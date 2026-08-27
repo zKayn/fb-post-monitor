@@ -8,8 +8,8 @@ và gửi thông báo Telegram ngay khi 1 bài đạt đủ 1 TRONG CÁC điều
 
 ĐIỀU KIỆN THÔNG BÁO (OR — đạt 1 trong các điều kiện là báo ngay)
 ------------------------------------------------------------------
-  - >= 5000 views  VÀ  >= 20 comments
-  - >= 3500 views  VÀ  >= 100 comments
+  - >= 4500 views  VÀ  >= 20 comments
+  - >= 3000 views  VÀ  >= 100 comments
   - Comments > 100 (bất kể views bao nhiêu)
 Chỉnh sửa trong phần THRESHOLD_RULES / COMMENT_ONLY_THRESHOLD bên dưới.
 
@@ -46,7 +46,7 @@ import os
 import re
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ========================== CONFIG ==========================
 USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSZA7u2ySKgEB8UGVvSTwEQLNw8jL159ZCn8293Eb7CAa7nnZBu7SPV5N4aje6158kfnMAGZBo4tuzJdhqDEzFEYNz0Mt1ZBrjg2yphct70kyc3dDpmmE0PfkN6hAdxJtLD8HHUIdaZCOKOcRsjadqMh12WH9i7BgJqbooZBDn3GZCJ8fBGPjqtla3pjMfFz8ZBp3CLnIo")
@@ -56,16 +56,24 @@ INCLUDE_PAGE_NAMES = []
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 #   - >= 4500 views VÀ >= 20 comments
-#   - >= 3500 views VÀ >= 100 comments
+#   - >= 3000 views VÀ >= 100 comments
 #   - Comments > 100 (bất kể views bao nhiêu)
 THRESHOLD_RULES = [
     {"min_views": 4500, "min_comments": 20},
-    {"min_views": 3500, "min_comments": 100},
+    {"min_views": 3000, "min_comments": 100},
 ]
 COMMENT_ONLY_THRESHOLD = 100  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
 ONLY_POSTS_NEWER_THAN_HOURS = 72
+
+# --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
+# So sánh views hiện tại với views của khoảng SPIKE_LOOKBACK_MINUTES phút trước.
+# Nếu tăng đủ nhiều (theo số tuyệt đối HOẶC theo %) -> coi là dấu hiệu "đang lên", báo ngay.
+SPIKE_LOOKBACK_MINUTES = 30
+SPIKE_MIN_VIEW_INCREASE = 3000   # tăng tối thiểu bấy nhiêu views trong khoảng thời gian trên
+SPIKE_MIN_PERCENT_INCREASE = 80  # HOẶC tăng tối thiểu bấy nhiêu % so với mốc trước
+VIEW_HISTORY_FILE = "view_history.json"  # lưu lịch sử views để tính tốc độ tăng
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
@@ -113,7 +121,59 @@ def save_notified(notified_set):
         print(f"[LỖI] Không lưu được {NOTIFIED_FILE}: {e}")
 
 
-already_notified = load_notified()  # tập hợp "page_id_post_id" đã xử lý xong
+already_notified = load_notified()  # tập hợp "page_id_post_id" đã xử lý xong (đạt ngưỡng)
+already_spike_notified = set()  # tập hợp bài đã báo "dựng đứng" rồi, tránh báo lặp lại
+
+
+# -------------------- Lưu/đọc lịch sử views (để phát hiện tăng đột biến) --------------------
+def load_view_history():
+    if os.path.exists(VIEW_HISTORY_FILE):
+        try:
+            with open(VIEW_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_view_history(history: dict):
+    try:
+        with open(VIEW_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[LỖI] Không lưu được {VIEW_HISTORY_FILE}: {e}")
+
+
+view_history = load_view_history()  # {post_id: [[iso_timestamp, views], ...]}
+
+
+def record_and_check_spike(post_id: str, current_views: int, now: datetime):
+    """Ghi nhận views hiện tại vào lịch sử, và kiểm tra xem có dấu hiệu
+    'dựng đứng' (tăng đột biến trong SPIKE_LOOKBACK_MINUTES phút gần nhất) không.
+    Trả về True nếu phát hiện tăng đột biến."""
+    points = view_history.get(post_id, [])
+
+    # Tìm điểm dữ liệu gần với mốc SPIKE_LOOKBACK_MINUTES phút trước nhất
+    cutoff = now - timedelta(minutes=SPIKE_LOOKBACK_MINUTES)
+    baseline_views = None
+    for ts_str, v in points:
+        ts = datetime.fromisoformat(ts_str)
+        if ts <= cutoff:
+            baseline_views = v  # lấy điểm gần cutoff nhất (points được lưu theo thứ tự thời gian)
+        else:
+            break
+
+    # Ghi thêm điểm dữ liệu hiện tại, giữ tối đa 200 điểm gần nhất để file không phình to
+    points.append([now.isoformat(), current_views])
+    view_history[post_id] = points[-200:]
+
+    if baseline_views is None:
+        return False  # chưa đủ lịch sử (bài quá mới) để so sánh
+
+    increase = current_views - baseline_views
+    percent_increase = (increase / baseline_views * 100) if baseline_views > 0 else 0
+
+    return increase >= SPIKE_MIN_VIEW_INCREASE or percent_increase >= SPIKE_MIN_PERCENT_INCREASE
 
 
 # -------------------- Facebook API --------------------
@@ -298,6 +358,23 @@ def check_all_pages():
 
             print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
 
+            # --- Kiểm tra dấu hiệu "dựng đứng" (tăng đột biến) ---
+            now_dt = datetime.now()
+            is_spike = record_and_check_spike(post_id, views, now_dt)
+            if is_spike and key not in already_spike_notified:
+                spike_msg = (
+                    f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
+                    f"Post ID: {post_id}\n"
+                    f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
+                    f"Comments: {comments}\n"
+                    + (f"Link: {link}\n" if link else "")
+                    + "=> Theo dõi sát, chuẩn bị gắn link!"
+                )
+                send_telegram_message(spike_msg)
+                already_spike_notified.add(key)
+                changed = True
+                print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
+
             if not meets_threshold(views, comments):
                 continue
 
@@ -323,6 +400,7 @@ def check_all_pages():
 
     if changed:
         save_notified(already_notified)
+    save_view_history(view_history)  # luôn lưu để không mất dữ liệu lịch sử tính spike
 
 
 def main():
