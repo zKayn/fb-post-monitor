@@ -74,7 +74,8 @@ SPIKE_LOOKBACK_MINUTES = 30
 SPIKE_MIN_VIEW_INCREASE = 3000   # tăng tối thiểu bấy nhiêu views trong khoảng thời gian trên
 SPIKE_MIN_PERCENT_INCREASE = 80  # HOẶC tăng tối thiểu bấy nhiêu % so với mốc trước
 SPIKE_MIN_VIEWS_TO_CHECK = 2000  # chỉ bắt đầu xét spike khi views hiện tại >= mốc này (tránh báo nhiễu bài quá mới)
-VIEW_HISTORY_FILE = "view_history.json"  # lưu lịch sử views để tính tốc độ tăng
+# LƯU Ý: đặt trong /data (Railway Volume) để KHÔNG bị mất lịch sử mỗi khi deploy lại.
+VIEW_HISTORY_FILE = "/data/view_history.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
@@ -82,8 +83,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
 CHECK_INTERVAL_SECONDS = 60  # tần suất kiểm tra (giây)
 GRAPH_API_VERSION = "v20.0"
 
-# File lưu lại các bài đã báo/đã có link, để không báo trùng khi restart
-NOTIFIED_FILE = "notified_posts.json"
+# File lưu lại các bài đã báo/đã có link, để không báo trùng khi restart.
+# LƯU Ý: đặt trong /data (Railway Volume) để KHÔNG bị mất dữ liệu mỗi khi deploy lại.
+# Nếu chưa tạo Volume trên Railway, có thể tạm để "notified_posts.json" (không có /data/)
+# nhưng dữ liệu sẽ mất mỗi lần deploy lại code.
+NOTIFIED_FILE = "/data/notified_posts.json"
 # ==============================================================
 
 GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -116,6 +120,7 @@ def load_notified():
 
 def save_notified(notified_set):
     try:
+        os.makedirs(os.path.dirname(NOTIFIED_FILE) or ".", exist_ok=True)
         with open(NOTIFIED_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(notified_set), f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -139,6 +144,7 @@ def load_view_history():
 
 def save_view_history(history: dict):
     try:
+        os.makedirs(os.path.dirname(VIEW_HISTORY_FILE) or ".", exist_ok=True)
         with open(VIEW_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -351,8 +357,11 @@ def check_all_pages():
         post_ids = get_recent_post_ids(page_id, page_token)
         for post_id in post_ids:
             key = f"{page_id}_{post_id}"
-            if key in already_notified:
-                continue  # đã xử lý xong bài này rồi, bỏ qua luôn không cần gọi API nữa
+            # Chỉ bỏ qua hoàn toàn khi bài đã được báo CẢ 2 loại (ngưỡng chính + spike)
+            # -> không còn gì để theo dõi thêm nữa. Nếu mới chỉ báo 1 trong 2 loại,
+            # vẫn tiếp tục lấy dữ liệu để kiểm tra loại còn lại.
+            if key in already_notified and key in already_spike_notified:
+                continue
 
             views, comments, link, message = get_post_stats(post_id, page_token)
 
@@ -379,7 +388,7 @@ def check_all_pages():
                 changed = True
                 print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
 
-            if not meets_threshold(views, comments):
+            if not meets_threshold(views, comments) or key in already_notified:
                 continue
 
             # Đạt ngưỡng -> kiểm tra xem đã gắn link chưa trước khi báo
