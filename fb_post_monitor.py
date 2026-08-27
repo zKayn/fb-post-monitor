@@ -130,7 +130,12 @@ def get_managed_pages():
         r = requests.get(url, params=params)
         data = r.json()
         if "error" in data:
-            print(f"[LỖI] Không lấy được danh sách Page: {data['error'].get('message')}")
+            err_msg = data['error'].get('message', 'Không rõ nguyên nhân')
+            print(f"[LỖI] Không lấy được danh sách Page: {err_msg}")
+            send_error_alert(
+                "get_managed_pages",
+                f"Không lấy được danh sách Page (có thể USER_ACCESS_TOKEN đã hết hạn/sai quyền).\nChi tiết: {err_msg}",
+            )
             return []
         pages.extend(data.get("data", []))
         next_url = data.get("paging", {}).get("next")
@@ -149,7 +154,12 @@ def get_recent_post_ids(page_id: str, page_token: str):
     )
     data = r.json()
     if "error" in data:
-        print(f"[LỖI] Page {page_id}: không lấy được danh sách bài viết: {data['error'].get('message')}")
+        err_msg = data['error'].get('message', 'Không rõ nguyên nhân')
+        print(f"[LỖI] Page {page_id}: không lấy được danh sách bài viết: {err_msg}")
+        send_error_alert(
+            f"get_recent_post_ids_{page_id}",
+            f"Page ID {page_id}: không lấy được danh sách bài viết (có thể token của Page này bị lỗi/hết quyền).\nChi tiết: {err_msg}",
+        )
         return []
 
     now = datetime.now(timezone.utc)
@@ -199,7 +209,12 @@ def get_post_stats(post_id: str, page_token: str):
         comments = data2["comments"]["summary"]["total_count"]
         link = data2.get("permalink_url")
     elif "error" in data2:
-        print(f"[LỖI] {post_id}: {data2['error'].get('message')}")
+        err_msg = data2['error'].get('message', 'Không rõ nguyên nhân')
+        print(f"[LỖI] {post_id}: {err_msg}")
+        send_error_alert(
+            f"get_post_stats_{post_id}",
+            f"Bài viết {post_id}: lỗi khi đọc dữ liệu (views/comments).\nChi tiết: {err_msg}",
+        )
 
     return views, comments, link, message
 
@@ -236,6 +251,21 @@ def send_telegram_message(text: str):
     resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
     if resp.status_code != 200:
         print(f"[LỖI] Gửi Telegram thất bại: {resp.text}")
+
+
+# -------------------- Báo lỗi qua Telegram (có chống spam) --------------------
+ERROR_COOLDOWN_MINUTES = 30  # mỗi loại lỗi chỉ báo lại sau tối thiểu 30 phút
+_last_error_sent_at = {}  # key = loại lỗi, value = thời điểm báo gần nhất
+
+
+def send_error_alert(error_key: str, text: str):
+    """Gửi cảnh báo lỗi qua Telegram, tự chống spam theo error_key."""
+    now = datetime.now()
+    last_sent = _last_error_sent_at.get(error_key)
+    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
+        return  # lỗi này vừa báo gần đây rồi, bỏ qua để tránh spam
+    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
+    _last_error_sent_at[error_key] = now
 
 
 def check_all_pages():
@@ -302,6 +332,7 @@ def main():
             check_all_pages()
         except Exception as e:
             print(f"[LỖI] Lỗi không xác định trong vòng quét: {e}")
+            send_error_alert("main_loop_exception", f"Lỗi không xác định trong vòng quét:\n{e}")
         time.sleep(CHECK_INTERVAL_SECONDS)
 
 
