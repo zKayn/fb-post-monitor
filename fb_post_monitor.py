@@ -8,8 +8,8 @@ và gửi thông báo Telegram ngay khi 1 bài đạt đủ 1 TRONG CÁC điều
 
 ĐIỀU KIỆN THÔNG BÁO (OR — đạt 1 trong các điều kiện là báo ngay)
 ------------------------------------------------------------------
-  - >= 4500 views  VÀ  >= 20 comments
-  - >= 3000 views  VÀ  >= 100 comments
+  - >= 5000 views  VÀ  >= 20 comments
+  - >= 3500 views  VÀ  >= 100 comments
   - Comments > 100 (bất kể views bao nhiêu)
 Chỉnh sửa trong phần THRESHOLD_RULES / COMMENT_ONLY_THRESHOLD bên dưới.
 
@@ -55,12 +55,12 @@ USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSZA7u2ySKgEB8UG
 INCLUDE_PAGE_NAMES = []
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
-#   - >= 4500 views VÀ >= 20 comments
-#   - >= 3000 views VÀ >= 100 comments
+#   - >= 5000 views VÀ >= 20 comments
+#   - >= 3500 views VÀ >= 100 comments
 #   - Comments > 100 (bất kể views bao nhiêu)
 THRESHOLD_RULES = [
-    {"min_views": 4500, "min_comments": 20},
-    {"min_views": 3000, "min_comments": 100},
+    {"min_views": 5000, "min_comments": 20},
+    {"min_views": 3500, "min_comments": 100},
 ]
 COMMENT_ONLY_THRESHOLD = 100  # comments vượt mốc này thì báo luôn, không cần xét views
 
@@ -73,6 +73,7 @@ ONLY_POSTS_NEWER_THAN_HOURS = 72
 SPIKE_LOOKBACK_MINUTES = 30
 SPIKE_MIN_VIEW_INCREASE = 3000   # tăng tối thiểu bấy nhiêu views trong khoảng thời gian trên
 SPIKE_MIN_PERCENT_INCREASE = 80  # HOẶC tăng tối thiểu bấy nhiêu % so với mốc trước
+SPIKE_MIN_VIEWS_TO_CHECK = 2000  # chỉ bắt đầu xét spike khi views hiện tại >= mốc này (tránh báo nhiễu bài quá mới)
 VIEW_HISTORY_FILE = "view_history.json"  # lưu lịch sử views để tính tốc độ tăng
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
@@ -166,6 +167,9 @@ def record_and_check_spike(post_id: str, current_views: int, now: datetime):
     # Ghi thêm điểm dữ liệu hiện tại, giữ tối đa 200 điểm gần nhất để file không phình to
     points.append([now.isoformat(), current_views])
     view_history[post_id] = points[-200:]
+
+    if current_views < SPIKE_MIN_VIEWS_TO_CHECK:
+        return False  # bài còn quá ít view, chưa đủ ý nghĩa để xét tăng đột biến
 
     if baseline_views is None:
         return False  # chưa đủ lịch sử (bài quá mới) để so sánh
