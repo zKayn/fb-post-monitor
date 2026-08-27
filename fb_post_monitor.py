@@ -3,7 +3,15 @@ FB POST MONITOR (NHIỀU PAGE, TỰ ĐỘNG, CHẠY 24/7)
 =========================================================
 Tự động theo dõi TẤT CẢ (hoặc 1 phần) các Page Facebook bạn quản lý.
 Với mỗi Page, script lấy danh sách bài viết MỚI NHẤT, kiểm tra views/comments,
-và gửi thông báo Telegram ngay khi 1 bài đạt đủ ngưỡng — kèm tên Page + link.
+và gửi thông báo Telegram ngay khi 1 bài đạt đủ 1 TRONG CÁC điều kiện dưới
+đây — kèm tên Page + link.
+
+ĐIỀU KIỆN THÔNG BÁO (OR — đạt 1 trong các điều kiện là báo ngay)
+------------------------------------------------------------------
+  - >= 5000 views  VÀ  >= 20 comments
+  - >= 3500 views  VÀ  >= 100 comments
+  - Comments > 100 (bất kể views bao nhiêu)
+Chỉnh sửa trong phần THRESHOLD_RULES / COMMENT_ONLY_THRESHOLD bên dưới.
 
 BẢN NÀY THÊM
 ------------
@@ -41,19 +49,26 @@ import requests
 from datetime import datetime, timezone
 
 # ========================== CONFIG ==========================
-USER_ACCESS_TOKEN = "EAAgnXcXSwJUBSZA7u2ySKgEB8UGVvSTwEQLNw8jL159ZCn8293Eb7CAa7nnZBu7SPV5N4aje6158kfnMAGZBo4tuzJdhqDEzFEYNz0Mt1ZBrjg2yphct70kyc3dDpmmE0PfkN6hAdxJtLD8HHUIdaZCOKOcRsjadqMh12WH9i7BgJqbooZBDn3GZCJ8fBGPjqtla3pjMfFz8ZBp3CLnIo"
+USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSZA7u2ySKgEB8UGVvSTwEQLNw8jL159ZCn8293Eb7CAa7nnZBu7SPV5N4aje6158kfnMAGZBo4tuzJdhqDEzFEYNz0Mt1ZBrjg2yphct70kyc3dDpmmE0PfkN6hAdxJtLD8HHUIdaZCOKOcRsjadqMh12WH9i7BgJqbooZBDn3GZCJ8fBGPjqtla3pjMfFz8ZBp3CLnIo")
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
 
-VIEW_THRESHOLD = 5000
-COMMENT_THRESHOLD = 20
+# Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
+#   - >= 5000 views VÀ >= 20 comments
+#   - >= 3500 views VÀ >= 100 comments
+#   - Comments > 100 (bất kể views bao nhiêu)
+THRESHOLD_RULES = [
+    {"min_views": 5000, "min_comments": 20},
+    {"min_views": 3500, "min_comments": 100},
+]
+COMMENT_ONLY_THRESHOLD = 100  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
 ONLY_POSTS_NEWER_THAN_HOURS = 72
 
-TELEGRAM_BOT_TOKEN = "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw"
-TELEGRAM_CHAT_ID = "7513038171"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
 
 CHECK_INTERVAL_SECONDS = 60  # tần suất kiểm tra (giây)
 GRAPH_API_VERSION = "v20.0"
@@ -67,6 +82,16 @@ GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 
 URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
+
+
+def meets_threshold(views: int, comments: int) -> bool:
+    """Trả về True nếu bài đạt ĐỦ 1 trong các điều kiện thông báo đã cấu hình."""
+    if comments > COMMENT_ONLY_THRESHOLD:
+        return True
+    for rule in THRESHOLD_RULES:
+        if views >= rule["min_views"] and comments >= rule["min_comments"]:
+            return True
+    return False
 
 
 # -------------------- Lưu/đọc trạng thái đã báo --------------------
@@ -243,7 +268,7 @@ def check_all_pages():
 
             print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
 
-            if views < VIEW_THRESHOLD or comments < COMMENT_THRESHOLD:
+            if not meets_threshold(views, comments):
                 continue
 
             # Đạt ngưỡng -> kiểm tra xem đã gắn link chưa trước khi báo
