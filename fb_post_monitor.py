@@ -55,11 +55,11 @@ USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSZA7u2ySKgEB8UG
 INCLUDE_PAGE_NAMES = []
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
-#   - >= 5000 views VÀ >= 20 comments
+#   - >= 4500 views VÀ >= 20 comments
 #   - >= 3500 views VÀ >= 100 comments
 #   - Comments > 100 (bất kể views bao nhiêu)
 THRESHOLD_RULES = [
-    {"min_views": 5000, "min_comments": 20},
+    {"min_views": 4500, "min_comments": 20},
     {"min_views": 3500, "min_comments": 100},
 ]
 COMMENT_ONLY_THRESHOLD = 100  # comments vượt mốc này thì báo luôn, không cần xét views
