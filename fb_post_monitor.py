@@ -80,7 +80,7 @@ VIEW_HISTORY_FILE = "/data/view_history.json"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
 
-CHECK_INTERVAL_SECONDS = 60  # tần suất kiểm tra (giây)
+CHECK_INTERVAL_SECONDS = 600  # tần suất kiểm tra (giây)
 GRAPH_API_VERSION = "v20.0"
 
 # File lưu lại các bài đã báo/đã có link, để không báo trùng khi restart.
