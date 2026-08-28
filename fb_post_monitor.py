@@ -65,7 +65,12 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 3  # tăng dần: 3s, 6s, 9s giữa các lần thử lại
 
 # --- Batch API ---
-POSTS_PER_BATCH = 25  # 25 bài x 2 sub-request = 50, đúng giới hạn tối đa của Facebook Batch API
+# Mỗi bài viết cần 3 sub-request: 2 request insights riêng biệt (giữ cơ chế
+# fallback metric để không mất dữ liệu nếu 1 metric không áp dụng được cho
+# bài đó) + 1 request lấy message/comments/link. 16 bài x 3 = 48, dưới giới
+# hạn tối đa 50 sub-request/batch của Facebook.
+POSTS_PER_BATCH = 16
+METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 
 # --- Cảnh báo token sắp hết hạn ---
 TOKEN_EXPIRY_WARNING_DAYS = 5
@@ -319,18 +324,23 @@ def chunked(lst, n):
 
 def get_stats_batch(post_ids: list, page_token: str) -> dict:
     """Lấy views/comments/link/message của nhiều bài viết cùng lúc qua
-    Facebook Batch API (tối đa POSTS_PER_BATCH bài/lần gọi HTTP)."""
+    Facebook Batch API (tối đa POSTS_PER_BATCH bài/lần gọi HTTP).
+    Mỗi bài dùng 2 sub-request insights riêng biệt theo METRIC_FALLBACKS
+    (không gộp chung 1 câu truy vấn) để giữ cơ chế fallback: nếu metric A
+    không áp dụng được cho bài đó, vẫn còn kết quả từ metric B, tránh mất
+    dữ liệu oan uổng do 1 metric lỗi kéo cả bài xuống."""
     results = {}
 
     for group in chunked(post_ids, POSTS_PER_BATCH):
         batch_items = []
         for pid in group:
-            batch_items.append(
-                {
-                    "method": "GET",
-                    "relative_url": f"{pid}/insights?metric=post_media_view,post_total_media_view_unique&period=lifetime",
-                }
-            )
+            for metric in METRIC_FALLBACKS:
+                batch_items.append(
+                    {
+                        "method": "GET",
+                        "relative_url": f"{pid}/insights?metric={metric}&period=lifetime",
+                    }
+                )
             batch_items.append(
                 {
                     "method": "GET",
@@ -359,21 +369,28 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             send_error_alert("batch_request_error", f"Batch request thất bại: {err}")
             continue
 
-        for idx, pid in enumerate(group):
-            insights_item = batch_resp[idx * 2] if idx * 2 < len(batch_resp) else None
-            fields_item = batch_resp[idx * 2 + 1] if idx * 2 + 1 < len(batch_resp) else None
+        n_metrics = len(METRIC_FALLBACKS)
+        items_per_post = n_metrics + 1  # 2 insights + 1 fields
 
+        for idx, pid in enumerate(group):
+            base = idx * items_per_post
+            insight_items = batch_resp[base : base + n_metrics] if base + n_metrics <= len(batch_resp) else []
+            fields_item = batch_resp[base + n_metrics] if base + n_metrics < len(batch_resp) else None
+
+            # Thử lần lượt từng metric, lấy kết quả đầu tiên hợp lệ
             views = None
-            if insights_item and insights_item.get("code") == 200:
-                try:
-                    body = json.loads(insights_item["body"])
-                    for entry in body.get("data", []):
-                        vals = entry.get("values", [])
-                        if vals and vals[-1].get("value") is not None:
-                            views = vals[-1]["value"]
-                            break
-                except Exception:
-                    pass
+            for insight_item in insight_items:
+                if insight_item and insight_item.get("code") == 200:
+                    try:
+                        body = json.loads(insight_item["body"])
+                        data_list = body.get("data", [])
+                        if data_list:
+                            vals = data_list[0].get("values", [])
+                            if vals and vals[-1].get("value") is not None:
+                                views = vals[-1]["value"]
+                                break
+                    except Exception:
+                        continue
 
             comments = None
             link = None
