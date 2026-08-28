@@ -1,44 +1,31 @@
 """
-FB POST MONITOR (NHIỀU PAGE, TỰ ĐỘNG, CHẠY 24/7)
-=========================================================
-Tự động theo dõi TẤT CẢ (hoặc 1 phần) các Page Facebook bạn quản lý.
-Với mỗi Page, script lấy danh sách bài viết MỚI NHẤT, kiểm tra views/comments,
-và gửi thông báo Telegram ngay khi 1 bài đạt đủ 1 TRONG CÁC điều kiện dưới
-đây — kèm tên Page + link.
+FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN HẾT HẠN)
+=================================================================
+Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi thông báo
+Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
+tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
+Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 
-ĐIỀU KIỆN THÔNG BÁO (OR — đạt 1 trong các điều kiện là báo ngay)
-------------------------------------------------------------------
-  - >= 4500 views  VÀ  >= 20 comments
-  - >= 3500 views  VÀ  >= 100 comments
-  - Comments > 100 (bất kể views bao nhiêu)
-Chỉnh sửa trong phần THRESHOLD_RULES / COMMENT_ONLY_THRESHOLD bên dưới.
+BẢN NÀY THÊM (so với bản trước)
+---------------------------------
+1. RETRY TỰ ĐỘNG: mọi lệnh gọi Facebook API đều tự thử lại tối đa 3 lần
+   khi gặp lỗi mạng tạm thời (ConnectionResetError, Timeout...) trước khi
+   báo lỗi hẳn — giảm khả năng bỏ lỡ dữ liệu do mạng chập chờn.
+2. BATCH REQUEST: thay vì gọi riêng từng bài viết (insights + comments =
+   2 request/bài), giờ gộp tối đa 25 bài (50 sub-request) vào 1 lần gọi
+   HTTP duy nhất tới Facebook Batch API -> nhanh hơn nhiều, giảm rủi ro
+   bị Facebook giới hạn tốc độ (rate limit) khi theo dõi nhiều Page.
+3. CẢNH BÁO TOKEN SẮP HẾT HẠN: mỗi lượt quét, script tự hỏi Facebook
+   "token này còn bao lâu nữa hết hạn" (qua endpoint debug_token chính
+   thức), nếu còn dưới TOKEN_EXPIRY_WARNING_DAYS ngày sẽ tự báo Telegram
+   để bạn kịp lấy token mới, tránh bị gián đoạn theo dõi.
 
-BẢN NÀY THÊM
-------------
-1. Nhớ trạng thái đã báo qua file "notified_posts.json" -> khởi động lại
-   script (deploy lại, restart server...) sẽ KHÔNG báo lại các bài đã báo.
-2. Trước khi báo, tự kiểm tra bài viết đã có link (trong nội dung bài hoặc
-   trong bình luận của chính Page) hay chưa -> nếu có rồi thì bỏ qua, không báo.
-
-YÊU CẦU TRƯỚC KHI CHẠY
------------------------
-1. USER ACCESS TOKEN (không phải Page Token) tại:
-   https://developers.facebook.com/tools/explorer/
-   - "User or Page" -> "Get User Access Token"
-   - Add a Permission -> tick: pages_show_list, pages_read_engagement,
-     pages_read_user_content, read_insights
-   - Generate Access Token -> Opt in to all current Pages -> copy token.
-
-2. Telegram Bot: @BotFather -> /newbot -> lấy BOT_TOKEN, lấy CHAT_ID qua
-   https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
-
+YÊU CẦU
+--------
+1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
+   pages_read_engagement, pages_read_user_content, read_insights
+2. Telegram Bot Token + Chat ID
 3. Cài thư viện: pip install requests
-
-CÁCH DÙNG
----------
-- Điền USER_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID bên dưới.
-- (Tuỳ chọn) INCLUDE_PAGE_NAMES để trống [] = theo dõi TẤT CẢ Page.
-- Chạy: python fb_post_monitor.py
 """
 
 import json
@@ -49,15 +36,14 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ========================== CONFIG ==========================
-USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSZA7u2ySKgEB8UGVvSTwEQLNw8jL159ZCn8293Eb7CAa7nnZBu7SPV5N4aje6158kfnMAGZBo4tuzJdhqDEzFEYNz0Mt1ZBrjg2yphct70kyc3dDpmmE0PfkN6hAdxJtLD8HHUIdaZCOKOcRsjadqMh12WH9i7BgJqbooZBDn3GZCJ8fBGPjqtla3pjMfFz8ZBp3CLnIo")
+USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "DÁN_USER_ACCESS_TOKEN_VÀO_ĐÂY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "DÁN_TELEGRAM_BOT_TOKEN_VÀO_ĐÂY")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "DÁN_CHAT_ID_CỦA_BẠN_VÀO_ĐÂY")
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
-#   - >= 4500 views VÀ >= 20 comments
-#   - >= 3500 views VÀ >= 100 comments
-#   - Comments > 100 (bất kể views bao nhiêu)
 THRESHOLD_RULES = [
     {"min_views": 4500, "min_comments": 20},
     {"min_views": 3500, "min_comments": 100},
@@ -68,37 +54,61 @@ COMMENT_ONLY_THRESHOLD = 100  # comments vượt mốc này thì báo luôn, kh�
 ONLY_POSTS_NEWER_THAN_HOURS = 72
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
-# So sánh views hiện tại với views của khoảng SPIKE_LOOKBACK_MINUTES phút trước.
-# Nếu tăng đủ nhiều (theo số tuyệt đối HOẶC theo %) -> coi là dấu hiệu "đang lên", báo ngay.
 SPIKE_LOOKBACK_MINUTES = 30
-SPIKE_MIN_VIEW_INCREASE = 3000   # tăng tối thiểu bấy nhiêu views trong khoảng thời gian trên
-SPIKE_MIN_PERCENT_INCREASE = 80  # HOẶC tăng tối thiểu bấy nhiêu % so với mốc trước
-SPIKE_MIN_VIEWS_TO_CHECK = 2000  # chỉ bắt đầu xét spike khi views hiện tại >= mốc này (tránh báo nhiễu bài quá mới)
-# LƯU Ý: đặt trong /data (Railway Volume) để KHÔNG bị mất lịch sử mỗi khi deploy lại.
+SPIKE_MIN_VIEW_INCREASE = 3000
+SPIKE_MIN_PERCENT_INCREASE = 80
+SPIKE_MIN_VIEWS_TO_CHECK = 2000
 VIEW_HISTORY_FILE = "/data/view_history.json"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
+# --- Retry khi gặp lỗi mạng tạm thời ---
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 3  # tăng dần: 3s, 6s, 9s giữa các lần thử lại
 
-CHECK_INTERVAL_SECONDS = 600  # tần suất kiểm tra (giây)
+# --- Batch API ---
+POSTS_PER_BATCH = 25  # 25 bài x 2 sub-request = 50, đúng giới hạn tối đa của Facebook Batch API
+
+# --- Cảnh báo token sắp hết hạn ---
+TOKEN_EXPIRY_WARNING_DAYS = 5
+
+CHECK_INTERVAL_SECONDS = 60
 GRAPH_API_VERSION = "v20.0"
-
-# File lưu lại các bài đã báo/đã có link, để không báo trùng khi restart.
-# LƯU Ý: đặt trong /data (Railway Volume) để KHÔNG bị mất dữ liệu mỗi khi deploy lại.
-# Nếu chưa tạo Volume trên Railway, có thể tạm để "notified_posts.json" (không có /data/)
-# nhưng dữ liệu sẽ mất mỗi lần deploy lại code.
 NOTIFIED_FILE = "/data/notified_posts.json"
 # ==============================================================
 
 GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
-# post_impressions/post_impressions_unique đã bị Facebook deprecated (15/06/2026).
-METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
-
 URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 
 
+# ==================== RETRY HELPER ====================
+def api_get(url, params=None, timeout=20):
+    """GET request có tự động retry khi gặp lỗi mạng tạm thời."""
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return requests.get(url, params=params, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            print(f"[CẢNH BÁO] Lỗi mạng (lần {attempt}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise last_exc
+
+
+def api_post(url, data=None, timeout=30):
+    """POST request có tự động retry khi gặp lỗi mạng tạm thời."""
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return requests.post(url, data=data, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            print(f"[CẢNH BÁO] Lỗi mạng (lần {attempt}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise last_exc
+
+
 def meets_threshold(views: int, comments: int) -> bool:
-    """Trả về True nếu bài đạt ĐỦ 1 trong các điều kiện thông báo đã cấu hình."""
     if comments > COMMENT_ONLY_THRESHOLD:
         return True
     for rule in THRESHOLD_RULES:
@@ -127,11 +137,11 @@ def save_notified(notified_set):
         print(f"[LỖI] Không lưu được {NOTIFIED_FILE}: {e}")
 
 
-already_notified = load_notified()  # tập hợp "page_id_post_id" đã xử lý xong (đạt ngưỡng)
-already_spike_notified = set()  # tập hợp bài đã báo "dựng đứng" rồi, tránh báo lặp lại
+already_notified = load_notified()
+already_spike_notified = set()
 
 
-# -------------------- Lưu/đọc lịch sử views (để phát hiện tăng đột biến) --------------------
+# -------------------- Lưu/đọc lịch sử views (spike detection) --------------------
 def load_view_history():
     if os.path.exists(VIEW_HISTORY_FILE):
         try:
@@ -151,56 +161,108 @@ def save_view_history(history: dict):
         print(f"[LỖI] Không lưu được {VIEW_HISTORY_FILE}: {e}")
 
 
-view_history = load_view_history()  # {post_id: [[iso_timestamp, views], ...]}
+view_history = load_view_history()
 
 
 def record_and_check_spike(post_id: str, current_views: int, now: datetime):
-    """Ghi nhận views hiện tại vào lịch sử, và kiểm tra xem có dấu hiệu
-    'dựng đứng' (tăng đột biến trong SPIKE_LOOKBACK_MINUTES phút gần nhất) không.
-    Trả về True nếu phát hiện tăng đột biến."""
     points = view_history.get(post_id, [])
-
-    # Tìm điểm dữ liệu gần với mốc SPIKE_LOOKBACK_MINUTES phút trước nhất
     cutoff = now - timedelta(minutes=SPIKE_LOOKBACK_MINUTES)
     baseline_views = None
     for ts_str, v in points:
         ts = datetime.fromisoformat(ts_str)
         if ts <= cutoff:
-            baseline_views = v  # lấy điểm gần cutoff nhất (points được lưu theo thứ tự thời gian)
+            baseline_views = v
         else:
             break
 
-    # Ghi thêm điểm dữ liệu hiện tại, giữ tối đa 200 điểm gần nhất để file không phình to
     points.append([now.isoformat(), current_views])
     view_history[post_id] = points[-200:]
 
     if current_views < SPIKE_MIN_VIEWS_TO_CHECK:
-        return False  # bài còn quá ít view, chưa đủ ý nghĩa để xét tăng đột biến
-
+        return False
     if baseline_views is None:
-        return False  # chưa đủ lịch sử (bài quá mới) để so sánh
+        return False
 
     increase = current_views - baseline_views
     percent_increase = (increase / baseline_views * 100) if baseline_views > 0 else 0
-
     return increase >= SPIKE_MIN_VIEW_INCREASE or percent_increase >= SPIKE_MIN_PERCENT_INCREASE
+
+
+# -------------------- Telegram --------------------
+def send_telegram_message(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = api_post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+        if resp.status_code != 200:
+            print(f"[LỖI] Gửi Telegram thất bại: {resp.text}")
+    except Exception as e:
+        print(f"[LỖI] Gửi Telegram thất bại (mạng): {e}")
+
+
+ERROR_COOLDOWN_MINUTES = 30
+_last_error_sent_at = {}
+
+
+def send_error_alert(error_key: str, text: str):
+    now = datetime.now()
+    last_sent = _last_error_sent_at.get(error_key)
+    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
+        return
+    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
+    _last_error_sent_at[error_key] = now
+
+
+# -------------------- Cảnh báo token sắp hết hạn --------------------
+def check_token_expiry():
+    """Tự hỏi Facebook token còn bao lâu hết hạn, cảnh báo nếu sắp hết."""
+    try:
+        r = api_get(
+            f"{GRAPH_URL}/debug_token",
+            params={"input_token": USER_ACCESS_TOKEN, "access_token": USER_ACCESS_TOKEN},
+        )
+        data = r.json().get("data", {})
+    except Exception as e:
+        print(f"[CẢNH BÁO] Không kiểm tra được hạn token: {e}")
+        return
+
+    if not data.get("is_valid", True):
+        send_error_alert(
+            "token_invalid",
+            "USER_ACCESS_TOKEN không còn hợp lệ (có thể đã hết hạn hoặc bị thu hồi)! "
+            "Hãy lấy token mới và cập nhật vào Railway Variables ngay.",
+        )
+        return
+
+    expires_at = data.get("expires_at")
+    if not expires_at:  # 0 hoặc None = token không có hạn / không xác định được
+        return
+
+    expire_dt = datetime.fromtimestamp(expires_at)
+    days_left = (expire_dt - datetime.now()).days
+    if days_left <= TOKEN_EXPIRY_WARNING_DAYS:
+        send_error_alert(
+            "token_expiry_warning",
+            f"USER_ACCESS_TOKEN sắp hết hạn! Còn khoảng {days_left} ngày "
+            f"(hết hạn lúc {expire_dt.strftime('%H:%M %d/%m/%Y')}).\n"
+            "Hãy lấy Long-Lived Token mới tại Graph API Explorer và cập nhật "
+            "vào Railway -> Variables -> USER_ACCESS_TOKEN.",
+        )
 
 
 # -------------------- Facebook API --------------------
 def get_managed_pages():
-    """Lấy danh sách toàn bộ Page bạn quản lý, kèm access token riêng từng Page."""
     pages = []
     url = f"{GRAPH_URL}/me/accounts"
-    params = {
-        "fields": "id,name,access_token",
-        "limit": 100,
-        "access_token": USER_ACCESS_TOKEN,
-    }
+    params = {"fields": "id,name,access_token", "limit": 100, "access_token": USER_ACCESS_TOKEN}
     while url:
-        r = requests.get(url, params=params)
+        try:
+            r = api_get(url, params=params)
+        except Exception as e:
+            send_error_alert("get_managed_pages_network", f"Không kết nối được Facebook để lấy danh sách Page: {e}")
+            return []
         data = r.json()
         if "error" in data:
-            err_msg = data['error'].get('message', 'Không rõ nguyên nhân')
+            err_msg = data["error"].get("message", "Không rõ nguyên nhân")
             print(f"[LỖI] Không lấy được danh sách Page: {err_msg}")
             send_error_alert(
                 "get_managed_pages",
@@ -217,18 +279,22 @@ def get_managed_pages():
 
 
 def get_recent_post_ids(page_id: str, page_token: str):
-    """Lấy danh sách ID các bài viết gần đây của 1 Page (trong N giờ)."""
-    r = requests.get(
-        f"{GRAPH_URL}/{page_id}/posts",
-        params={"fields": "id,created_time", "limit": 25, "access_token": page_token},
-    )
+    try:
+        r = api_get(
+            f"{GRAPH_URL}/{page_id}/posts",
+            params={"fields": "id,created_time", "limit": 25, "access_token": page_token},
+        )
+    except Exception as e:
+        send_error_alert(f"get_recent_post_ids_net_{page_id}", f"Page ID {page_id}: lỗi mạng khi lấy danh sách bài viết: {e}")
+        return []
+
     data = r.json()
     if "error" in data:
-        err_msg = data['error'].get('message', 'Không rõ nguyên nhân')
+        err_msg = data["error"].get("message", "Không rõ nguyên nhân")
         print(f"[LỖI] Page {page_id}: không lấy được danh sách bài viết: {err_msg}")
         send_error_alert(
             f"get_recent_post_ids_{page_id}",
-            f"Page ID {page_id}: không lấy được danh sách bài viết (có thể token của Page này bị lỗi/hết quyền).\nChi tiết: {err_msg}",
+            f"Page ID {page_id}: không lấy được danh sách bài viết (có thể token của Page bị lỗi).\nChi tiết: {err_msg}",
         )
         return []
 
@@ -246,67 +312,109 @@ def get_recent_post_ids(page_id: str, page_token: str):
     return post_ids
 
 
-def get_post_stats(post_id: str, page_token: str):
-    """Trả về (views, comments, link, message) của 1 bài viết."""
-    views = None
-    for metric in METRIC_FALLBACKS:
-        r = requests.get(
-            f"{GRAPH_URL}/{post_id}/insights",
-            params={"metric": metric, "period": "lifetime", "access_token": page_token},
-        )
-        data = r.json()
-        if "data" in data and data["data"]:
-            try:
-                views = data["data"][0]["values"][-1]["value"]
-                break
-            except (KeyError, IndexError):
-                continue
-        elif "error" in data:
+def chunked(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+def get_stats_batch(post_ids: list, page_token: str) -> dict:
+    """Lấy views/comments/link/message của nhiều bài viết cùng lúc qua
+    Facebook Batch API (tối đa POSTS_PER_BATCH bài/lần gọi HTTP)."""
+    results = {}
+
+    for group in chunked(post_ids, POSTS_PER_BATCH):
+        batch_items = []
+        for pid in group:
+            batch_items.append(
+                {
+                    "method": "GET",
+                    "relative_url": f"{pid}/insights?metric=post_media_view,post_total_media_view_unique&period=lifetime",
+                }
+            )
+            batch_items.append(
+                {
+                    "method": "GET",
+                    "relative_url": f"{pid}?fields=message,comments.summary(true),permalink_url",
+                }
+            )
+
+        try:
+            resp = api_post(
+                f"{GRAPH_URL}/",
+                data={"access_token": page_token, "batch": json.dumps(batch_items)},
+            )
+        except Exception as e:
+            send_error_alert("batch_request_network", f"Lỗi mạng khi gọi Batch API: {e}")
             continue
 
-    r2 = requests.get(
-        f"{GRAPH_URL}/{post_id}",
-        params={
-            "fields": "message,comments.summary(true),permalink_url",
-            "access_token": page_token,
-        },
-    )
-    data2 = r2.json()
-    comments = None
-    link = None
-    message = data2.get("message", "") or ""
-    if "comments" in data2:
-        comments = data2["comments"]["summary"]["total_count"]
-        link = data2.get("permalink_url")
-    elif "error" in data2:
-        err_msg = data2['error'].get('message', 'Không rõ nguyên nhân')
-        print(f"[LỖI] {post_id}: {err_msg}")
-        send_error_alert(
-            f"get_post_stats_{post_id}",
-            f"Bài viết {post_id}: lỗi khi đọc dữ liệu (views/comments).\nChi tiết: {err_msg}",
-        )
+        try:
+            batch_resp = resp.json()
+        except Exception as e:
+            print(f"[LỖI] Batch request lỗi parse JSON: {e}")
+            continue
 
-    return views, comments, link, message
+        if not isinstance(batch_resp, list):
+            err = batch_resp.get("error", {}).get("message", str(batch_resp)) if isinstance(batch_resp, dict) else str(batch_resp)
+            print(f"[LỖI] Batch request thất bại: {err}")
+            send_error_alert("batch_request_error", f"Batch request thất bại: {err}")
+            continue
+
+        for idx, pid in enumerate(group):
+            insights_item = batch_resp[idx * 2] if idx * 2 < len(batch_resp) else None
+            fields_item = batch_resp[idx * 2 + 1] if idx * 2 + 1 < len(batch_resp) else None
+
+            views = None
+            if insights_item and insights_item.get("code") == 200:
+                try:
+                    body = json.loads(insights_item["body"])
+                    for entry in body.get("data", []):
+                        vals = entry.get("values", [])
+                        if vals and vals[-1].get("value") is not None:
+                            views = vals[-1]["value"]
+                            break
+                except Exception:
+                    pass
+
+            comments = None
+            link = None
+            message = ""
+            if fields_item and fields_item.get("code") == 200:
+                try:
+                    body = json.loads(fields_item["body"])
+                    message = body.get("message", "") or ""
+                    if "comments" in body:
+                        comments = body["comments"]["summary"]["total_count"]
+                        link = body.get("permalink_url")
+                except Exception:
+                    pass
+            elif fields_item and fields_item.get("code") != 200:
+                try:
+                    err_body = json.loads(fields_item["body"])
+                    err_msg = err_body.get("error", {}).get("message", "Không rõ")
+                except Exception:
+                    err_msg = "Không rõ"
+                print(f"[LỖI] {pid}: {err_msg}")
+
+            results[pid] = (views, comments, link, message)
+
+    return results
 
 
 def post_already_has_link(post_id: str, page_id: str, page_token: str, post_message: str) -> bool:
-    """Kiểm tra bài viết đã có link chưa (trong nội dung bài, hoặc trong
-    bình luận do chính Page đăng — trường hợp gắn link bằng comment)."""
     if URL_PATTERN.search(post_message or ""):
         return True
 
-    r = requests.get(
-        f"{GRAPH_URL}/{post_id}/comments",
-        params={
-            "filter": "stream",
-            "limit": 50,
-            "fields": "message,from",
-            "access_token": page_token,
-        },
-    )
+    try:
+        r = api_get(
+            f"{GRAPH_URL}/{post_id}/comments",
+            params={"filter": "stream", "limit": 50, "fields": "message,from", "access_token": page_token},
+        )
+    except Exception:
+        return False
+
     data = r.json()
     if "error" in data:
-        return False  # không chắc chắn -> coi như chưa gắn link, để an toàn vẫn báo
+        return False
 
     for c in data.get("data", []):
         from_id = (c.get("from") or {}).get("id")
@@ -316,29 +424,9 @@ def post_already_has_link(post_id: str, page_id: str, page_token: str, post_mess
     return False
 
 
-def send_telegram_message(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
-    if resp.status_code != 200:
-        print(f"[LỖI] Gửi Telegram thất bại: {resp.text}")
-
-
-# -------------------- Báo lỗi qua Telegram (có chống spam) --------------------
-ERROR_COOLDOWN_MINUTES = 30  # mỗi loại lỗi chỉ báo lại sau tối thiểu 30 phút
-_last_error_sent_at = {}  # key = loại lỗi, value = thời điểm báo gần nhất
-
-
-def send_error_alert(error_key: str, text: str):
-    """Gửi cảnh báo lỗi qua Telegram, tự chống spam theo error_key."""
-    now = datetime.now()
-    last_sent = _last_error_sent_at.get(error_key)
-    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
-        return  # lỗi này vừa báo gần đây rồi, bỏ qua để tránh spam
-    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
-    _last_error_sent_at[error_key] = now
-
-
 def check_all_pages():
+    check_token_expiry()  # kiểm tra hạn token mỗi lượt quét (rất nhẹ, không đáng kể)
+
     pages = get_managed_pages()
     ts = datetime.now().strftime("%H:%M:%S")
 
@@ -349,21 +437,29 @@ def check_all_pages():
     print(f"[{ts}] Đang quét {len(pages)} Page: {', '.join(p['name'] for p in pages)}")
 
     changed = False
+    now_dt = datetime.now()
+
     for page in pages:
         page_id = page["id"]
         page_name = page["name"]
         page_token = page["access_token"]
 
-        post_ids = get_recent_post_ids(page_id, page_token)
-        for post_id in post_ids:
-            key = f"{page_id}_{post_id}"
-            # Chỉ bỏ qua hoàn toàn khi bài đã được báo CẢ 2 loại (ngưỡng chính + spike)
-            # -> không còn gì để theo dõi thêm nữa. Nếu mới chỉ báo 1 trong 2 loại,
-            # vẫn tiếp tục lấy dữ liệu để kiểm tra loại còn lại.
-            if key in already_notified and key in already_spike_notified:
-                continue
+        all_post_ids = get_recent_post_ids(page_id, page_token)
 
-            views, comments, link, message = get_post_stats(post_id, page_token)
+        # Chỉ bỏ qua hoàn toàn khi bài đã được báo CẢ 2 loại (ngưỡng chính + spike)
+        post_ids_to_check = [
+            pid for pid in all_post_ids
+            if not (f"{page_id}_{pid}" in already_notified and f"{page_id}_{pid}" in already_spike_notified)
+        ]
+
+        if not post_ids_to_check:
+            continue
+
+        stats = get_stats_batch(post_ids_to_check, page_token)
+
+        for post_id in post_ids_to_check:
+            key = f"{page_id}_{post_id}"
+            views, comments, link, message = stats.get(post_id, (None, None, None, ""))
 
             if views is None or comments is None:
                 print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
@@ -371,8 +467,7 @@ def check_all_pages():
 
             print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
 
-            # --- Kiểm tra dấu hiệu "dựng đứng" (tăng đột biến) ---
-            now_dt = datetime.now()
+            # --- Kiểm tra dấu hiệu "dựng đứng" ---
             is_spike = record_and_check_spike(post_id, views, now_dt)
             if is_spike and key not in already_spike_notified:
                 spike_msg = (
@@ -391,7 +486,6 @@ def check_all_pages():
             if not meets_threshold(views, comments) or key in already_notified:
                 continue
 
-            # Đạt ngưỡng -> kiểm tra xem đã gắn link chưa trước khi báo
             if post_already_has_link(post_id, page_id, page_token, message):
                 print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
                 already_notified.add(key)
@@ -413,7 +507,7 @@ def check_all_pages():
 
     if changed:
         save_notified(already_notified)
-    save_view_history(view_history)  # luôn lưu để không mất dữ liệu lịch sử tính spike
+    save_view_history(view_history)
 
 
 def main():
