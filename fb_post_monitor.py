@@ -94,10 +94,10 @@ REPLY_TEMPLATES = [
 ]
 
 MAX_REPLIES_PER_SCAN = 20  # giới hạn tổng số reply mỗi lượt quét, tránh bị Facebook coi là spam
-REPLY_DELAY_SECONDS = 10  # nghỉ giữa mỗi lần gửi reply (giây)
+REPLY_DELAY_SECONDS = 5  # nghỉ giữa mỗi lần gửi reply (giây)
 REPLIED_COMMENTERS_FILE = "/data/replied_commenters.json"  # lưu danh sách đã reply (post_id_commenter_id)
 
-CHECK_INTERVAL_SECONDS = 600
+CHECK_INTERVAL_SECONDS = 60
 GRAPH_API_VERSION = "v20.0"
 NOTIFIED_FILE = "/data/notified_posts.json"
 # ==============================================================
