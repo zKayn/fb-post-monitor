@@ -1,42 +1,45 @@
 """
-FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN HẾT HẠN)
+FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN + AUTO-REPLY)
 =================================================================
 Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi thông báo
 Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
 tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
+Tự động trả lời bình luận độc giả sau khi bài đã gắn link (1 độc giả
+chỉ được trả lời 1 lần/bài, câu trả lời chọn ngẫu nhiên trong danh sách
+mẫu bạn chuẩn bị sẵn).
 
-BẢN NÀY THÊM (so với bản trước)
----------------------------------
-1. RETRY TỰ ĐỘNG: mọi lệnh gọi Facebook API đều tự thử lại tối đa 3 lần
-   khi gặp lỗi mạng tạm thời (ConnectionResetError, Timeout...) trước khi
-   báo lỗi hẳn — giảm khả năng bỏ lỡ dữ liệu do mạng chập chờn.
-2. BATCH REQUEST: thay vì gọi riêng từng bài viết (insights + comments =
-   2 request/bài), giờ gộp tối đa 25 bài (50 sub-request) vào 1 lần gọi
-   HTTP duy nhất tới Facebook Batch API -> nhanh hơn nhiều, giảm rủi ro
-   bị Facebook giới hạn tốc độ (rate limit) khi theo dõi nhiều Page.
-3. CẢNH BÁO TOKEN SẮP HẾT HẠN: mỗi lượt quét, script tự hỏi Facebook
-   "token này còn bao lâu nữa hết hạn" (qua endpoint debug_token chính
-   thức), nếu còn dưới TOKEN_EXPIRY_WARNING_DAYS ngày sẽ tự báo Telegram
-   để bạn kịp lấy token mới, tránh bị gián đoạn theo dõi.
+BẢN NÀY THÊM: AUTO-REPLY BÌNH LUẬN
+-------------------------------------
+Sau khi 1 bài viết đã được gắn link (trong nội dung bài hoặc bình luận
+của chính Page), script sẽ quét bình luận của độc giả trên bài đó, và
+tự động trả lời (reply) từng độc giả CHƯA từng được trả lời (theo cặp
+bài viết + người bình luận) bằng 1 câu ngẫu nhiên trong REPLY_TEMPLATES.
+
+⚠️ QUYỀN CẦN THÊM: tính năng này cần quyền GHI (không chỉ đọc) vào bình
+luận, cụ thể là "pages_manage_engagement". Khi lấy USER_ACCESS_TOKEN ở
+Graph API Explorer, nhớ tick thêm quyền này (ngoài 4 quyền cũ), rồi
+Generate Access Token lại.
 
 YÊU CẦU
 --------
-1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
-   pages_read_engagement, pages_read_user_content, read_insights
+1. USER ACCESS TOKEN (Long-Lived) với đủ 5 quyền: pages_show_list,
+   pages_read_engagement, pages_read_user_content, read_insights,
+   pages_manage_engagement
 2. Telegram Bot Token + Chat ID
 3. Cài thư viện: pip install requests
 """
 
 import json
 import os
+import random
 import re
 import time
 import requests
 from datetime import datetime, timezone, timedelta
 
 # ========================== CONFIG ==========================
-USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSZA7u2ySKgEB8UGVvSTwEQLNw8jL159ZCn8293Eb7CAa7nnZBu7SPV5N4aje6158kfnMAGZBo4tuzJdhqDEzFEYNz0Mt1ZBrjg2yphct70kyc3dDpmmE0PfkN6hAdxJtLD8HHUIdaZCOKOcRsjadqMh12WH9i7BgJqbooZBDn3GZCJ8fBGPjqtla3pjMfFz8ZBp3CLnIo")
+USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSeeogSeacmyxvQdq1xNfQbXvSPUTFNmXMtRevU6XTOAcqV8JpmU3th9RwCY94Fz5MhgLGmvsToieBiBeHXHI23lWtU8Foc5XjK2iE3psQ862PPnfQmZBqZCvNAiILg1Ldp1JNHMgqaHhJJwUEIEjjdrhpZCO39ZBhXqgwyDHc2Dmz1XH15DGZCuOG8VyAZBBIr7D5F")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
 
@@ -75,7 +78,29 @@ METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 # --- Cảnh báo token sắp hết hạn ---
 TOKEN_EXPIRY_WARNING_DAYS = 5
 
-CHECK_INTERVAL_SECONDS = 60
+# --- Auto-reply bình luận sau khi bài đã gắn link ---
+ENABLE_AUTO_REPLY = True
+
+# Danh sách câu trả lời mẫu — mỗi lần reply sẽ CHỌN NGẪU NHIÊN 1 trong 10 câu này.
+# Bạn nên tự soạn 10 câu phù hợp với nội dung/giọng văn của Page mình, ví dụ:
+REPLY_TEMPLATES = [
+    "The full story has now been updated in the comments below. Thank you for reading! ❤️",
+    "All parts of the story are available in the comment section now. Hope you enjoy the ending! 📖",
+    "The complete story has been posted below in the comments — you can continue reading there! 👇",
+    "For those asking for the rest of the story — it’s all there now! Scroll through the comments to read the complete version. 👇",
+    "For everyone waiting for the next part, the entire story is now updated in the comments. ❤️",
+    "You don’t have to wait anymore — all remaining parts have been added to the comment section! ✨",
+    "The story is officially complete! Check the comments below to read everything from beginning to end. 👇",
+    "Thank you for being so patient! The full continuation and ending are now available in the comments. 💕",
+    "Wondering what happens next? The complete story has just been updated in the comment section below! 📚",
+    "Good news! Every part, including the final ending, has now been posted in the comments. Enjoy! ❤️",
+]
+
+MAX_REPLIES_PER_SCAN = 20  # giới hạn tổng số reply mỗi lượt quét, tránh bị Facebook coi là spam
+REPLY_DELAY_SECONDS = 10  # nghỉ giữa mỗi lần gửi reply (giây)
+REPLIED_COMMENTERS_FILE = "/data/replied_commenters.json"  # lưu danh sách đã reply (post_id_commenter_id)
+
+CHECK_INTERVAL_SECONDS = 600
 GRAPH_API_VERSION = "v20.0"
 NOTIFIED_FILE = "/data/notified_posts.json"
 # ==============================================================
@@ -441,6 +466,117 @@ def post_already_has_link(post_id: str, page_id: str, page_token: str, post_mess
     return False
 
 
+# -------------------- Auto-reply bình luận độc giả --------------------
+def load_replied_commenters():
+    if os.path.exists(REPLIED_COMMENTERS_FILE):
+        try:
+            with open(REPLIED_COMMENTERS_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_replied_commenters(replied_set):
+    try:
+        os.makedirs(os.path.dirname(REPLIED_COMMENTERS_FILE) or ".", exist_ok=True)
+        with open(REPLIED_COMMENTERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(replied_set), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[LỖI] Không lưu được {REPLIED_COMMENTERS_FILE}: {e}")
+
+
+already_replied_commenters = load_replied_commenters()  # tập hợp "post_id_commenter_id"
+
+
+def get_stream_comments(post_id: str, page_token: str, limit: int = 100):
+    """Lấy danh sách bình luận (id, message, from) của 1 bài viết."""
+    try:
+        r = api_get(
+            f"{GRAPH_URL}/{post_id}/comments",
+            params={"filter": "stream", "limit": limit, "fields": "id,message,from", "access_token": page_token},
+        )
+    except Exception as e:
+        print(f"[LỖI] Lỗi mạng khi lấy comments của {post_id}: {e}")
+        return []
+
+    data = r.json()
+    if "error" in data:
+        return []
+    return data.get("data", [])
+
+
+def reply_to_comment(comment_id: str, text: str, page_token: str) -> bool:
+    try:
+        resp = api_post(
+            f"{GRAPH_URL}/{comment_id}/comments",
+            data={"message": text, "access_token": page_token},
+        )
+        data = resp.json()
+        if "id" not in data:
+            err_msg = data.get("error", {}).get("message", "Không rõ nguyên nhân")
+            print(f"[LỖI] Không reply được comment {comment_id}: {err_msg}")
+            send_error_alert(
+                "auto_reply_failed",
+                f"Không tự trả lời bình luận được (comment {comment_id}).\n"
+                f"Chi tiết: {err_msg}\n"
+                "Có thể thiếu quyền 'pages_manage_engagement' -> cần lấy lại token với quyền này.",
+            )
+            return False
+        return True
+    except Exception as e:
+        print(f"[LỖI] Lỗi mạng khi reply comment {comment_id}: {e}")
+        return False
+
+
+def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, post_message: str) -> int:
+    """Nếu bài đã có link, tự trả lời các độc giả CHƯA từng được trả lời.
+    Trả về số lượng reply đã gửi cho bài này."""
+    global already_replied_commenters
+
+    comments = get_stream_comments(post_id, page_token)
+    if not comments:
+        return 0
+
+    has_link = URL_PATTERN.search(post_message or "") is not None
+    if not has_link:
+        for c in comments:
+            from_id = (c.get("from") or {}).get("id")
+            msg = c.get("message", "") or ""
+            if from_id == page_id and URL_PATTERN.search(msg):
+                has_link = True
+                break
+
+    if not has_link:
+        return 0  # bài chưa gắn link, chưa tới lượt auto-reply
+
+    replies_sent = 0
+    for c in comments:
+        if replies_sent >= MAX_REPLIES_PER_SCAN:
+            break
+
+        commenter = c.get("from") or {}
+        commenter_id = commenter.get("id")
+        comment_id = c.get("id")
+        if not commenter_id or not comment_id:
+            continue
+        if commenter_id == page_id:
+            continue  # bỏ qua bình luận của chính Page (ví dụ bình luận gắn link)
+
+        key = f"{post_id}_{commenter_id}"
+        if key in already_replied_commenters:
+            continue  # độc giả này đã được trả lời rồi, không reply lần 2
+
+        reply_text = random.choice(REPLY_TEMPLATES)
+        ok = reply_to_comment(comment_id, reply_text, page_token)
+        if ok:
+            already_replied_commenters.add(key)
+            replies_sent += 1
+            time.sleep(REPLY_DELAY_SECONDS)
+
+    return replies_sent
+
+
 def check_all_pages():
     check_token_expiry()  # kiểm tra hạn token mỗi lượt quét (rất nhẹ, không đáng kể)
 
@@ -469,61 +605,78 @@ def check_all_pages():
             if not (f"{page_id}_{pid}" in already_notified and f"{page_id}_{pid}" in already_spike_notified)
         ]
 
-        if not post_ids_to_check:
-            continue
+        if post_ids_to_check:
+            stats = get_stats_batch(post_ids_to_check, page_token)
 
-        stats = get_stats_batch(post_ids_to_check, page_token)
+            for post_id in post_ids_to_check:
+                key = f"{page_id}_{post_id}"
+                views, comments, link, message = stats.get(post_id, (None, None, None, ""))
 
-        for post_id in post_ids_to_check:
-            key = f"{page_id}_{post_id}"
-            views, comments, link, message = stats.get(post_id, (None, None, None, ""))
+                if views is None or comments is None:
+                    print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
+                    continue
 
-            if views is None or comments is None:
-                print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
-                continue
+                print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
 
-            print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
+                # --- Kiểm tra dấu hiệu "dựng đứng" ---
+                is_spike = record_and_check_spike(post_id, views, now_dt)
+                if is_spike and key not in already_spike_notified:
+                    spike_msg = (
+                        f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
+                        f"Post ID: {post_id}\n"
+                        f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
+                        f"Comments: {comments}\n"
+                        + (f"Link: {link}\n" if link else "")
+                        + "=> Theo dõi sát, chuẩn bị gắn link!"
+                    )
+                    send_telegram_message(spike_msg)
+                    already_spike_notified.add(key)
+                    changed = True
+                    print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
 
-            # --- Kiểm tra dấu hiệu "dựng đứng" ---
-            is_spike = record_and_check_spike(post_id, views, now_dt)
-            if is_spike and key not in already_spike_notified:
-                spike_msg = (
-                    f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
-                    f"Post ID: {post_id}\n"
-                    f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
-                    f"Comments: {comments}\n"
-                    + (f"Link: {link}\n" if link else "")
-                    + "=> Theo dõi sát, chuẩn bị gắn link!"
-                )
-                send_telegram_message(spike_msg)
-                already_spike_notified.add(key)
-                changed = True
-                print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
+                if not meets_threshold(views, comments) or key in already_notified:
+                    pass  # vẫn tiếp tục xuống dưới để xét auto-reply, không "continue" luôn nữa
+                elif post_already_has_link(post_id, page_id, page_token, message):
+                    print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
+                    already_notified.add(key)
+                    changed = True
+                else:
+                    msg = (
+                        f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
+                        f"Post ID: {post_id}\n"
+                        f"Views: {views}\n"
+                        f"Comments: {comments}\n"
+                        + (f"Link: {link}\n" if link else "")
+                        + "=> Gắn link ngay!"
+                    )
+                    send_telegram_message(msg)
+                    already_notified.add(key)
+                    changed = True
+                    print(f"[{ts}] Đã gửi thông báo Telegram cho [{page_name}] {post_id}")
 
-            if not meets_threshold(views, comments) or key in already_notified:
-                continue
+                # --- Auto-reply bình luận độc giả (chạy cho MỌI bài, không chỉ bài vừa đạt ngưỡng) ---
+                if ENABLE_AUTO_REPLY:
+                    n_replied = process_auto_replies_for_post(post_id, page_id, page_token, message)
+                    if n_replied > 0:
+                        print(f"[{ts}] [{page_name}] {post_id}: đã tự trả lời {n_replied} độc giả mới.")
+                        changed = True
 
-            if post_already_has_link(post_id, page_id, page_token, message):
-                print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
-                already_notified.add(key)
-                changed = True
-                continue
-
-            msg = (
-                f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                f"Post ID: {post_id}\n"
-                f"Views: {views}\n"
-                f"Comments: {comments}\n"
-                + (f"Link: {link}\n" if link else "")
-                + "=> Gắn link ngay!"
-            )
-            send_telegram_message(msg)
-            already_notified.add(key)
-            changed = True
-            print(f"[{ts}] Đã gửi thông báo Telegram cho [{page_name}] {post_id}")
+        # Auto-reply cho cả những bài đã "báo xong cả 2 loại" (bị loại khỏi post_ids_to_check
+        # ở trên) — các bài này không còn được lấy stats nữa, nhưng vẫn cần tiếp tục auto-reply
+        # cho độc giả mới bình luận, cho đến khi bài quá cũ (ngoài ONLY_POSTS_NEWER_THAN_HOURS).
+        if ENABLE_AUTO_REPLY:
+            already_processed_ids = set(post_ids_to_check)
+            for post_id in all_post_ids:
+                if post_id in already_processed_ids:
+                    continue  # đã xử lý ở vòng lặp trên rồi
+                n_replied = process_auto_replies_for_post(post_id, page_id, page_token, "")
+                if n_replied > 0:
+                    print(f"[{ts}] [{page_name}] {post_id}: đã tự trả lời {n_replied} độc giả mới.")
+                    changed = True
 
     if changed:
         save_notified(already_notified)
+        save_replied_commenters(already_replied_commenters)
     save_view_history(view_history)
 
 
