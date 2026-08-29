@@ -7,19 +7,17 @@ tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo l
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 Tự động trả lời bình luận độc giả sau khi bài đã gắn link (1 độc giả
 chỉ được trả lời 1 lần/bài, câu trả lời chọn ngẫu nhiên trong danh sách
-mẫu bạn chuẩn bị sẵn).
+mẫu bạn chuẩn bị sẵn). Báo Telegram khi đã trả lời HẾT bình luận hiện có.
 
-BẢN NÀY THÊM: AUTO-REPLY BÌNH LUẬN
--------------------------------------
-Sau khi 1 bài viết đã được gắn link (trong nội dung bài hoặc bình luận
-của chính Page), script sẽ quét bình luận của độc giả trên bài đó, và
-tự động trả lời (reply) từng độc giả CHƯA từng được trả lời (theo cặp
-bài viết + người bình luận) bằng 1 câu ngẫu nhiên trong REPLY_TEMPLATES.
+BẢN NÀY THÊM: BÁO KHI ĐÃ REPLY HẾT COMMENTS
+-----------------------------------------------
+Khi bot đã trả lời hết toàn bộ bình luận độc giả hiện có trên 1 bài
+(không còn ai bị bỏ sót), gửi 1 tin nhắn Telegram xác nhận riêng — chỉ
+báo đúng 1 lần/bài để bạn kiểm tra thử chất lượng câu trả lời.
 
-⚠️ QUYỀN CẦN THÊM: tính năng này cần quyền GHI (không chỉ đọc) vào bình
-luận, cụ thể là "pages_manage_engagement". Khi lấy USER_ACCESS_TOKEN ở
-Graph API Explorer, nhớ tick thêm quyền này (ngoài 4 quyền cũ), rồi
-Generate Access Token lại.
+⚠️ QUYỀN CẦN THÊM: tính năng auto-reply cần quyền GHI (không chỉ đọc)
+vào bình luận, cụ thể là "pages_manage_engagement". Khi lấy
+USER_ACCESS_TOKEN ở Graph API Explorer, nhớ tick thêm quyền này.
 
 YÊU CẦU
 --------
@@ -82,14 +80,13 @@ TOKEN_EXPIRY_WARNING_DAYS = 5
 ENABLE_AUTO_REPLY = True
 
 # Danh sách câu trả lời mẫu — mỗi lần reply sẽ CHỌN NGẪU NHIÊN 1 trong 10 câu này.
-# Bạn nên tự soạn 10 câu phù hợp với nội dung/giọng văn của Page mình, ví dụ:
 REPLY_TEMPLATES = [
     "The full story has now been updated in the comments below. Thank you for reading! ❤️",
     "All parts of the story are available in the comment section now. Hope you enjoy the ending! 📖",
     "The complete story has been posted below in the comments — you can continue reading there! 👇",
-    "For those asking for the rest of the story — it’s all there now! Scroll through the comments to read the complete version. 👇",
+    "For those asking for the rest of the story — it's all there now! Scroll through the comments to read the complete version. 👇",
     "For everyone waiting for the next part, the entire story is now updated in the comments. ❤️",
-    "You don’t have to wait anymore — all remaining parts have been added to the comment section! ✨",
+    "You don't have to wait anymore — all remaining parts have been added to the comment section! ✨",
     "The story is officially complete! Check the comments below to read everything from beginning to end. 👇",
     "Thank you for being so patient! The full continuation and ending are now available in the comments. 💕",
     "Wondering what happens next? The complete story has just been updated in the comment section below! 📚",
@@ -529,14 +526,16 @@ def reply_to_comment(comment_id: str, text: str, page_token: str) -> bool:
         return False
 
 
-def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, post_message: str) -> int:
+def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, post_message: str, page_name: str = ""):
     """Nếu bài đã có link, tự trả lời các độc giả CHƯA từng được trả lời.
-    Trả về số lượng reply đã gửi cho bài này."""
-    global already_replied_commenters
+    Khi đã trả lời HẾT toàn bộ bình luận hiện có (không còn ai bị bỏ sót),
+    gửi 1 thông báo Telegram xác nhận riêng (chỉ báo 1 lần/bài).
+    Trả về tuple (số reply đã gửi lượt này, có thay đổi trạng thái cần lưu không)."""
+    global already_notified
 
     comments = get_stream_comments(post_id, page_token)
     if not comments:
-        return 0
+        return 0, False
 
     has_link = URL_PATTERN.search(post_message or "") is not None
     if not has_link:
@@ -548,13 +547,12 @@ def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, p
                 break
 
     if not has_link:
-        return 0  # bài chưa gắn link, chưa tới lượt auto-reply
+        return 0, False  # bài chưa gắn link, chưa tới lượt auto-reply
 
     replies_sent = 0
-    for c in comments:
-        if replies_sent >= MAX_REPLIES_PER_SCAN:
-            break
+    real_reader_keys = []  # danh sách key của các bình luận thực sự từ độc giả (không tính Page)
 
+    for c in comments:
         commenter = c.get("from") or {}
         commenter_id = commenter.get("id")
         comment_id = c.get("id")
@@ -564,8 +562,12 @@ def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, p
             continue  # bỏ qua bình luận của chính Page (ví dụ bình luận gắn link)
 
         key = f"{post_id}_{commenter_id}"
+        real_reader_keys.append(key)
+
         if key in already_replied_commenters:
             continue  # độc giả này đã được trả lời rồi, không reply lần 2
+        if replies_sent >= MAX_REPLIES_PER_SCAN:
+            continue  # đạt giới hạn reply/lượt quét, để dành cho lượt sau
 
         reply_text = random.choice(REPLY_TEMPLATES)
         ok = reply_to_comment(comment_id, reply_text, page_token)
@@ -574,7 +576,23 @@ def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, p
             replies_sent += 1
             time.sleep(REPLY_DELAY_SECONDS)
 
-    return replies_sent
+    # --- Kiểm tra đã trả lời HẾT chưa, báo Telegram 1 lần duy nhất nếu đúng ---
+    state_changed = replies_sent > 0
+    caughtup_key = f"caughtup_{post_id}"
+    if real_reader_keys and caughtup_key not in already_notified:
+        all_replied = all(k in already_replied_commenters for k in real_reader_keys)
+        if all_replied:
+            send_telegram_message(
+                f"✅ ĐÃ TRẢ LỜI HẾT BÌNH LUẬN!\n"
+                f"Page: {page_name}\n"
+                f"Post ID: {post_id}\n"
+                f"Tổng số độc giả đã trả lời: {len(real_reader_keys)}\n"
+                "=> Kiểm tra thử xem câu trả lời có ổn không nhé!"
+            )
+            already_notified.add(caughtup_key)
+            state_changed = True
+
+    return replies_sent, state_changed
 
 
 def check_all_pages():
@@ -656,9 +674,10 @@ def check_all_pages():
 
                 # --- Auto-reply bình luận độc giả (chạy cho MỌI bài, không chỉ bài vừa đạt ngưỡng) ---
                 if ENABLE_AUTO_REPLY:
-                    n_replied = process_auto_replies_for_post(post_id, page_id, page_token, message)
+                    n_replied, reply_state_changed = process_auto_replies_for_post(post_id, page_id, page_token, message, page_name)
                     if n_replied > 0:
                         print(f"[{ts}] [{page_name}] {post_id}: đã tự trả lời {n_replied} độc giả mới.")
+                    if reply_state_changed:
                         changed = True
 
         # Auto-reply cho cả những bài đã "báo xong cả 2 loại" (bị loại khỏi post_ids_to_check
@@ -669,9 +688,10 @@ def check_all_pages():
             for post_id in all_post_ids:
                 if post_id in already_processed_ids:
                     continue  # đã xử lý ở vòng lặp trên rồi
-                n_replied = process_auto_replies_for_post(post_id, page_id, page_token, "")
+                n_replied, reply_state_changed = process_auto_replies_for_post(post_id, page_id, page_token, "", page_name)
                 if n_replied > 0:
                     print(f"[{ts}] [{page_name}] {post_id}: đã tự trả lời {n_replied} độc giả mới.")
+                if reply_state_changed:
                     changed = True
 
     if changed:
