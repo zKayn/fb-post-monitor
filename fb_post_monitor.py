@@ -486,21 +486,44 @@ def save_replied_commenters(replied_set):
 already_replied_commenters = load_replied_commenters()  # tập hợp "post_id_commenter_id"
 
 
-def get_stream_comments(post_id: str, page_token: str, limit: int = 100):
-    """Lấy danh sách bình luận (id, message, from) của 1 bài viết."""
+def get_stream_comments(post_id: str, page_token: str, max_comments: int = 2000):
+    """Lấy TOÀN BỘ bình luận (id, message, from) của 1 bài viết, tự động
+    phân trang cho tới khi hết hoặc đạt max_comments (để tránh vòng lặp
+    vô hạn nếu bài có quá nhiều bình luận)."""
+    all_comments = []
+    url = f"{GRAPH_URL}/{post_id}/comments"
+    params = {"filter": "stream", "limit": 100, "fields": "id,message,from", "access_token": page_token}
+
+    while url and len(all_comments) < max_comments:
+        try:
+            r = api_get(url, params=params)
+        except Exception as e:
+            print(f"[LỖI] Lỗi mạng khi lấy comments của {post_id}: {e}")
+            break
+
+        data = r.json()
+        if "error" in data:
+            break
+
+        all_comments.extend(data.get("data", []))
+        next_url = data.get("paging", {}).get("next")
+        url = next_url
+        params = None  # next_url đã có sẵn đầy đủ query string (kể cả access_token)
+
+    return all_comments
+
+
+def get_post_permalink(post_id: str, page_token: str) -> str:
+    """Lấy link thật của bài viết (dùng khi báo 'đã trả lời hết bình luận')."""
     try:
         r = api_get(
-            f"{GRAPH_URL}/{post_id}/comments",
-            params={"filter": "stream", "limit": limit, "fields": "id,message,from", "access_token": page_token},
+            f"{GRAPH_URL}/{post_id}",
+            params={"fields": "permalink_url", "access_token": page_token},
         )
-    except Exception as e:
-        print(f"[LỖI] Lỗi mạng khi lấy comments của {post_id}: {e}")
-        return []
-
-    data = r.json()
-    if "error" in data:
-        return []
-    return data.get("data", [])
+        data = r.json()
+        return data.get("permalink_url", "")
+    except Exception:
+        return ""
 
 
 def reply_to_comment(comment_id: str, text: str, page_token: str) -> bool:
@@ -582,11 +605,12 @@ def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, p
     if real_reader_keys and caughtup_key not in already_notified:
         all_replied = all(k in already_replied_commenters for k in real_reader_keys)
         if all_replied:
+            permalink = get_post_permalink(post_id, page_token)
             send_telegram_message(
                 f"✅ ĐÃ TRẢ LỜI HẾT BÌNH LUẬN!\n"
                 f"Page: {page_name}\n"
-                f"Post ID: {post_id}\n"
-                f"Tổng số độc giả đã trả lời: {len(real_reader_keys)}\n"
+                + (f"Link: {permalink}\n" if permalink else f"Post ID: {post_id}\n")
+                + f"Tổng số độc giả đã trả lời: {len(set(real_reader_keys))}\n"
                 "=> Kiểm tra thử xem câu trả lời có ổn không nhé!"
             )
             already_notified.add(caughtup_key)
