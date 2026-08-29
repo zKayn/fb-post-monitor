@@ -79,22 +79,34 @@ TOKEN_EXPIRY_WARNING_DAYS = 5
 # --- Auto-reply bình luận sau khi bài đã gắn link ---
 ENABLE_AUTO_REPLY = True
 
-# Danh sách câu trả lời mẫu — mỗi lần reply sẽ CHỌN NGẪU NHIÊN 1 trong 10 câu này.
-REPLY_TEMPLATES = [
+# Danh sách câu trả lời mẫu CÓ chèn tên độc giả — {name} sẽ được thay bằng
+# tên (first name) của người bình luận khi lấy được.
+REPLY_TEMPLATES_WITH_NAME = [
+    "Hi {name}! The full story has now been updated in the comments below. Thank you for reading! ❤️",
+    "Thanks for reading, {name}! All parts of the story are available in the comment section now. 📖",
+    "Hi {name}, the complete story has been posted below in the comments — you can continue reading there! 👇",
+    "{name}, the entire story is now updated in the comments. Hope you enjoy it! ❤️",
+    "Thanks so much, {name}! The full continuation and ending are now available in the comments. 💕",
+    "Hey {name}, the complete story has just been updated in the comment section below! 📚",
+]
+
+# Danh sách dự phòng KHÔNG có tên — dùng khi không lấy được tên độc giả,
+# hoặc được chọn xen kẽ ngẫu nhiên để tăng độ đa dạng, giảm khả năng bị
+# Facebook coi là spam (do lặp lại y hệt quá nhiều).
+REPLY_TEMPLATES_NO_NAME = [
     "The full story has now been updated in the comments below. Thank you for reading! ❤️",
     "All parts of the story are available in the comment section now. Hope you enjoy the ending! 📖",
     "The complete story has been posted below in the comments — you can continue reading there! 👇",
     "For those asking for the rest of the story — it's all there now! Scroll through the comments to read the complete version. 👇",
-    "For everyone waiting for the next part, the entire story is now updated in the comments. ❤️",
     "You don't have to wait anymore — all remaining parts have been added to the comment section! ✨",
     "The story is officially complete! Check the comments below to read everything from beginning to end. 👇",
-    "Thank you for being so patient! The full continuation and ending are now available in the comments. 💕",
     "Wondering what happens next? The complete story has just been updated in the comment section below! 📚",
     "Good news! Every part, including the final ending, has now been posted in the comments. Enjoy! ❤️",
 ]
 
-MAX_REPLIES_PER_SCAN = 20  # giới hạn tổng số reply mỗi lượt quét, tránh bị Facebook coi là spam
-REPLY_DELAY_SECONDS = 10  # nghỉ giữa mỗi lần gửi reply (giây)
+MAX_REPLIES_PER_SCAN = 8  # giảm từ 20 xuống 8 để phù hợp với thời gian nghỉ dài hơn giữa các reply
+REPLY_DELAY_MIN_SECONDS = 20  # nghỉ ngẫu nhiên giữa mỗi lần reply, tránh nhịp độ đều đặn dễ bị phát hiện là bot
+REPLY_DELAY_MAX_SECONDS = 45
 REPLIED_COMMENTERS_FILE = "/data/replied_commenters.json"  # lưu danh sách đã reply (post_id_commenter_id)
 
 CHECK_INTERVAL_SECONDS = 600
@@ -526,6 +538,23 @@ def get_post_permalink(post_id: str, page_token: str) -> str:
         return ""
 
 
+def build_reply_text(commenter_name: str) -> str:
+    """Tạo câu trả lời, ưu tiên chèn tên độc giả nếu có, xen kẽ ngẫu nhiên
+    với bản không tên để tăng độ đa dạng (giảm nguy cơ bị Facebook coi
+    là spam do lặp lại y hệt quá nhiều)."""
+    first_name = ""
+    if commenter_name:
+        parts = commenter_name.strip().split()
+        if parts:
+            first_name = parts[0]
+
+    if first_name and random.random() < 0.7:  # 70% cơ hội dùng bản có tên nếu lấy được tên
+        template = random.choice(REPLY_TEMPLATES_WITH_NAME)
+        return template.format(name=first_name)
+
+    return random.choice(REPLY_TEMPLATES_NO_NAME)
+
+
 def reply_to_comment(comment_id: str, text: str, page_token: str) -> bool:
     try:
         resp = api_post(
@@ -578,6 +607,7 @@ def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, p
     for c in comments:
         commenter = c.get("from") or {}
         commenter_id = commenter.get("id")
+        commenter_name = commenter.get("name", "")
         comment_id = c.get("id")
         if not commenter_id or not comment_id:
             continue
@@ -592,12 +622,12 @@ def process_auto_replies_for_post(post_id: str, page_id: str, page_token: str, p
         if replies_sent >= MAX_REPLIES_PER_SCAN:
             continue  # đạt giới hạn reply/lượt quét, để dành cho lượt sau
 
-        reply_text = random.choice(REPLY_TEMPLATES)
+        reply_text = build_reply_text(commenter_name)
         ok = reply_to_comment(comment_id, reply_text, page_token)
         if ok:
             already_replied_commenters.add(key)
             replies_sent += 1
-            time.sleep(REPLY_DELAY_SECONDS)
+            time.sleep(random.uniform(REPLY_DELAY_MIN_SECONDS, REPLY_DELAY_MAX_SECONDS))
 
     # --- Kiểm tra đã trả lời HẾT chưa, báo Telegram 1 lần duy nhất nếu đúng ---
     state_changed = replies_sent > 0
