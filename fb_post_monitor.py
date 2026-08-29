@@ -77,7 +77,7 @@ METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 TOKEN_EXPIRY_WARNING_DAYS = 5
 
 # --- Auto-reply bình luận sau khi bài đã gắn link ---
-ENABLE_AUTO_REPLY = True
+ENABLE_AUTO_REPLY = False
 
 # Danh sách câu trả lời mẫu CÓ chèn tên độc giả — {name} sẽ được thay bằng
 # tên (first name) của người bình luận khi lấy được.
