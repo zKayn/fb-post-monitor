@@ -476,18 +476,23 @@ def check_all_pages():
             # --- Kiểm tra dấu hiệu "dựng đứng" ---
             is_spike = record_and_check_spike(post_id, views, now_dt)
             if is_spike and key not in already_spike_notified:
+                spike_has_link = post_already_has_link(post_id, page_id, page_token, message)
+                if spike_has_link:
+                    action_line = "=> Bài ĐÃ gắn link rồi, tiếp tục theo dõi đà tăng trưởng."
+                else:
+                    action_line = "=> CHƯA gắn link, theo dõi sát và chuẩn bị gắn link ngay!"
                 spike_msg = (
                     f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
                     f"Post ID: {post_id}\n"
                     f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
                     f"Comments: {comments}\n"
                     + (f"Link: {link}\n" if link else "")
-                    + "=> Theo dõi sát, chuẩn bị gắn link!"
+                    + action_line
                 )
                 send_telegram_message(spike_msg)
                 already_spike_notified.add(key)
                 changed = True
-                print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
+                print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id} (đã gắn link: {spike_has_link})")
 
             if not meets_threshold(views, comments) or key in already_notified:
                 continue
