@@ -1,16 +1,19 @@
 """
-FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN HẾT HẠN)
+FB POST MONITOR (CHẠY QUA GITHUB ACTIONS - MIỄN PHÍ VĨNH VIỄN)
 =================================================================
 Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi thông báo
 Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
 tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 
+
 YÊU CẦU
 --------
 1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
    pages_read_engagement, pages_read_user_content, read_insights
 2. Telegram Bot Token + Chat ID
+3. Trên GitHub repo: Settings -> Secrets and variables -> Actions,
+   thêm 3 secret: USER_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 
 import json
@@ -43,26 +46,22 @@ SPIKE_LOOKBACK_MINUTES = 30
 SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
 SPIKE_MIN_VIEWS_TO_CHECK = 2000
-VIEW_HISTORY_FILE = "/data/view_history.json"
+VIEW_HISTORY_FILE = "view_history.json"  # lưu ngay trong repo, KHÔNG dùng /data (GitHub Actions không có Volume)
 
 # --- Retry khi gặp lỗi mạng tạm thời ---
 MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 3  # tăng dần: 3s, 6s, 9s giữa các lần thử lại
+RETRY_BACKOFF_SECONDS = 3
 
 # --- Batch API ---
-# Mỗi bài viết cần 3 sub-request: 2 request insights riêng biệt (giữ cơ chế
-# fallback metric để không mất dữ liệu nếu 1 metric không áp dụng được cho
-# bài đó) + 1 request lấy message/comments/link. 16 bài x 3 = 48, dưới giới
-# hạn tối đa 50 sub-request/batch của Facebook.
 POSTS_PER_BATCH = 16
 METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 
 # --- Cảnh báo token sắp hết hạn ---
 TOKEN_EXPIRY_WARNING_DAYS = 5
 
-CHECK_INTERVAL_SECONDS = 600
 GRAPH_API_VERSION = "v20.0"
-NOTIFIED_FILE = "/data/notified_posts.json"
+NOTIFIED_FILE = "notified_posts.json"  # lưu ngay trong repo
+ERROR_ALERT_STATE_FILE = "error_alert_state.json"  # lưu thời điểm báo lỗi gần nhất, để cooldown hoạt động đúng qua nhiều lần chạy
 # ==============================================================
 
 GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -71,7 +70,6 @@ URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 
 # ==================== RETRY HELPER ====================
 def api_get(url, params=None, timeout=20):
-    """GET request có tự động retry khi gặp lỗi mạng tạm thời."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -85,7 +83,6 @@ def api_get(url, params=None, timeout=20):
 
 
 def api_post(url, data=None, timeout=30):
-    """POST request có tự động retry khi gặp lỗi mạng tạm thời."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -120,7 +117,6 @@ def load_notified():
 
 def save_notified(notified_set):
     try:
-        os.makedirs(os.path.dirname(NOTIFIED_FILE) or ".", exist_ok=True)
         with open(NOTIFIED_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(notified_set), f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -144,7 +140,6 @@ def load_view_history():
 
 def save_view_history(history: dict):
     try:
-        os.makedirs(os.path.dirname(VIEW_HISTORY_FILE) or ".", exist_ok=True)
         with open(VIEW_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -190,21 +185,43 @@ def send_telegram_message(text: str):
 
 
 ERROR_COOLDOWN_MINUTES = 30
-_last_error_sent_at = {}
+
+
+def load_error_alert_state():
+    if os.path.exists(ERROR_ALERT_STATE_FILE):
+        try:
+            with open(ERROR_ALERT_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)  # {error_key: iso_timestamp}
+        except Exception:
+            return {}
+    return {}
+
+
+def save_error_alert_state(state: dict):
+    try:
+        with open(ERROR_ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[LỖI] Không lưu được {ERROR_ALERT_STATE_FILE}: {e}")
+
+
+_last_error_sent_at = load_error_alert_state()  # {error_key: iso_timestamp}, lưu file để cooldown đúng qua nhiều lần chạy
 
 
 def send_error_alert(error_key: str, text: str):
     now = datetime.now()
-    last_sent = _last_error_sent_at.get(error_key)
-    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
-        return
+    last_sent_str = _last_error_sent_at.get(error_key)
+    if last_sent_str:
+        last_sent = datetime.fromisoformat(last_sent_str)
+        if (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
+            return
     send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
-    _last_error_sent_at[error_key] = now
+    _last_error_sent_at[error_key] = now.isoformat()
+    save_error_alert_state(_last_error_sent_at)
 
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
 def check_token_expiry():
-    """Tự hỏi Facebook token còn bao lâu hết hạn, cảnh báo nếu sắp hết."""
     try:
         r = api_get(
             f"{GRAPH_URL}/debug_token",
@@ -219,12 +236,12 @@ def check_token_expiry():
         send_error_alert(
             "token_invalid",
             "USER_ACCESS_TOKEN không còn hợp lệ (có thể đã hết hạn hoặc bị thu hồi)! "
-            "Hãy lấy token mới và cập nhật vào Railway Variables ngay.",
+            "Hãy lấy token mới và cập nhật vào GitHub Secrets ngay.",
         )
         return
 
     expires_at = data.get("expires_at")
-    if not expires_at:  # 0 hoặc None = token không có hạn / không xác định được
+    if not expires_at:
         return
 
     expire_dt = datetime.fromtimestamp(expires_at)
@@ -235,7 +252,7 @@ def check_token_expiry():
             f"USER_ACCESS_TOKEN sắp hết hạn! Còn khoảng {days_left} ngày "
             f"(hết hạn lúc {expire_dt.strftime('%H:%M %d/%m/%Y')}).\n"
             "Hãy lấy Long-Lived Token mới tại Graph API Explorer và cập nhật "
-            "vào Railway -> Variables -> USER_ACCESS_TOKEN.",
+            "vào GitHub -> Settings -> Secrets and variables -> Actions -> USER_ACCESS_TOKEN.",
         )
 
 
@@ -308,12 +325,6 @@ def chunked(lst, n):
 
 
 def get_stats_batch(post_ids: list, page_token: str) -> dict:
-    """Lấy views/comments/link/message của nhiều bài viết cùng lúc qua
-    Facebook Batch API (tối đa POSTS_PER_BATCH bài/lần gọi HTTP).
-    Mỗi bài dùng 2 sub-request insights riêng biệt theo METRIC_FALLBACKS
-    (không gộp chung 1 câu truy vấn) để giữ cơ chế fallback: nếu metric A
-    không áp dụng được cho bài đó, vẫn còn kết quả từ metric B, tránh mất
-    dữ liệu oan uổng do 1 metric lỗi kéo cả bài xuống."""
     results = {}
 
     for group in chunked(post_ids, POSTS_PER_BATCH):
@@ -321,16 +332,10 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
         for pid in group:
             for metric in METRIC_FALLBACKS:
                 batch_items.append(
-                    {
-                        "method": "GET",
-                        "relative_url": f"{pid}/insights?metric={metric}&period=lifetime",
-                    }
+                    {"method": "GET", "relative_url": f"{pid}/insights?metric={metric}&period=lifetime"}
                 )
             batch_items.append(
-                {
-                    "method": "GET",
-                    "relative_url": f"{pid}?fields=message,comments.summary(true),permalink_url",
-                }
+                {"method": "GET", "relative_url": f"{pid}?fields=message,comments.summary(true),permalink_url"}
             )
 
         try:
@@ -355,14 +360,13 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             continue
 
         n_metrics = len(METRIC_FALLBACKS)
-        items_per_post = n_metrics + 1  # 2 insights + 1 fields
+        items_per_post = n_metrics + 1
 
         for idx, pid in enumerate(group):
             base = idx * items_per_post
             insight_items = batch_resp[base : base + n_metrics] if base + n_metrics <= len(batch_resp) else []
             fields_item = batch_resp[base + n_metrics] if base + n_metrics < len(batch_resp) else None
 
-            # Thử lần lượt từng metric, lấy kết quả đầu tiên hợp lệ
             views = None
             for insight_item in insight_items:
                 if insight_item and insight_item.get("code") == 200:
@@ -427,7 +431,7 @@ def post_already_has_link(post_id: str, page_id: str, page_token: str, post_mess
 
 
 def check_all_pages():
-    check_token_expiry()  # kiểm tra hạn token mỗi lượt quét (rất nhẹ, không đáng kể)
+    check_token_expiry()
 
     pages = get_managed_pages()
     ts = datetime.now().strftime("%H:%M:%S")
@@ -448,7 +452,6 @@ def check_all_pages():
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
 
-        # Chỉ bỏ qua hoàn toàn khi bài đã được báo CẢ 2 loại (ngưỡng chính + spike)
         post_ids_to_check = [
             pid for pid in all_post_ids
             if not (f"{page_id}_{pid}" in already_notified and f"{page_id}_{pid}" in already_spike_notified)
@@ -469,7 +472,6 @@ def check_all_pages():
 
             print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
 
-            # --- Kiểm tra dấu hiệu "dựng đứng" ---
             is_spike = record_and_check_spike(post_id, views, now_dt)
             if is_spike and key not in already_spike_notified:
                 spike_has_link = post_already_has_link(post_id, page_id, page_token, message)
@@ -478,7 +480,8 @@ def check_all_pages():
                 else:
                     action_line = "=> CHƯA gắn link, theo dõi sát và chuẩn bị gắn link ngay!"
                 spike_msg = (
-                    f"📈 ĐANG BÙNG NỔ! (Page: {page_name})\n"
+                    f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
+                    f"Post ID: {post_id}\n"
                     f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
                     f"Comments: {comments}\n"
                     + (f"Link: {link}\n" if link else "")
@@ -500,6 +503,7 @@ def check_all_pages():
 
             msg = (
                 f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
+                f"Post ID: {post_id}\n"
                 f"Views: {views}\n"
                 f"Comments: {comments}\n"
                 + (f"Link: {link}\n" if link else "")
@@ -515,16 +519,7 @@ def check_all_pages():
     save_view_history(view_history)
 
 
-def main():
-    print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
-    while True:
-        try:
-            check_all_pages()
-        except Exception as e:
-            print(f"[LỖI] Lỗi không xác định trong vòng quét: {e}")
-            send_error_alert("main_loop_exception", f"Lỗi không xác định trong vòng quét:\n{e}")
-        time.sleep(CHECK_INTERVAL_SECONDS)
-
-
 if __name__ == "__main__":
-    main()
+    print("Bắt đầu 1 lượt quét (GitHub Actions)...")
+    check_all_pages()
+    print("Hoàn tất lượt quét.")
