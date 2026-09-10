@@ -482,8 +482,7 @@ def check_all_pages():
                 else:
                     action_line = "=> CHƯA gắn link, theo dõi sát và chuẩn bị gắn link ngay!"
                 spike_msg = (
-                    f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
-                    f"Post ID: {post_id}\n"
+                    f"📈 ĐANG BÙNG NỔ! (Page: {page_name})\n"
                     f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
                     f"Comments: {comments}\n"
                     + (f"Link: {link}\n" if link else "")
@@ -505,7 +504,6 @@ def check_all_pages():
 
             msg = (
                 f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                f"Post ID: {post_id}\n"
                 f"Views: {views}\n"
                 f"Comments: {comments}\n"
                 + (f"Link: {link}\n" if link else "")
