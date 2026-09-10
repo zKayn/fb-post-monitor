@@ -6,15 +6,11 @@ Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấ
 tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 
-(Đã bỏ tính năng auto-reply bình luận độc giả — Facebook tự ẩn các
-reply hàng loạt vì bị coi là spam, không đáng để duy trì độ phức tạp.)
-
 YÊU CẦU
 --------
 1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
    pages_read_engagement, pages_read_user_content, read_insights
 2. Telegram Bot Token + Chat ID
-3. Cài thư viện: pip install requests
 """
 
 import json
