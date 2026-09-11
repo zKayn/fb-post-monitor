@@ -2,8 +2,9 @@ name: FB Post Monitor
 
 on:
   schedule:
-    # Tự chạy mỗi 15 phút, 24 giờ/ngày, 7 ngày/tuần
-    - cron: "*/15 * * * *"
+    # Chạy 4 lần mỗi giờ, 24/7
+    # Cố tình lệch khỏi phút 00/15/30/45 để giảm khả năng bị trễ
+    - cron: "7,22,37,52 * * * *"
 
   # Vẫn giữ nút này để khi cần bạn có thể test thủ công
   workflow_dispatch:
