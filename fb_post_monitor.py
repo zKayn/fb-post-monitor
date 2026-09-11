@@ -41,13 +41,12 @@ INCLUDE_PAGE_NAMES = []
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 THRESHOLD_RULES = [
-    {"min_views": 4500, "min_comments": 20},
-    {"min_views": 3500, "min_comments": 100},
+    {"min_views": 3000, "min_comments": 40},
 ]
-COMMENT_ONLY_THRESHOLD = 100  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 50  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
-ONLY_POSTS_NEWER_THAN_HOURS = 72
+ONLY_POSTS_NEWER_THAN_HOURS = 120
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
 SPIKE_LOOKBACK_MINUTES = 30
@@ -489,7 +488,6 @@ def check_all_pages():
                     action_line = "=> CHƯA gắn link, theo dõi sát và chuẩn bị gắn link ngay!"
                 spike_msg = (
                     f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
-                    f"Post ID: {post_id}\n"
                     f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
                     f"Comments: {comments}\n"
                     + (f"Link: {link}\n" if link else "")
@@ -511,7 +509,6 @@ def check_all_pages():
 
             msg = (
                 f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                f"Post ID: {post_id}\n"
                 f"Views: {views}\n"
                 f"Comments: {comments}\n"
                 + (f"Link: {link}\n" if link else "")
