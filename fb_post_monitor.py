@@ -1,5 +1,5 @@
 """
-FB POST MONITOR (CHẠY QUA GITHUB ACTIONS - MIỄN PHÍ VĨNH VIỄN)
+FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN HẾT HẠN)
 =================================================================
 Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi thông báo
 Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
@@ -11,8 +11,6 @@ YÊU CẦU
 1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
    pages_read_engagement, pages_read_user_content, read_insights
 2. Telegram Bot Token + Chat ID
-3. Trên GitHub repo: Settings -> Secrets and variables -> Actions,
-   thêm 3 secret: USER_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 
 import json
@@ -23,9 +21,9 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ========================== CONFIG ==========================
-USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSRsR5ZCZBpfGsLffEZCUEYtBzMyDB7cF2LLZChO79rUIU5BCB779Rs7xDaAw6dZBOpUU3n8ZCFKznyoZBJ9E7bydbzrFXsmKzfbgFZBYKyyLZACcvfutHlW4IJq1Kci2qFfM97yNr3jnZBytbjSocCxFy5B8XfSVTUpfFsQDFl4iZAZClkHYTovciRZA9NZBJMxDI21SZBS0gzx")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
@@ -44,23 +42,26 @@ SPIKE_LOOKBACK_MINUTES = 30
 SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
 SPIKE_MIN_VIEWS_TO_CHECK = 2000
-VIEW_HISTORY_FILE = "view_history.json"  # lưu ngay trong repo, KHÔNG dùng /data (GitHub Actions không có Volume)
-VIEW_HISTORY_RETENTION_DAYS = 5  # chỉ giữ lịch sử views trong 5 ngày để file không phình quá lớn
+VIEW_HISTORY_FILE = "/data/view_history.json"
 
 # --- Retry khi gặp lỗi mạng tạm thời ---
 MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 3
+RETRY_BACKOFF_SECONDS = 3  # tăng dần: 3s, 6s, 9s giữa các lần thử lại
 
 # --- Batch API ---
+# Mỗi bài viết cần 3 sub-request: 2 request insights riêng biệt (giữ cơ chế
+# fallback metric để không mất dữ liệu nếu 1 metric không áp dụng được cho
+# bài đó) + 1 request lấy message/comments/link. 16 bài x 3 = 48, dưới giới
+# hạn tối đa 50 sub-request/batch của Facebook.
 POSTS_PER_BATCH = 16
 METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 
 # --- Cảnh báo token sắp hết hạn ---
 TOKEN_EXPIRY_WARNING_DAYS = 5
 
+CHECK_INTERVAL_SECONDS = 600
 GRAPH_API_VERSION = "v20.0"
-NOTIFIED_FILE = "notified_posts.json"  # lưu ngay trong repo
-ERROR_ALERT_STATE_FILE = "error_alert_state.json"  # lưu thời điểm báo lỗi gần nhất, để cooldown hoạt động đúng qua nhiều lần chạy
+NOTIFIED_FILE = "/data/notified_posts.json"
 # ==============================================================
 
 GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -69,6 +70,7 @@ URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 
 # ==================== RETRY HELPER ====================
 def api_get(url, params=None, timeout=20):
+    """GET request có tự động retry khi gặp lỗi mạng tạm thời."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -82,6 +84,7 @@ def api_get(url, params=None, timeout=20):
 
 
 def api_post(url, data=None, timeout=30):
+    """POST request có tự động retry khi gặp lỗi mạng tạm thời."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -103,9 +106,7 @@ def meets_threshold(views: int, comments: int) -> bool:
     return False
 
 
-# -------------------- Lưu/đọc trạng thái đã xử lý --------------------
-# notified_posts.json là danh sách DUY NHẤT cho mọi loại thông báo.
-# Một key đã vào file này thì bài đó sẽ không bao giờ được báo lại.
+# -------------------- Lưu/đọc trạng thái đã báo --------------------
 def load_notified():
     if os.path.exists(NOTIFIED_FILE):
         try:
@@ -118,6 +119,7 @@ def load_notified():
 
 def save_notified(notified_set):
     try:
+        os.makedirs(os.path.dirname(NOTIFIED_FILE) or ".", exist_ok=True)
         with open(NOTIFIED_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(notified_set), f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -125,6 +127,8 @@ def save_notified(notified_set):
 
 
 already_notified = load_notified()
+# already_spike_notified không dùng set riêng nữa -> lưu chung vào already_notified
+# với tiền tố "spike_" để không bị mất khi restart (trước đây chỉ lưu trong bộ nhớ).
 
 
 # -------------------- Lưu/đọc lịch sử views (spike detection) --------------------
@@ -140,44 +144,11 @@ def load_view_history():
 
 def save_view_history(history: dict):
     try:
+        os.makedirs(os.path.dirname(VIEW_HISTORY_FILE) or ".", exist_ok=True)
         with open(VIEW_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[LỖI] Không lưu được {VIEW_HISTORY_FILE}: {e}")
-
-
-def cleanup_view_history(now: datetime):
-    """Xóa các điểm lịch sử views cũ hơn VIEW_HISTORY_RETENTION_DAYS ngày."""
-    cutoff = now - timedelta(days=VIEW_HISTORY_RETENTION_DAYS)
-    removed_points = 0
-    removed_posts = 0
-
-    for post_id in list(view_history.keys()):
-        points = view_history.get(post_id, [])
-        kept_points = []
-
-        for point in points:
-            try:
-                ts_str, views = point
-                ts = datetime.fromisoformat(ts_str)
-                if ts >= cutoff:
-                    kept_points.append(point)
-                else:
-                    removed_points += 1
-            except Exception:
-                removed_points += 1
-
-        if kept_points:
-            view_history[post_id] = kept_points
-        else:
-            del view_history[post_id]
-            removed_posts += 1
-
-    if removed_points or removed_posts:
-        print(
-            f"[DỌN LỊCH SỬ] Đã xóa {removed_points} điểm views cũ "
-            f"và {removed_posts} bài không còn dữ liệu."
-        )
 
 
 view_history = load_view_history()
@@ -219,43 +190,21 @@ def send_telegram_message(text: str):
 
 
 ERROR_COOLDOWN_MINUTES = 30
-
-
-def load_error_alert_state():
-    if os.path.exists(ERROR_ALERT_STATE_FILE):
-        try:
-            with open(ERROR_ALERT_STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)  # {error_key: iso_timestamp}
-        except Exception:
-            return {}
-    return {}
-
-
-def save_error_alert_state(state: dict):
-    try:
-        with open(ERROR_ALERT_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[LỖI] Không lưu được {ERROR_ALERT_STATE_FILE}: {e}")
-
-
-_last_error_sent_at = load_error_alert_state()  # {error_key: iso_timestamp}, lưu file để cooldown đúng qua nhiều lần chạy
+_last_error_sent_at = {}
 
 
 def send_error_alert(error_key: str, text: str):
     now = datetime.now()
-    last_sent_str = _last_error_sent_at.get(error_key)
-    if last_sent_str:
-        last_sent = datetime.fromisoformat(last_sent_str)
-        if (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
-            return
+    last_sent = _last_error_sent_at.get(error_key)
+    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
+        return
     send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
-    _last_error_sent_at[error_key] = now.isoformat()
-    save_error_alert_state(_last_error_sent_at)
+    _last_error_sent_at[error_key] = now
 
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
 def check_token_expiry():
+    """Tự hỏi Facebook token còn bao lâu hết hạn, cảnh báo nếu sắp hết."""
     try:
         r = api_get(
             f"{GRAPH_URL}/debug_token",
@@ -270,12 +219,12 @@ def check_token_expiry():
         send_error_alert(
             "token_invalid",
             "USER_ACCESS_TOKEN không còn hợp lệ (có thể đã hết hạn hoặc bị thu hồi)! "
-            "Hãy lấy token mới và cập nhật vào GitHub Secrets ngay.",
+            "Hãy lấy token mới và cập nhật vào Railway Variables ngay.",
         )
         return
 
     expires_at = data.get("expires_at")
-    if not expires_at:
+    if not expires_at:  # 0 hoặc None = token không có hạn / không xác định được
         return
 
     expire_dt = datetime.fromtimestamp(expires_at)
@@ -286,7 +235,7 @@ def check_token_expiry():
             f"USER_ACCESS_TOKEN sắp hết hạn! Còn khoảng {days_left} ngày "
             f"(hết hạn lúc {expire_dt.strftime('%H:%M %d/%m/%Y')}).\n"
             "Hãy lấy Long-Lived Token mới tại Graph API Explorer và cập nhật "
-            "vào GitHub -> Settings -> Secrets and variables -> Actions -> USER_ACCESS_TOKEN.",
+            "vào Railway -> Variables -> USER_ACCESS_TOKEN.",
         )
 
 
@@ -359,6 +308,12 @@ def chunked(lst, n):
 
 
 def get_stats_batch(post_ids: list, page_token: str) -> dict:
+    """Lấy views/comments/link/message của nhiều bài viết cùng lúc qua
+    Facebook Batch API (tối đa POSTS_PER_BATCH bài/lần gọi HTTP).
+    Mỗi bài dùng 2 sub-request insights riêng biệt theo METRIC_FALLBACKS
+    (không gộp chung 1 câu truy vấn) để giữ cơ chế fallback: nếu metric A
+    không áp dụng được cho bài đó, vẫn còn kết quả từ metric B, tránh mất
+    dữ liệu oan uổng do 1 metric lỗi kéo cả bài xuống."""
     results = {}
 
     for group in chunked(post_ids, POSTS_PER_BATCH):
@@ -366,10 +321,16 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
         for pid in group:
             for metric in METRIC_FALLBACKS:
                 batch_items.append(
-                    {"method": "GET", "relative_url": f"{pid}/insights?metric={metric}&period=lifetime"}
+                    {
+                        "method": "GET",
+                        "relative_url": f"{pid}/insights?metric={metric}&period=lifetime",
+                    }
                 )
             batch_items.append(
-                {"method": "GET", "relative_url": f"{pid}?fields=message,comments.summary(true),permalink_url"}
+                {
+                    "method": "GET",
+                    "relative_url": f"{pid}?fields=message,comments.summary(true),permalink_url",
+                }
             )
 
         try:
@@ -394,13 +355,14 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             continue
 
         n_metrics = len(METRIC_FALLBACKS)
-        items_per_post = n_metrics + 1
+        items_per_post = n_metrics + 1  # 2 insights + 1 fields
 
         for idx, pid in enumerate(group):
             base = idx * items_per_post
             insight_items = batch_resp[base : base + n_metrics] if base + n_metrics <= len(batch_resp) else []
             fields_item = batch_resp[base + n_metrics] if base + n_metrics < len(batch_resp) else None
 
+            # Thử lần lượt từng metric, lấy kết quả đầu tiên hợp lệ
             views = None
             for insight_item in insight_items:
                 if insight_item and insight_item.get("code") == 200:
@@ -465,7 +427,7 @@ def post_already_has_link(post_id: str, page_id: str, page_token: str, post_mess
 
 
 def check_all_pages():
-    check_token_expiry()
+    check_token_expiry()  # kiểm tra hạn token mỗi lượt quét (rất nhẹ, không đáng kể)
 
     pages = get_managed_pages()
     ts = datetime.now().strftime("%H:%M:%S")
@@ -486,12 +448,10 @@ def check_all_pages():
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
 
-        # Mỗi bài chỉ xử lý/thông báo MỘT LẦN.
-        # Bài đã được báo hoặc đã phát hiện có link sẽ nằm trong notified_posts.json
-        # và bị bỏ qua hoàn toàn ở các lượt GitHub Actions sau.
+        # Chỉ bỏ qua hoàn toàn khi bài đã được báo CẢ 2 loại (ngưỡng chính + spike)
         post_ids_to_check = [
             pid for pid in all_post_ids
-            if f"{page_id}_{pid}" not in already_notified
+            if not (f"{page_id}_{pid}" in already_notified and f"spike_{page_id}_{pid}" in already_notified)
         ]
 
         if not post_ids_to_check:
@@ -509,44 +469,42 @@ def check_all_pages():
 
             print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
 
+            # --- Kiểm tra dấu hiệu "dựng đứng" ---
+            spike_key = f"spike_{key}"
             is_spike = record_and_check_spike(post_id, views, now_dt)
-            if is_spike:
+            if is_spike and spike_key not in already_notified:
                 spike_has_link = post_already_has_link(post_id, page_id, page_token, message)
-
-                # Nếu bài đang bùng nổ nhưng ĐÃ có link thì KHÔNG cần báo Telegram nữa.
-                # Đánh dấu đã xử lý để các lượt sau bỏ qua hoàn toàn.
                 if spike_has_link:
-                    already_notified.add(key)
+                    # Bài đã gắn link rồi -> không cần báo "đang bùng nổ" nữa, bỏ qua luôn
+                    already_notified.add(spike_key)
                     changed = True
-                    print(
-                        f"[{ts}] [{page_name}] {post_id}: đang bùng nổ nhưng đã có link, "
-                        "đánh dấu đã xử lý và không báo Telegram."
+                    print(f"[{ts}] [{page_name}] {post_id}: có dấu hiệu spike nhưng đã gắn link rồi, bỏ qua không báo.")
+                elif spike_key not in load_notified():  # đọc lại file mới nhất, giảm rủi ro trùng nếu có tiến trình khác vừa ghi
+                    spike_msg = (
+                        f"📈 ĐANG BÙNG NỔ! (Page: {page_name})\n"
+                        f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
+                        f"Comments: {comments}\n"
+                        + (f"Link: {link}\n" if link else "")
+                        + "=> CHƯA gắn link, theo dõi sát và chuẩn bị gắn link ngay!"
                     )
-                    continue
+                    send_telegram_message(spike_msg)
+                    already_notified.add(spike_key)
+                    changed = True
+                    save_notified(already_notified)  # lưu ngay lập tức sau khi gửi, giảm cửa sổ race-condition
+                    print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
 
-                # Chỉ báo SPIKE khi bài CHƯA có link.
-                spike_msg = (
-                    f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
-                    f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
-                    f"Comments: {comments}\n"
-                    + (f"Link: {link}\n" if link else "")
-                    + "=> CHƯA gắn link, gắn link ngay!"
-                )
-                send_telegram_message(spike_msg)
-
-                # Mỗi bài chỉ báo 1 lần.
-                already_notified.add(key)
-                changed = True
-                print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
-                continue
-
-            if not meets_threshold(views, comments):
+            if not meets_threshold(views, comments) or key in already_notified:
                 continue
 
             if post_already_has_link(post_id, page_id, page_token, message):
                 print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
                 already_notified.add(key)
                 changed = True
+                continue
+
+            if key in load_notified():  # đọc lại file mới nhất, giảm rủi ro trùng nếu có tiến trình khác vừa ghi
+                print(f"[{ts}] [{page_name}] {post_id}: vừa được báo bởi tiến trình khác, bỏ qua.")
+                already_notified.add(key)
                 continue
 
             msg = (
@@ -559,16 +517,24 @@ def check_all_pages():
             send_telegram_message(msg)
             already_notified.add(key)
             changed = True
+            save_notified(already_notified)  # lưu ngay lập tức sau khi gửi, giảm cửa sổ race-condition
             print(f"[{ts}] Đã gửi thông báo Telegram cho [{page_name}] {post_id}")
-
-    cleanup_view_history(now_dt)
 
     if changed:
         save_notified(already_notified)
     save_view_history(view_history)
 
 
+def main():
+    print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
+    while True:
+        try:
+            check_all_pages()
+        except Exception as e:
+            print(f"[LỖI] Lỗi không xác định trong vòng quét: {e}")
+            send_error_alert("main_loop_exception", f"Lỗi không xác định trong vòng quét:\n{e}")
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
 if __name__ == "__main__":
-    print("Bắt đầu 1 lượt quét (GitHub Actions)...")
-    check_all_pages()
-    print("Hoàn tất lượt quét.")
+    main()
