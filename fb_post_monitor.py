@@ -6,15 +6,6 @@ Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấ
 tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 
-BẢN NÀY CHẠY QUA GITHUB ACTIONS
---------------------------------
-Khác với bản Railway (chạy vòng lặp vô tận), bản này chỉ QUÉT 1 LẦN
-rồi thoát — GitHub Actions sẽ tự gọi lại script này theo lịch (cron).
-Trạng thái (đã báo, lịch sử views) được lưu vào 2 file JSON ngay trong
-thư mục repo, và GitHub Actions tự commit lại các file này sau mỗi lần
-chạy để không bị mất khi lần chạy sau khởi động (mỗi lần chạy là 1 môi
-trường hoàn toàn mới).
-
 YÊU CẦU
 --------
 1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
@@ -112,7 +103,9 @@ def meets_threshold(views: int, comments: int) -> bool:
     return False
 
 
-# -------------------- Lưu/đọc trạng thái đã báo --------------------
+# -------------------- Lưu/đọc trạng thái đã xử lý --------------------
+# notified_posts.json là danh sách DUY NHẤT cho mọi loại thông báo.
+# Một key đã vào file này thì bài đó sẽ không bao giờ được báo lại.
 def load_notified():
     if os.path.exists(NOTIFIED_FILE):
         try:
@@ -132,7 +125,6 @@ def save_notified(notified_set):
 
 
 already_notified = load_notified()
-already_spike_notified = set()
 
 
 # -------------------- Lưu/đọc lịch sử views (spike detection) --------------------
@@ -494,9 +486,12 @@ def check_all_pages():
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
 
+        # Mỗi bài chỉ xử lý/thông báo MỘT LẦN.
+        # Bài đã được báo hoặc đã phát hiện có link sẽ nằm trong notified_posts.json
+        # và bị bỏ qua hoàn toàn ở các lượt GitHub Actions sau.
         post_ids_to_check = [
             pid for pid in all_post_ids
-            if not (f"{page_id}_{pid}" in already_notified and f"{page_id}_{pid}" in already_spike_notified)
+            if f"{page_id}_{pid}" not in already_notified
         ]
 
         if not post_ids_to_check:
@@ -515,25 +510,37 @@ def check_all_pages():
             print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
 
             is_spike = record_and_check_spike(post_id, views, now_dt)
-            if is_spike and key not in already_spike_notified:
+            if is_spike:
                 spike_has_link = post_already_has_link(post_id, page_id, page_token, message)
+
+                # Nếu bài đang bùng nổ nhưng ĐÃ có link thì KHÔNG cần báo Telegram nữa.
+                # Đánh dấu đã xử lý để các lượt sau bỏ qua hoàn toàn.
                 if spike_has_link:
-                    action_line = "=> Bài ĐÃ gắn link rồi, tiếp tục theo dõi đà tăng trưởng."
-                else:
-                    action_line = "=> CHƯA gắn link, theo dõi sát và chuẩn bị gắn link ngay!"
+                    already_notified.add(key)
+                    changed = True
+                    print(
+                        f"[{ts}] [{page_name}] {post_id}: đang bùng nổ nhưng đã có link, "
+                        "đánh dấu đã xử lý và không báo Telegram."
+                    )
+                    continue
+
+                # Chỉ báo SPIKE khi bài CHƯA có link.
                 spike_msg = (
                     f"📈 BÀI ĐANG BÙNG NỔ! (Page: {page_name})\n"
                     f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
                     f"Comments: {comments}\n"
                     + (f"Link: {link}\n" if link else "")
-                    + action_line
+                    + "=> CHƯA gắn link, gắn link ngay!"
                 )
                 send_telegram_message(spike_msg)
-                already_spike_notified.add(key)
-                changed = True
-                print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id} (đã gắn link: {spike_has_link})")
 
-            if not meets_threshold(views, comments) or key in already_notified:
+                # Mỗi bài chỉ báo 1 lần.
+                already_notified.add(key)
+                changed = True
+                print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
+                continue
+
+            if not meets_threshold(views, comments):
                 continue
 
             if post_already_has_link(post_id, page_id, page_token, message):
