@@ -30,10 +30,9 @@ INCLUDE_PAGE_NAMES = []
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 THRESHOLD_RULES = [
-    {"min_views": 3500, "min_comments": 20},
-    {"min_views": 3000, "min_comments": 50},
+    {"min_views": 3000, "min_comments": 40},
 ]
-COMMENT_ONLY_THRESHOLD = 60  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 50  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
 ONLY_POSTS_NEWER_THAN_HOURS = 120
@@ -128,7 +127,8 @@ def save_notified(notified_set):
 
 
 already_notified = load_notified()
-already_spike_notified = set()
+# already_spike_notified không dùng set riêng nữa -> lưu chung vào already_notified
+# với tiền tố "spike_" để không bị mất khi restart (trước đây chỉ lưu trong bộ nhớ).
 
 
 # -------------------- Lưu/đọc lịch sử views (spike detection) --------------------
@@ -451,7 +451,7 @@ def check_all_pages():
         # Chỉ bỏ qua hoàn toàn khi bài đã được báo CẢ 2 loại (ngưỡng chính + spike)
         post_ids_to_check = [
             pid for pid in all_post_ids
-            if not (f"{page_id}_{pid}" in already_notified and f"{page_id}_{pid}" in already_spike_notified)
+            if not (f"{page_id}_{pid}" in already_notified and f"spike_{page_id}_{pid}" in already_notified)
         ]
 
         if not post_ids_to_check:
@@ -470,24 +470,28 @@ def check_all_pages():
             print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
 
             # --- Kiểm tra dấu hiệu "dựng đứng" ---
+            spike_key = f"spike_{key}"
             is_spike = record_and_check_spike(post_id, views, now_dt)
-            if is_spike and key not in already_spike_notified:
+            if is_spike and spike_key not in already_notified:
                 spike_has_link = post_already_has_link(post_id, page_id, page_token, message)
                 if spike_has_link:
-                    action_line = "=> Bài ĐÃ gắn link rồi, tiếp tục theo dõi đà tăng trưởng."
-                else:
-                    action_line = "=> CHƯA gắn link, theo dõi sát và chuẩn bị gắn link ngay!"
-                spike_msg = (
-                    f"📈 ĐANG BÙNG NỔ! (Page: {page_name})\n"
-                    f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
-                    f"Comments: {comments}\n"
-                    + (f"Link: {link}\n" if link else "")
-                    + action_line
-                )
-                send_telegram_message(spike_msg)
-                already_spike_notified.add(key)
-                changed = True
-                print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id} (đã gắn link: {spike_has_link})")
+                    # Bài đã gắn link rồi -> không cần báo "đang bùng nổ" nữa, bỏ qua luôn
+                    already_notified.add(spike_key)
+                    changed = True
+                    print(f"[{ts}] [{page_name}] {post_id}: có dấu hiệu spike nhưng đã gắn link rồi, bỏ qua không báo.")
+                elif spike_key not in load_notified():  # đọc lại file mới nhất, giảm rủi ro trùng nếu có tiến trình khác vừa ghi
+                    spike_msg = (
+                        f"📈 ĐANG BÙNG NỔ! (Page: {page_name})\n"
+                        f"Views hiện tại: {views} (tăng đột biến trong {SPIKE_LOOKBACK_MINUTES} phút gần nhất)\n"
+                        f"Comments: {comments}\n"
+                        + (f"Link: {link}\n" if link else "")
+                        + "=> CHƯA gắn link, theo dõi sát và chuẩn bị gắn link ngay!"
+                    )
+                    send_telegram_message(spike_msg)
+                    already_notified.add(spike_key)
+                    changed = True
+                    save_notified(already_notified)  # lưu ngay lập tức sau khi gửi, giảm cửa sổ race-condition
+                    print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
 
             if not meets_threshold(views, comments) or key in already_notified:
                 continue
@@ -496,6 +500,11 @@ def check_all_pages():
                 print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
                 already_notified.add(key)
                 changed = True
+                continue
+
+            if key in load_notified():  # đọc lại file mới nhất, giảm rủi ro trùng nếu có tiến trình khác vừa ghi
+                print(f"[{ts}] [{page_name}] {post_id}: vừa được báo bởi tiến trình khác, bỏ qua.")
+                already_notified.add(key)
                 continue
 
             msg = (
@@ -508,6 +517,7 @@ def check_all_pages():
             send_telegram_message(msg)
             already_notified.add(key)
             changed = True
+            save_notified(already_notified)  # lưu ngay lập tức sau khi gửi, giảm cửa sổ race-condition
             print(f"[{ts}] Đã gửi thông báo Telegram cho [{page_name}] {post_id}")
 
     if changed:
