@@ -2,21 +2,22 @@ name: FB Post Monitor
 
 on:
   schedule:
-    # Chạy mỗi 15 phút (cú pháp cron theo giờ UTC). GitHub có thể trễ vài
-    # phút khi tải cao, đây là giới hạn chung của GitHub Actions, không
-    # phải lỗi của script.
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}   # cho phép bấm "Run workflow" để chạy thử thủ công
+
+  workflow_dispatch:
 
 permissions:
-  contents: write   # cần quyền này để commit lại 2 file JSON trạng thái
+  contents: write
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,12 +32,34 @@ jobs:
           USER_ACCESS_TOKEN: ${{ secrets.USER_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python fb_post_monitor.py
+        run: |
+          python fb_post_monitor.py
 
-      - name: Commit updated state files (nếu có thay đổi)
+          echo ""
+          echo "===== SAU KHI CHẠY PYTHON ====="
+          pwd
+          ls -lah
+
+      - name: Commit updated state files
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add notified_posts.json view_history.json error_alert_state.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Update state files [skip ci]"
-          git push || true
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for file in notified_posts.json view_history.json error_alert_state.json; do
+            if [ -f "$file" ]; then
+              echo "Tìm thấy $file"
+              git add -f "$file"
+            else
+              echo "Chưa có $file"
+            fi
+          done
+
+          echo "===== GIT STATUS ====="
+          git status
+
+          if git diff --cached --quiet; then
+            echo "Không có file trạng thái nào thay đổi."
+          else
+            git commit -m "Update monitor state [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
