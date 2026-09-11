@@ -32,9 +32,9 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ========================== CONFIG ==========================
-USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSRsR5ZCZBpfGsLffEZCUEYtBzMyDB7cF2LLZChO79rUIU5BCB779Rs7xDaAw6dZBOpUU3n8ZCFKznyoZBJ9E7bydbzrFXsmKzfbgFZBYKyyLZACcvfutHlW4IJq1Kci2qFfM97yNr3jnZBytbjSocCxFy5B8XfSVTUpfFsQDFl4iZAZClkHYTovciRZA9NZBJMxDI21SZBS0gzx")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
+USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
@@ -54,6 +54,7 @@ SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
 SPIKE_MIN_VIEWS_TO_CHECK = 2000
 VIEW_HISTORY_FILE = "view_history.json"  # lưu ngay trong repo, KHÔNG dùng /data (GitHub Actions không có Volume)
+VIEW_HISTORY_RETENTION_DAYS = 5  # chỉ giữ lịch sử views trong 5 ngày để file không phình quá lớn
 
 # --- Retry khi gặp lỗi mạng tạm thời ---
 MAX_RETRIES = 3
@@ -151,6 +152,40 @@ def save_view_history(history: dict):
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[LỖI] Không lưu được {VIEW_HISTORY_FILE}: {e}")
+
+
+def cleanup_view_history(now: datetime):
+    """Xóa các điểm lịch sử views cũ hơn VIEW_HISTORY_RETENTION_DAYS ngày."""
+    cutoff = now - timedelta(days=VIEW_HISTORY_RETENTION_DAYS)
+    removed_points = 0
+    removed_posts = 0
+
+    for post_id in list(view_history.keys()):
+        points = view_history.get(post_id, [])
+        kept_points = []
+
+        for point in points:
+            try:
+                ts_str, views = point
+                ts = datetime.fromisoformat(ts_str)
+                if ts >= cutoff:
+                    kept_points.append(point)
+                else:
+                    removed_points += 1
+            except Exception:
+                removed_points += 1
+
+        if kept_points:
+            view_history[post_id] = kept_points
+        else:
+            del view_history[post_id]
+            removed_posts += 1
+
+    if removed_points or removed_posts:
+        print(
+            f"[DỌN LỊCH SỬ] Đã xóa {removed_points} điểm views cũ "
+            f"và {removed_posts} bài không còn dữ liệu."
+        )
 
 
 view_history = load_view_history()
@@ -518,6 +553,8 @@ def check_all_pages():
             already_notified.add(key)
             changed = True
             print(f"[{ts}] Đã gửi thông báo Telegram cho [{page_name}] {post_id}")
+
+    cleanup_view_history(now_dt)
 
     if changed:
         save_notified(already_notified)
