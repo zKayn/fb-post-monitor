@@ -21,9 +21,9 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ========================== CONFIG ==========================
-USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "EAAgnXcXSwJUBSRsR5ZCZBpfGsLffEZCUEYtBzMyDB7cF2LLZChO79rUIU5BCB779Rs7xDaAw6dZBOpUU3n8ZCFKznyoZBJ9E7bydbzrFXsmKzfbgFZBYKyyLZACcvfutHlW4IJq1Kci2qFfM97yNr3jnZBytbjSocCxFy5B8XfSVTUpfFsQDFl4iZAZClkHYTovciRZA9NZBJMxDI21SZBS0gzx")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8770004220:AAEUuMts84bq8XUn6Tbyc_qYGOx0F_UZoEw")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7513038171")
+USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
