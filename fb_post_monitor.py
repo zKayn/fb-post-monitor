@@ -5,8 +5,8 @@ Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi th�
 Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
 tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
-Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng Google Gemini API viết
-tiếp Part 2 + Part 3 dựa trên caption gốc, xuất ra file Word, gửi kèm
+Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API viết tiếp
+Part 2 + Part 3 dựa trên caption gốc, xuất ra file Word, gửi kèm
 thông báo Telegram.
 
 YÊU CẦU
@@ -14,8 +14,8 @@ YÊU CẦU
 1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
    pages_read_engagement, pages_read_user_content, read_insights
 2. Telegram Bot Token + Chat ID
-3. Gemini API Key (MIỄN PHÍ) — lấy tại aistudio.google.com/apikey,
-   đăng nhập bằng tài khoản Google thường, không cần thẻ thanh toán.
+3. OpenAI API Key (lấy tại platform.openai.com/api-keys, cần nạp tiền
+   riêng, khác với ChatGPT Plus)
 4. Cài thư viện: pip install requests python-docx
 """
 
@@ -30,15 +30,13 @@ from datetime import datetime, timezone, timedelta
 USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# --- Tự viết Part 2 + Part 3 bằng Gemini khi bài đạt ngưỡng và CHƯA có link ---
+# --- Tự viết Part 2 + Part 3 bằng OpenAI khi bài đạt ngưỡng và CHƯA có link ---
 ENABLE_STORY_CONTINUATION = True
-# Model ổn định, chưa có lịch ngừng hỗ trợ (kiểm tra lại tại
-# ai.google.dev/gemini-api/docs/models nếu gặp lỗi "model not found").
-GEMINI_MODEL = "gemini-3.1-flash-lite"
-GEMINI_MAX_OUTPUT_TOKENS = 8000  # đủ cho ~2x 3500-4000 từ theo yêu cầu prompt
-GEMINI_TIMEOUT_SECONDS = 300  # sinh văn bản dài có thể mất vài phút
+OPENAI_MODEL = "gpt-4o"
+OPENAI_MAX_OUTPUT_TOKENS = 8000  # đủ cho ~2x 3500-4000 từ theo yêu cầu prompt
+OPENAI_TIMEOUT_SECONDS = 300  # sinh văn bản dài có thể mất vài phút
 
 STORY_PROMPT_TEMPLATE = """You are a professional storyteller and novelist capable of crafting emotionally resonant works that emphasize character depth and captivate a wide audience.
 
@@ -269,70 +267,52 @@ def send_telegram_document(file_path: str, caption: str = ""):
         return False
 
 
-# -------------------- Tự viết Part 2 + Part 3 (Google Gemini - miễn phí) --------------------
-def call_gemini_story(caption: str):
-    """Gọi Google Gemini API để viết Part 2 + Part 3 dựa trên caption gốc.
+# -------------------- Tự viết Part 2 + Part 3 (OpenAI) --------------------
+def call_openai_story(caption: str):
+    """Gọi OpenAI API để viết Part 2 + Part 3 dựa trên caption gốc.
     Trả về đoạn văn bản kết quả, hoặc None nếu lỗi."""
-    if not GEMINI_API_KEY:
-        print("[CẢNH BÁO] Chưa cấu hình GEMINI_API_KEY, bỏ qua bước viết Part 2/3.")
+    if not OPENAI_API_KEY:
+        print("[CẢNH BÁO] Chưa cấu hình OPENAI_API_KEY, bỏ qua bước viết Part 2/3.")
         return None
 
     full_prompt = f"{caption}\n\n{STORY_PROMPT_TEMPLATE}"
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
 
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                json={
-                    "contents": [{"parts": [{"text": full_prompt}]}],
-                    "generationConfig": {
-                        "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
-                        "temperature": 0.85,
-                    },
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
                 },
-                timeout=GEMINI_TIMEOUT_SECONDS,
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [{"role": "user", "content": full_prompt}],
+                    "max_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+                    "temperature": 0.85,
+                },
+                timeout=OPENAI_TIMEOUT_SECONDS,
             )
             data = resp.json()
-
-            if "candidates" in data and data["candidates"]:
-                candidate = data["candidates"][0]
-                finish_reason = candidate.get("finishReason", "")
-                parts = candidate.get("content", {}).get("parts", [])
-                if parts and parts[0].get("text"):
-                    return parts[0]["text"]
-                if finish_reason == "SAFETY":
-                    print(f"[CẢNH BÁO] Gemini từ chối sinh nội dung do bộ lọc an toàn cho bài này.")
-                    send_error_alert(
-                        "gemini_safety_block",
-                        "Gemini từ chối viết Part 2/3 cho 1 bài do bộ lọc an toàn (SAFETY). "
-                        "Có thể caption gốc chứa nội dung nhạy cảm.",
-                    )
-                    return None
-                print(f"[LỖI] Gemini trả về không có nội dung (finishReason={finish_reason}).")
-                return None
-
+            if "choices" in data and data["choices"]:
+                return data["choices"][0]["message"]["content"]
             err_msg = data.get("error", {}).get("message", "Không rõ nguyên nhân")
-            print(f"[LỖI] Gemini API lỗi: {err_msg}")
-            send_error_alert("gemini_api_error", f"Lỗi khi gọi Gemini API để viết Part 2/3:\n{err_msg}")
+            print(f"[LỖI] OpenAI API lỗi: {err_msg}")
+            send_error_alert("openai_api_error", f"Lỗi khi gọi OpenAI API để viết Part 2/3:\n{err_msg}")
             return None
         except requests.exceptions.RequestException as e:
             last_exc = e
-            print(f"[CẢNH BÁO] Lỗi mạng khi gọi Gemini (lần {attempt}/{MAX_RETRIES}): {e}")
+            print(f"[CẢNH BÁO] Lỗi mạng khi gọi OpenAI (lần {attempt}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
-    send_error_alert("gemini_api_network", f"Không kết nối được Gemini sau {MAX_RETRIES} lần thử: {last_exc}")
+    send_error_alert("openai_api_network", f"Không kết nối được OpenAI sau {MAX_RETRIES} lần thử: {last_exc}")
     return None
 
 
 def create_story_docx(story_text: str, out_path: str):
-    """Tạo file Word từ đoạn văn bản Part 2/3 do Gemini trả về."""
+    """Tạo file Word từ đoạn văn bản Part 2/3 do OpenAI trả về."""
     from docx import Document
 
     lines = [l for l in story_text.split("\n")]
@@ -348,15 +328,15 @@ def create_story_docx(story_text: str, out_path: str):
 
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
-    """Toàn bộ luồng: gọi Gemini -> tạo file Word -> gửi qua Telegram."""
+    """Toàn bộ luồng: gọi OpenAI -> tạo file Word -> gửi qua Telegram."""
     if not ENABLE_STORY_CONTINUATION:
         return
     if not caption or not caption.strip():
         print(f"[CẢNH BÁO] Bài {post_id} không có caption, bỏ qua viết Part 2/3.")
         return
 
-    print(f"[GEMINI] Đang viết Part 2/3 cho bài {post_id}...")
-    story_text = call_gemini_story(caption)
+    print(f"[OPENAI] Đang viết Part 2/3 cho bài {post_id}...")
+    story_text = call_openai_story(caption)
     if not story_text:
         return
 
@@ -374,7 +354,7 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
         caption=f"📖 Part 2 & 3 tự động — Page: {page_name}\n{title[:200]}",
     )
     if ok:
-        print(f"[GEMINI] Đã gửi file Part 2/3 cho bài {post_id}.")
+        print(f"[OPENAI] Đã gửi file Part 2/3 cho bài {post_id}.")
 
     try:
         os.remove(docx_path)
