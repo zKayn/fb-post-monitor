@@ -42,7 +42,7 @@ COMMENT_LINK_MAX_PAGES = 5  # quét tối đa 5 trang x 100 comments trước kh
 
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
-OPENAI_MODEL = "gpt-4o"
+OPENAI_MODEL = "gpt-5.6-luna"
 OPENAI_MAX_OUTPUT_TOKENS = 8000  # dư địa cho MỖI part; tránh reasoning/length làm content rỗng
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 3  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
