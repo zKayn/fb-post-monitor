@@ -32,6 +32,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
+# Domain link bài đọc. Có thể ghi nhiều domain trong Railway Variable ARTICLE_LINK_DOMAINS, cách nhau bằng dấu phẩy.
+ARTICLE_LINK_DOMAINS = [
+    d.strip().lower()
+    for d in os.getenv("ARTICLE_LINK_DOMAINS", "puretales.cafex.biz").split(",")
+    if d.strip()
+]
+COMMENT_LINK_MAX_PAGES = 5  # quét tối đa 5 trang x 100 comments trước khi báo / gọi OpenAI
+
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-4o"
@@ -858,27 +866,63 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
     return results
 
 
+def contains_article_link(text: str) -> bool:
+    """Nhận diện link bài đọc cần tránh tạo Word. Domain cấu hình riêng để không nhầm URL Facebook/permalink."""
+    value = (text or "").lower()
+    return any(domain in value for domain in ARTICLE_LINK_DOMAINS)
+
+
 def post_already_has_link(post_id: str, page_id: str, page_token: str, post_message: str) -> bool:
+    """
+    Kiểm tra link chắc hơn:
+    1) Caption có URL -> coi là đã gắn link (giữ hành vi cũ).
+    2) Quét comment có phân trang, tối đa COMMENT_LINK_MAX_PAGES.
+    3) Nếu comment chứa domain bài đọc cấu hình -> coi là đã gắn link, không phụ thuộc from.id.
+    4) Nếu Graph API trả đúng from.id của Page và comment có bất kỳ URL -> cũng coi là đã gắn link.
+    """
     if URL_PATTERN.search(post_message or ""):
         return True
 
-    try:
-        r = api_get(
-            f"{GRAPH_URL}/{post_id}/comments",
-            params={"filter": "stream", "limit": 50, "fields": "message,from", "access_token": page_token},
-        )
-    except Exception:
-        return False
+    url = f"{GRAPH_URL}/{post_id}/comments"
+    params = {
+        "filter": "stream",
+        "limit": 100,
+        "fields": "message,from",
+        "access_token": page_token,
+    }
 
-    data = r.json()
-    if "error" in data:
-        return False
+    pages_checked = 0
+    while url and pages_checked < COMMENT_LINK_MAX_PAGES:
+        try:
+            r = api_get(url, params=params)
+            data = r.json()
+        except Exception as e:
+            print(f"[CẢNH BÁO] {post_id}: không kiểm tra được comment link: {e}")
+            return False
 
-    for c in data.get("data", []):
-        from_id = (c.get("from") or {}).get("id")
-        msg = c.get("message", "") or ""
-        if from_id == page_id and URL_PATTERN.search(msg):
-            return True
+        if "error" in data:
+            err = data.get("error", {}).get("message", "Không rõ")
+            print(f"[CẢNH BÁO] {post_id}: Graph API lỗi khi kiểm tra comment link: {err}")
+            return False
+
+        for c in data.get("data", []):
+            msg = c.get("message", "") or ""
+            from_id = str((c.get("from") or {}).get("id") or "")
+
+            # Domain bài đọc: không phụ thuộc from.id vì Graph đôi khi không trả author ổn định.
+            if contains_article_link(msg):
+                print(f"[LINK] {post_id}: phát hiện article link trong comment -> SKIP.")
+                return True
+
+            # Fallback: nếu xác định chắc comment là của Page thì bất kỳ URL nào cũng được tính.
+            if from_id == str(page_id) and URL_PATTERN.search(msg):
+                print(f"[LINK] {post_id}: phát hiện URL trong comment của Page -> SKIP.")
+                return True
+
+        url = data.get("paging", {}).get("next")
+        params = None
+        pages_checked += 1
+
     return False
 
 
@@ -959,7 +1003,11 @@ def check_all_pages():
             # thông báo BÀI ĐANG LÊN ngay trước pipeline. Nhờ vậy nếu lần retry thành công,
             # Telegram luôn có đúng thứ tự: BÀI ĐANG LÊN -> Word của chính bài đó.
             if key in already_notified:
-                if str(post_id) not in story_completed and message and not URL_PATTERN.search(message or ""):
+                if str(post_id) not in story_completed and message:
+                    # Word từng lỗi: trước khi báo lại / tốn OpenAI, bắt buộc quét link lại cả caption + comments.
+                    if post_already_has_link(post_id, page_id, page_token, message):
+                        print(f"[{ts}] [{page_name}] {post_id}: đã có link trước lượt retry -> bỏ qua, KHÔNG gọi OpenAI.")
+                        continue
                     retry_msg = (
                         f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
                         f"Views: {views}\n"
@@ -969,8 +1017,12 @@ def check_all_pages():
                         + "🔄 Đang tạo lại file Word hoàn chỉnh cho bài này..."
                     )
                     send_telegram_message(retry_msg)
-                    print(f"[{ts}] [{page_name}] {post_id}: Word chưa hoàn chỉnh -> đã báo lại đúng bài, bắt đầu retry Part 2/3/4.")
-                    generate_and_send_story_continuation(page_name, post_id, message)
+                    print(f"[{ts}] [{page_name}] {post_id}: Word chưa hoàn chỉnh -> đã báo lại đúng bài, chuẩn bị retry Part 2/3/4.")
+                    # Kiểm tra lần cuối ngay trước khi tiêu token OpenAI.
+                    if post_already_has_link(post_id, page_id, page_token, message):
+                        print(f"[{ts}] [{page_name}] {post_id}: link vừa xuất hiện -> HỦY retry OpenAI.")
+                    else:
+                        generate_and_send_story_continuation(page_name, post_id, message)
                 continue
 
             if post_already_has_link(post_id, page_id, page_token, message):
@@ -997,6 +1049,11 @@ def check_all_pages():
             changed = True
             save_notified(already_notified)  # lưu ngay lập tức sau khi gửi, giảm cửa sổ race-condition
             print(f"[{ts}] Đã gửi thông báo Telegram cho [{page_name}] {post_id}")
+
+            # --- DOUBLE CHECK LINK ngay trước OpenAI để tránh tốn tiền nếu link vừa được gắn sau thông báo. ---
+            if post_already_has_link(post_id, page_id, page_token, message):
+                print(f"[{ts}] [{page_name}] {post_id}: link vừa xuất hiện sau thông báo -> HỦY OpenAI, không tạo Word.")
+                continue
 
             # --- Tự viết Part 2 + Part 3 + Part 4 dựa trên caption, gửi kèm file Word ---
             generate_and_send_story_continuation(page_name, post_id, message)
