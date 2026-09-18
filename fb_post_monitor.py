@@ -5,21 +5,9 @@ Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi th�
 Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
 tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
-Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API (GPT-4o) viết
-tiếp Part 2 + Part 3 dựa trên caption gốc, xuất ra file Word, gửi kèm
+Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API viết tiếp
+Part 2 + Part 3 dựa trên caption gốc, xuất ra file Word, gửi kèm
 thông báo Telegram.
-
-CHI PHÍ ƯỚC TÍNH (GPT-5.6 Sol, tại thời điểm viết code — GIÁ CÓ THỂ ĐÃ ĐỔI,
-kiểm tra lại tại platform.openai.com/docs/pricing trước khi chạy thật)
-------------------------------------------------------
-- Input: ~$2.50 / 1 triệu token | Output: ~$15.00 / 1 triệu token
-- Part 2, Part 3, Part 4 được sinh qua 3 LƯỢT GỌI RIÊNG BIỆT (mỗi lượt
-  giữ ngữ cảnh các phần trước), mỗi lượt tự động yêu cầu "viết tiếp" tối
-  đa 2 lần nếu chưa đạt đủ ~2.000-2.500 từ.
-- Trường hợp thường gặp (đạt đủ độ dài ngay lượt đầu): ~$0.15 - $0.20/bài
-- Trường hợp phải viết tiếp nhiều lần (worst case): ~$0.35 - $0.45/bài
-- Có giới hạn DAILY_STORY_LIMIT bên dưới để tránh phát sinh chi phí
-  ngoài ý muốn nếu gặp lỗi báo trùng lặp.
 
 YÊU CẦU
 --------
@@ -46,77 +34,66 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # --- Tự viết Part 2 + Part 3 bằng OpenAI khi bài đạt ngưỡng và CHƯA có link ---
 ENABLE_STORY_CONTINUATION = True
-OPENAI_MODEL = "gpt-4o"  # ổn định, $2.50/$10.00 mỗi 1M token (input/output)
-OPENAI_MAX_OUTPUT_TOKENS = 12000  # đủ cho ~7.000-8.000 từ theo yêu cầu prompt (2 Part)
+OPENAI_MODEL = "gpt-5.6-sol"
+OPENAI_MAX_OUTPUT_TOKENS = 8000  # đủ cho ~2x 3500-4000 từ theo yêu cầu prompt
 OPENAI_TIMEOUT_SECONDS = 300  # sinh văn bản dài có thể mất vài phút
 
-# Giới hạn số lần sinh bài/ngày để tránh phát sinh chi phí ngoài ý muốn
-# (VD nếu có bug khiến 1 bài bị xử lý trùng nhiều lần). Ước tính
-# $0.20-0.50/lần -> DAILY_STORY_LIMIT=10 tương đương tối đa ~$2-5/ngày.
-DAILY_STORY_LIMIT = 10
-STORY_COUNT_FILE = "/data/story_generation_count.json"
+STORY_PROMPT_TEMPLATE = """You are a professional storyteller and novelist capable of crafting emotionally resonant works that emphasize character depth and captivate a wide audience.
 
-SHARED_STYLE_RULES = """Write in a natural, engaging novelistic style with a smooth rhythm and compelling storytelling.
-Focus on authentic characters, emotional depth, family relationships, personal growth, trust, forgiveness, resilience, and meaningful life choices.
-Build suspense through hidden truths, difficult decisions, misunderstandings, subtle clues, and gradual revelations, rather than through heated confrontations or sensational events.
-Maintain reader curiosity through authentic dialogue, multi-dimensional character motivations, emotional conflicts, and surprising yet logical discoveries.
-Ensure all events stem from a solid and convincing emotional foundation.
-Avoid elements of graphic violence, physical abuse, domestic violence, cruelty, intimidation, revenge, public humiliation, excessive threats, manipulation, or abuse of power.
-Avoid scenes that are shocking, psychologically traumatic, or emotionally overwhelming for children or vulnerable characters. If children appear, portray them in safe, supported, and age-appropriate situations.
-Avoid sensational plot twists intended solely for shock value. Instead, build drama through mystery, relationships, and meaningful character choices.
-Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling to engage a broad audience.
-Give supporting characters meaningful roles, realistic motivations, and emotional growth.
-Maintain a warm, family-friendly tone suitable for mass-market publishing platforms and ad-friendly content standards."""
+Please continue by writing Part 2 and Part 3 of the story provided above.
 
-PART2_INSTRUCTIONS = f"""You are a professional storyteller and novelist capable of crafting emotionally resonant works that emphasize character depth and captivate a wide audience.
+Requirements:
+*   Divide the text into two sections: PART 2 and PART 3; present them as separate blocks for easy copying.
+*   Write in a natural, engaging novelistic style with a smooth rhythm and compelling storytelling.
 
-Please continue by writing ONLY PART 2 of the story provided above (do not write Part 3 yet, that will be a separate step).
+*   Focus on authentic characters, emotional depth, family relationships, personal growth, trust, forgiveness, resilience, and meaningful life choices.
 
-{SHARED_STYLE_RULES}
+*   Build suspense through hidden truths, difficult decisions, misunderstandings, subtle clues, and gradual revelations, rather than through heated confrontations or sensational events.
 
-CRITICAL LENGTH REQUIREMENT: Part 2 MUST be at least 3,500-4,000 words long. This is mandatory, not optional. Do not summarize or rush the plot — add rich descriptive detail, dialogue, sensory description, and interior monologue as needed to reach this length naturally. A short answer is considered a failed response.
+*   Maintain reader curiosity through authentic dialogue, multi-dimensional character motivations, emotional conflicts, and surprising yet logical discoveries.
 
-Structure:
-- Follow naturally from Part 1 while maintaining consistency in characters, setting, and timeline.
-- Gradually reveal new information to deepen the mystery and strengthen emotional bonds between characters.
-- Conclude Part 2 with a logical reveal, a compelling open-ended question, or a significant discovery that naturally leads the reader into Part 3, without relying on shock value, violence, or intense conflict.
+*   Ensure all events stem from a solid and convincing emotional foundation.
 
-Output format:
-1. Always create a concise, engaging title that sparks curiosity and highlights the emotional journey, family relationships, hidden truths, or meaningful choices, while avoiding sensationalist or misleading language.
-2. Write the full story for Part 2 (minimum 3,500 words).
-3. End exactly with this line (IN BOLD):
--END OF PART 2 – CLICK THE "NEXT PART" SECTION AT THE BOTTOM OF THE PAGE TO CONTINUE READING"""
+*   Avoid elements of graphic violence, physical abuse, domestic violence, cruelty, intimidation, revenge, public humiliation, excessive threats, manipulation, or abuse of power.
 
-PART3_INSTRUCTIONS = f"""Now write ONLY PART 3, continuing directly from Part 2 above.
+*   Avoid scenes that are shocking, psychologically traumatic, or emotionally overwhelming for children or vulnerable characters. If children appear, portray them in safe, supported, and age-appropriate situations.
 
-{SHARED_STYLE_RULES}
+*   Avoid sensational plot twists intended solely for shock value. Instead, build drama through mystery, relationships, and meaningful character choices.
 
-CRITICAL LENGTH REQUIREMENT: Part 3 MUST be at least 3,500-4,000 words long. This is mandatory, not optional. Do not summarize or rush the plot — add rich descriptive detail, dialogue, sensory description, and interior monologue as needed to reach this length naturally. A short answer is considered a failed response.
+• Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling to engage a broad audience.
+
+• Give supporting characters meaningful roles, realistic motivations, and emotional growth.
+
+• Maintain a warm, family-friendly tone suitable for mass-market publishing platforms and ad-friendly content standards.
 
 Structure:
-- Follow naturally from Part 2 while maintaining consistency in characters, setting, and timeline.
-- Bring the story to a satisfying, emotionally resonant conclusion.
 
-Output format:
-1. Write the full story for Part 3 (minimum 3,500 words). No new title is needed.
-2. End exactly with this line (IN BOLD):
+• Length: Approximately 3,500–4,000 words per part.
+
+• Follow naturally from Part 1 while maintaining consistency in characters, setting, and timeline.
+
+• Gradually reveal new information to deepen the mystery and strengthen emotional bonds between characters.
+
+• Conclude Part 2 with a logical reveal, a compelling open-ended question, or a significant discovery that naturally leads the reader into Part 3, without relying on shock value, violence, or intense conflict. Output format:
+
+1. Always create a concise, engaging title that sparks curiosity and highlights the emotional journey, family relationships, hidden truths, or meaningful choices, while avoiding sensationalist or misleading language. 2. Write the full story for Part 2.
+
+3. End exactly with the following lines (IN BOLD):
+-END OF PART 2 – CLICK THE "NEXT PART" SECTION AT THE BOTTOM OF THE PAGE TO CONTINUE READING
 -END OF PART 3 – PLEASE "LIKE" AND SHARE THIS POST ON FACEBOOK TO SUPPORT US IN SHARING EVEN MORE STORIES"""
-
-MIN_WORDS_PER_PART = 3300  # dưới ngưỡng 3500 một chút để chừa dung sai
-MAX_CONTINUE_ATTEMPTS = 2  # tối đa 2 lần yêu cầu viết tiếp nếu chưa đủ độ dài
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 THRESHOLD_RULES = [
-    {"min_views": 4000, "min_comments": 20},
-    {"min_views": 3000, "min_comments": 50},
+    {"min_views": 7000, "min_comments": 20},
+    {"min_views": 3000, "min_comments": 40},
 ]
-COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 50  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
-ONLY_POSTS_NEWER_THAN_HOURS = 72
+ONLY_POSTS_NEWER_THAN_HOURS = 120
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
 SPIKE_LOOKBACK_MINUTES = 30
@@ -290,57 +267,15 @@ def send_telegram_document(file_path: str, caption: str = ""):
         return False
 
 
-# -------------------- Giới hạn chi phí: đếm số lần sinh bài/ngày --------------------
-def load_story_count():
-    if os.path.exists(STORY_COUNT_FILE):
-        try:
-            with open(STORY_COUNT_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)  # {"date": "YYYY-MM-DD", "count": N}
-        except Exception:
-            pass
-    return {"date": "", "count": 0}
-
-
-def save_story_count(state: dict):
-    try:
-        os.makedirs(os.path.dirname(STORY_COUNT_FILE) or ".", exist_ok=True)
-        with open(STORY_COUNT_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[LỖI] Không lưu được {STORY_COUNT_FILE}: {e}")
-
-
-def check_and_increment_story_count() -> bool:
-    """Trả về True nếu còn trong giới hạn DAILY_STORY_LIMIT hôm nay (và tự
-    tăng bộ đếm lên 1). Trả về False nếu đã đạt giới hạn, kèm báo Telegram
-    (1 lần/ngày) để bạn biết chi phí đang được chặn lại."""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    state = load_story_count()
-
-    if state.get("date") != today_str:
-        state = {"date": today_str, "count": 0}
-
-    if state["count"] >= DAILY_STORY_LIMIT:
-        send_error_alert(
-            f"daily_story_limit_{today_str}",
-            f"Đã đạt giới hạn {DAILY_STORY_LIMIT} lần sinh Part 2/3 hôm nay. "
-            "Tạm dừng gọi OpenAI cho các bài tiếp theo trong ngày để tránh phát sinh "
-            "chi phí ngoài ý muốn. Chỉnh DAILY_STORY_LIMIT trong code nếu muốn tăng.",
-        )
-        return False
-
-    state["count"] += 1
-    save_story_count(state)
-    return True
-
-
 # -------------------- Tự viết Part 2 + Part 3 (OpenAI) --------------------
-def call_openai_chat(messages: list, max_tokens: int):
-    """Gọi OpenAI chat completions với 1 danh sách messages tùy ý (hỗ trợ
-    multi-turn để yêu cầu viết tiếp). Trả về text hoặc None nếu lỗi."""
+def call_openai_story(caption: str):
+    """Gọi OpenAI API để viết Part 2 + Part 3 dựa trên caption gốc.
+    Trả về đoạn văn bản kết quả, hoặc None nếu lỗi."""
     if not OPENAI_API_KEY:
         print("[CẢNH BÁO] Chưa cấu hình OPENAI_API_KEY, bỏ qua bước viết Part 2/3.")
         return None
+
+    full_prompt = f"{caption}\n\n{STORY_PROMPT_TEMPLATE}"
 
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -353,19 +288,14 @@ def call_openai_chat(messages: list, max_tokens: int):
                 },
                 json={
                     "model": OPENAI_MODEL,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": full_prompt}],
+                    "max_tokens": OPENAI_MAX_OUTPUT_TOKENS,
                     "temperature": 0.85,
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
             data = resp.json()
             if "choices" in data and data["choices"]:
-                usage = data.get("usage", {})
-                print(
-                    f"[OPENAI] Token dùng: input={usage.get('prompt_tokens')} "
-                    f"output={usage.get('completion_tokens')}"
-                )
                 return data["choices"][0]["message"]["content"]
             err_msg = data.get("error", {}).get("message", "Không rõ nguyên nhân")
             print(f"[LỖI] OpenAI API lỗi: {err_msg}")
@@ -379,63 +309,6 @@ def call_openai_chat(messages: list, max_tokens: int):
 
     send_error_alert("openai_api_network", f"Không kết nối được OpenAI sau {MAX_RETRIES} lần thử: {last_exc}")
     return None
-
-
-def generate_part_with_min_length(messages: list, part_label: str, min_words: int = MIN_WORDS_PER_PART):
-    """Sinh 1 phần (Part 2 hoặc Part 3), tự động yêu cầu viết tiếp nếu kết
-    quả chưa đạt đủ số từ tối thiểu, tối đa MAX_CONTINUE_ATTEMPTS lần."""
-    local_messages = list(messages)
-    combined_text = ""
-
-    for attempt in range(MAX_CONTINUE_ATTEMPTS + 1):
-        text = call_openai_chat(local_messages, max_tokens=OPENAI_MAX_OUTPUT_TOKENS)
-        if text is None:
-            return combined_text if combined_text else None
-
-        combined_text += ("\n\n" if combined_text else "") + text
-        word_count = len(combined_text.split())
-        print(f"[OPENAI] {part_label}: đoạn vừa sinh {len(text.split())} từ, tổng lũy kế {word_count} từ.")
-
-        if word_count >= min_words:
-            break
-        if attempt >= MAX_CONTINUE_ATTEMPTS:
-            print(f"[CẢNH BÁO] {part_label} chỉ đạt {word_count} từ sau {attempt + 1} lượt, chấp nhận kết quả hiện tại.")
-            break
-
-        local_messages.append({"role": "assistant", "content": text})
-        local_messages.append(
-            {
-                "role": "user",
-                "content": (
-                    f"This is too short. Please continue writing directly from where you left off, "
-                    f"in the same scene and style, to reach the required minimum length of {min_words} "
-                    "words total for this part. Do not repeat earlier content, do not add a new title, "
-                    "and do not abruptly start a new scene — continue naturally from the last sentence."
-                ),
-            }
-        )
-
-    return combined_text
-
-
-def call_openai_story(caption: str):
-    """Sinh Part 2 rồi Part 3 qua 2 lượt gọi riêng biệt (mỗi lượt có thể tự
-    viết tiếp nếu chưa đủ độ dài). Trả về toàn bộ văn bản gộp, hoặc None."""
-    part2_messages = [{"role": "user", "content": f"{caption}\n\n{PART2_INSTRUCTIONS}"}]
-    part2_text = generate_part_with_min_length(part2_messages, "PART 2")
-    if not part2_text:
-        return None
-
-    part3_messages = [
-        {"role": "user", "content": f"{caption}\n\n{PART2_INSTRUCTIONS}"},
-        {"role": "assistant", "content": part2_text},
-        {"role": "user", "content": PART3_INSTRUCTIONS},
-    ]
-    part3_text = generate_part_with_min_length(part3_messages, "PART 3")
-    if not part3_text:
-        return part2_text  # vẫn trả Part 2 nếu Part 3 lỗi, đỡ phí công đã sinh
-
-    return part2_text + "\n\n---\n\n" + part3_text
 
 
 def create_story_docx(story_text: str, out_path: str):
@@ -455,15 +328,11 @@ def create_story_docx(story_text: str, out_path: str):
 
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
-    """Toàn bộ luồng: kiểm tra giới hạn -> gọi OpenAI -> tạo file Word -> gửi qua Telegram."""
+    """Toàn bộ luồng: gọi OpenAI -> tạo file Word -> gửi qua Telegram."""
     if not ENABLE_STORY_CONTINUATION:
         return
     if not caption or not caption.strip():
         print(f"[CẢNH BÁO] Bài {post_id} không có caption, bỏ qua viết Part 2/3.")
-        return
-
-    if not check_and_increment_story_count():
-        print(f"[CẢNH BÁO] Đã đạt giới hạn sinh bài/ngày, bỏ qua bài {post_id}.")
         return
 
     print(f"[OPENAI] Đang viết Part 2/3 cho bài {post_id}...")
