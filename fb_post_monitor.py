@@ -35,8 +35,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-sol"
-OPENAI_MAX_OUTPUT_TOKENS = 5000  # giới hạn cho MỖI part (~2000-2500 từ)
-OPENAI_TIMEOUT_SECONDS = 300
+OPENAI_MAX_OUTPUT_TOKENS = 8000  # dư địa cho MỖI part; tránh reasoning/length làm content rỗng
+OPENAI_TIMEOUT_SECONDS = 600
+OPENAI_PART_RETRIES = 6  # retry riêng cho sinh truyện
 
 STORY_WRITING_RULES = """You are a professional storyteller and novelist, skilled at creating emotionally rich, character-driven fiction that appeals to a broad mainstream audience.
 
@@ -85,6 +86,7 @@ SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
 SPIKE_MIN_VIEWS_TO_CHECK = 2000
 VIEW_HISTORY_FILE = "/data/view_history.json"
+STORY_COMPLETED_FILE = "/data/story_completed_posts.json"  # chỉ đánh dấu sau khi Word đủ Part 2+3+4 đã gửi thành công
 
 # --- Retry khi gặp lỗi mạng tạm thời ---
 MAX_RETRIES = 3
@@ -169,6 +171,25 @@ def save_notified(notified_set):
 
 
 already_notified = load_notified()
+
+def load_story_completed():
+    if os.path.exists(STORY_COMPLETED_FILE):
+        try:
+            with open(STORY_COMPLETED_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_story_completed(items):
+    try:
+        os.makedirs(os.path.dirname(STORY_COMPLETED_FILE) or ".", exist_ok=True)
+        with open(STORY_COMPLETED_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(items), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[LỖI] Không lưu được {STORY_COMPLETED_FILE}: {e}")
+
+story_completed = load_story_completed()
 # already_spike_notified không dùng set riêng nữa -> lưu chung vào already_notified
 # với tiền tố "spike_" để không bị mất khi restart (trước đây chỉ lưu trong bộ nhớ).
 
@@ -232,51 +253,52 @@ def send_telegram_message(text: str):
 
 
 def send_telegram_document(file_path: str, caption: str = ""):
-    """Gửi 1 file đính kèm (VD file Word) qua Telegram."""
+    """Gửi file Telegram với retry để giảm lỗi mạng tạm thời."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-    try:
-        with open(file_path, "rb") as f:
-            resp = requests.post(
-                url,
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]},
-                files={"document": f},
-                timeout=120,
-            )
-        if resp.status_code != 200:
-            print(f"[LỖI] Gửi file Telegram thất bại: {resp.text}")
-            return False
-        return True
-    except Exception as e:
-        print(f"[LỖI] Lỗi mạng khi gửi file Telegram: {e}")
-        return False
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with open(file_path, "rb") as f:
+                resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}, files={"document": f}, timeout=180)
+            if resp.status_code == 200:
+                return True
+            last_error = f"HTTP {resp.status_code}: {resp.text[:1000]}"
+        except Exception as e:
+            last_error = str(e)
+        print(f"[CẢNH BÁO] Gửi file Telegram lần {attempt}/{MAX_RETRIES} thất bại: {last_error}")
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    send_error_alert("telegram_document_failed", f"Gửi file Word thất bại sau {MAX_RETRIES} lần: {last_error}")
+    return False
+
 
 
 # -------------------- Tự viết Part 2 + Part 3 + Part 4 (3 request liên tiếp) --------------------
 def call_openai_part(story_context: str, part_number: int):
-    """Sinh đúng 1 part. Ending không cho model viết; chương trình tự nối sau khi part hoàn tất."""
+    """Sinh đúng 1 part. Chỉ trả content; ending được nối đúng 1 lần sau khi part thành công."""
     if not OPENAI_API_KEY:
         print("[CẢNH BÁO] Chưa cấu hình OPENAI_API_KEY, bỏ qua bước viết Part 2/3/4.")
         return None
 
     if part_number == 2:
         part_instruction = """Write PART 2 only.
-Create ONE engaging, curiosity-driven headline before PART 2. The headline should highlight emotional journeys, family relationships, hidden truths, or meaningful choices without sensational or misleading wording.
-End the STORY CONTENT of Part 2 with a believable revelation, intriguing unanswered question, or important discovery that naturally leads into Part 3.
+Create ONE engaging, curiosity-driven headline before PART 2.
+End the STORY CONTENT with a believable revelation or discovery leading naturally into Part 3.
 Do not write Part 3 or Part 4."""
     elif part_number == 3:
         part_instruction = """Write PART 3 only.
-Do not create a new headline. Continue directly and naturally from Part 2.
-End the STORY CONTENT of Part 3 with a believable revelation, intriguing unanswered question, or important discovery that naturally leads into Part 4.
+Do not create a new headline. Continue directly from Part 2.
+End the STORY CONTENT with a believable revelation or discovery leading naturally into Part 4.
 Do not rewrite Part 2 and do not write Part 4."""
     elif part_number == 4:
         part_instruction = """Write PART 4 (The End) only.
-Do not create a new headline. Continue directly and naturally from Part 3.
-Resolve the important remaining story threads in a believable way. Usually give the story a happy, satisfying, emotionally relieving ending that resolves the reader's earlier frustration.
+Do not create a new headline. Continue directly from Part 3.
+Resolve the important remaining threads with a satisfying, emotionally relieving ending.
 Do not rewrite earlier parts."""
     else:
         raise ValueError(f"part_number không hợp lệ: {part_number}")
 
-    full_prompt = f"""STORY CONTEXT (everything below is continuity reference):
+    full_prompt = f"""STORY CONTEXT (continuity reference):
 
 {story_context}
 
@@ -286,18 +308,14 @@ Do not rewrite earlier parts."""
 --- CURRENT TASK ---
 {part_instruction}
 
-Start the requested part now. Remember: do NOT output the END OF PART / NEXT PART / Facebook CTA line. The program appends it only after generation is complete.
-"""
+Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
 
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    last_error = "unknown"
+    for attempt in range(1, OPENAI_PART_RETRIES + 1):
         try:
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": full_prompt}],
@@ -305,68 +323,161 @@ Start the requested part now. Remember: do NOT output the END OF PART / NEXT PAR
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
-            data = resp.json()
-            if "choices" in data and data["choices"]:
-                text = data["choices"][0]["message"]["content"].strip()
-                if not text:
-                    raise ValueError(f"OpenAI trả về Part {part_number} rỗng")
-                # Chỉ append ending SAU KHI request đã sinh xong toàn bộ part.
-                return f"{text}\n\n**{PART_ENDINGS[part_number]}**"
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
 
-            err_msg = data.get("error", {}).get("message", "Không rõ nguyên nhân")
-            print(f"[LỖI] OpenAI API lỗi khi viết Part {part_number}: {err_msg}")
-            send_error_alert(
-                f"openai_api_error_part_{part_number}",
-                f"Lỗi khi gọi OpenAI API để viết Part {part_number}:\n{err_msg}",
-            )
-            return None
+            if resp.status_code != 200:
+                last_error = data.get("error", {}).get("message", resp.text[:1000])
+                print(f"[CẢNH BÁO] Part {part_number} HTTP {resp.status_code}, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
+            else:
+                choices = data.get("choices") or []
+                if choices:
+                    choice = choices[0] or {}
+                    msg = choice.get("message") or {}
+                    text = msg.get("content") or ""
+                    if isinstance(text, list):
+                        text = "".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in text)
+                    text = str(text).strip()
+                    finish_reason = choice.get("finish_reason")
+                    usage = data.get("usage", {})
+                    if text:
+                        print(f"[OPENAI] Part {part_number} OK | finish_reason={finish_reason} | usage={usage}")
+                        return text
+                    last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}"
+                else:
+                    last_error = f"không có choices; response={str(data)[:1200]}"
+                print(f"[CẢNH BÁO] Part {part_number} rỗng/lỗi, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
         except requests.exceptions.RequestException as e:
-            last_exc = e
-            print(f"[CẢNH BÁO] Lỗi mạng khi viết Part {part_number} (lần {attempt}/{MAX_RETRIES}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            last_error = f"network/timeout: {e}"
+            print(f"[CẢNH BÁO] Part {part_number}, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
         except Exception as e:
-            last_exc = e
-            print(f"[CẢNH BÁO] Lỗi khi xử lý Part {part_number} (lần {attempt}/{MAX_RETRIES}): {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            last_error = f"parse/process: {e}"
+            print(f"[CẢNH BÁO] Part {part_number}, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
 
+        if attempt < OPENAI_PART_RETRIES:
+            time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 20))
+
+    send_error_alert(f"openai_api_part_{part_number}_failed", f"Không tạo được Part {part_number} sau {OPENAI_PART_RETRIES} lần thử. Chi tiết cuối: {last_error}")
+    return None
+
+
+def _strip_program_endings(text: str) -> str:
+    """Loại ending/CTA nếu model lỡ tự sinh; code sẽ chèn đúng 1 lần sau validation."""
+    if not text:
+        return ""
+    cleaned = text.strip()
+    for ending in PART_ENDINGS.values():
+        for variant in (ending, f"**{ending}**"):
+            cleaned = cleaned.replace(variant, "")
+    # Loại các dòng CTA phổ biến mà model có thể tự thêm ngoài ý muốn.
+    cleaned = re.sub(r"(?im)^\s*[-–—]*\s*END OF PART [234].*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^.*PRESS NEX(?:T)? PART.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^.*LIKE,? SHARE THIS POST.*$", "", cleaned)
+    return cleaned.strip()
+
+
+def _ensure_part_header(text: str, part_number: int) -> str:
+    """Đảm bảo mỗi phần có nhãn PART rõ ràng mà không làm mất headline của Part 2."""
+    text = text.strip()
+    pattern = rf"(?im)^\s*\*{{0,2}}PART\s+{part_number}(?:\s*\(THE END\))?\*{{0,2}}\s*$"
+    if re.search(pattern, text):
+        return text
+    if part_number == 2:
+        lines = text.splitlines()
+        # Giữ dòng đầu làm headline, chèn PART 2 ngay sau headline.
+        if len(lines) >= 2:
+            return lines[0].strip() + "\n\nPART 2\n\n" + "\n".join(lines[1:]).strip()
+    label = "PART 4 (THE END)" if part_number == 4 else f"PART {part_number}"
+    return f"{label}\n\n{text}"
+
+
+def _validate_part(text: str, part_number: int):
+    """Validation trước khi cho phép đi tiếp. Không đạt => coi như request lỗi và không tạo Word."""
+    if not text or not text.strip():
+        return False, "content rỗng"
+    words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
+    # Yêu cầu prompt là 2000-2500 từ. Cho biên an toàn để tránh loại nhầm văn bản tốt.
+    if words < 1400:
+        return False, f"quá ngắn ({words} từ; tối thiểu an toàn 1400)"
+    if part_number in (3, 4) and not re.search(rf"(?i)PART\s+{part_number}", text):
+        return False, f"thiếu nhãn PART {part_number}"
+    return True, f"OK ({words} từ)"
+
+
+def generate_valid_part(story_context: str, part_number: int):
+    """Gọi OpenAI; nếu nội dung không đạt validation thì gọi lại cả part."""
+    validation_rounds = 3
+    last_reason = "unknown"
+    for round_no in range(1, validation_rounds + 1):
+        raw = call_openai_part(story_context, part_number)
+        if not raw:
+            last_reason = "OpenAI không trả content sau retry nội bộ"
+        else:
+            raw = _strip_program_endings(raw)
+            raw = _ensure_part_header(raw, part_number)
+            ok, reason = _validate_part(raw, part_number)
+            if ok:
+                print(f"[OPENAI] Part {part_number} validation: {reason}")
+                return raw
+            last_reason = reason
+            print(f"[CẢNH BÁO] Part {part_number} validation vòng {round_no}/{validation_rounds}: {reason}")
+        if round_no < validation_rounds:
+            time.sleep(RETRY_BACKOFF_SECONDS * round_no)
     send_error_alert(
-        f"openai_api_part_{part_number}_failed",
-        f"Không tạo được Part {part_number} sau {MAX_RETRIES} lần thử: {last_exc}",
+        f"openai_part_{part_number}_validation_failed",
+        f"Part {part_number} chưa đạt điều kiện hoàn chỉnh nên KHÔNG xuất Word. Lý do cuối: {last_reason}",
     )
     return None
 
 
 def call_openai_story(caption: str):
-    """Sinh tuần tự: Part 2 từ Part 1 -> Part 3 từ Part 1+2 -> Part 4 từ Part 1+2+3."""
+    """ALL-OR-NOTHING: chỉ trả story khi Part 2, Part 3 và Part 4 đều hoàn chỉnh."""
     print("[OPENAI] Request 1/3: Đang viết Part 2...")
-    part2 = call_openai_part(caption, 2)
-    if not part2:
+    p2_raw = generate_valid_part(caption, 2)
+    if not p2_raw:
         return None
 
     print("[OPENAI] Request 2/3: Đang viết Part 3 với context Part 1 + Part 2...")
-    context_for_part3 = f"{caption}\n\n{part2}"
-    part3 = call_openai_part(context_for_part3, 3)
-    if not part3:
+    p3_raw = generate_valid_part(f"{caption}\n\n{p2_raw}", 3)
+    if not p3_raw:
         return None
 
     print("[OPENAI] Request 3/3: Đang viết Part 4 với context Part 1 + Part 2 + Part 3...")
-    context_for_part4 = f"{caption}\n\n{part2}\n\n{part3}"
-    part4 = call_openai_part(context_for_part4, 4)
-    if not part4:
+    p4_raw = generate_valid_part(f"{caption}\n\n{p2_raw}\n\n{p3_raw}", 4)
+    if not p4_raw:
         return None
 
-    return f"{part2}\n\n{part3}\n\n{part4}"
+    # Ending chỉ chèn sau khi cả content của part đó đã hoàn chỉnh.
+    part2 = f"{p2_raw}\n\n**{PART_ENDINGS[2]}**"
+    part3 = f"{p3_raw}\n\n**{PART_ENDINGS[3]}**"
+    part4 = f"{p4_raw}\n\n**{PART_ENDINGS[4]}**"
+    return "\n\n".join((part2, part3, part4))
+
+
+def validate_complete_story(story_text: str):
+    """Cổng cuối: Word tuyệt đối không được tạo nếu thiếu bất kỳ Part 2/3/4 hoặc ending."""
+    if not story_text:
+        return False, "story_text rỗng"
+    for n in (2, 3, 4):
+        if not re.search(rf"(?i)PART\s+{n}", story_text):
+            return False, f"thiếu PART {n}"
+        if story_text.count(PART_ENDINGS[n]) != 1:
+            return False, f"ending Part {n} không xuất hiện đúng 1 lần"
+    return True, "đủ Part 2 + Part 3 + Part 4"
 
 
 def create_story_docx(story_text: str, out_path: str):
-    """Tạo file Word chứa Part 2 + Part 3 + Part 4."""
+    """Chỉ tạo Word sau khi story đã qua cổng validation đầy đủ."""
     from docx import Document
+
+    ok, reason = validate_complete_story(story_text)
+    if not ok:
+        raise ValueError(f"Từ chối tạo Word: {reason}")
 
     lines = story_text.split("\n")
     title = next((l.strip().replace("**", "") for l in lines if l.strip()), "Story Continuation")
-
     doc = Document()
     doc.add_heading(title, level=1)
     title_used = False
@@ -374,51 +485,71 @@ def create_story_docx(story_text: str, out_path: str):
         clean = line.strip()
         if not clean:
             continue
-        # Không lặp lại headline vì đã dùng làm heading của Word.
         if not title_used and clean.replace("**", "") == title:
             title_used = True
             continue
-        if clean in ("PART 2", "PART 3", "PART 4", "PART 4 (THE END)"):
-            doc.add_heading(clean, level=2)
+        normalized = clean.replace("**", "").strip()
+        if normalized.upper() in ("PART 2", "PART 3", "PART 4", "PART 4 (THE END)"):
+            doc.add_heading(normalized, level=2)
+        elif normalized in PART_ENDINGS.values():
+            p = doc.add_paragraph()
+            p.add_run(normalized).bold = True
         else:
-            doc.add_paragraph(clean)
+            doc.add_paragraph(clean.replace("**", ""))
     doc.save(out_path)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+        raise IOError("File Word không tồn tại hoặc kích thước bất thường sau khi save")
     return title
 
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
-    """Gọi 3 request tuần tự -> ghép 3 part -> tạo 1 file Word -> gửi Telegram."""
+    """Chỉ đánh dấu hoàn tất khi đủ 3 part mới + Word tạo và gửi Telegram thành công."""
+    global story_completed
     if not ENABLE_STORY_CONTINUATION:
-        return
+        return False
     if not caption or not caption.strip():
         print(f"[CẢNH BÁO] Bài {post_id} không có caption, bỏ qua viết Part 2/3/4.")
-        return
+        return False
 
-    print(f"[OPENAI] Bắt đầu tạo Part 2/3/4 cho bài {post_id} bằng 3 request liên tiếp...")
+    story_key = str(post_id)
+    if story_key in story_completed:
+        return True
+
+    print(f"[OPENAI] Bắt đầu ALL-OR-NOTHING Part 2/3/4 cho bài {post_id}...")
     story_text = call_openai_story(caption)
-    if not story_text:
-        return
+    ok, reason = validate_complete_story(story_text)
+    if not ok:
+        print(f"[OPENAI] KHÔNG tạo Word cho {post_id}: {reason}")
+        send_error_alert(
+            f"story_incomplete_{post_id}",
+            f"Bài {post_id}: chưa đủ Part 2/3/4 ({reason}). Không xuất Word; hệ thống sẽ thử lại ở lượt quét sau.",
+        )
+        return False
 
     safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", post_id)
     docx_path = f"/tmp/story_{safe_id}.docx"
     try:
         title = create_story_docx(story_text, docx_path)
+        sent = send_telegram_document(
+            docx_path,
+            caption=f"📖 HOÀN CHỈNH Part 2, 3 & 4 — Page: {page_name}\n{title[:200]}",
+        )
+        if not sent:
+            return False
+        story_completed.add(story_key)
+        save_story_completed(story_completed)
+        print(f"[OPENAI] Đã gửi Word hoàn chỉnh Part 2/3/4 cho bài {post_id}.")
+        return True
     except Exception as e:
-        print(f"[LỖI] Không tạo được file Word: {e}")
-        send_error_alert("story_docx_error", f"Không tạo được file Word cho Part 2/3/4 bài {post_id}: {e}")
-        return
-
-    ok = send_telegram_document(
-        docx_path,
-        caption=f"📖 Part 2, 3 & 4 tự động — Page: {page_name}\n{title[:200]}",
-    )
-    if ok:
-        print(f"[OPENAI] Đã gửi file Part 2/3/4 cho bài {post_id}.")
-
-    try:
-        os.remove(docx_path)
-    except Exception:
-        pass
+        print(f"[LỖI] Không tạo/gửi được file Word hoàn chỉnh: {e}")
+        send_error_alert(f"story_docx_error_{post_id}", f"Bài {post_id}: không tạo/gửi Word: {e}. Hệ thống sẽ thử lại.")
+        return False
+    finally:
+        try:
+            if os.path.exists(docx_path):
+                os.remove(docx_path)
+        except Exception:
+            pass
 
 
 ERROR_COOLDOWN_MINUTES = 30
@@ -683,7 +814,10 @@ def check_all_pages():
         # Chỉ bỏ qua hoàn toàn khi bài đã được báo CẢ 2 loại (ngưỡng chính + spike)
         post_ids_to_check = [
             pid for pid in all_post_ids
-            if not (f"{page_id}_{pid}" in already_notified and f"spike_{page_id}_{pid}" in already_notified)
+            if (
+                str(pid) not in story_completed
+                or not (f"{page_id}_{pid}" in already_notified and f"spike_{page_id}_{pid}" in already_notified)
+            )
         ]
 
         if not post_ids_to_check:
@@ -725,7 +859,15 @@ def check_all_pages():
                     save_notified(already_notified)  # lưu ngay lập tức sau khi gửi, giảm cửa sổ race-condition
                     print(f"[{ts}] Đã báo SPIKE cho [{page_name}] {post_id}")
 
-            if not meets_threshold(views, comments) or key in already_notified:
+            if not meets_threshold(views, comments):
+                continue
+
+            # Nếu đã gửi cảnh báo trước đó nhưng Word chưa hoàn chỉnh, KHÔNG báo Telegram lặp lại;
+            # chỉ thử lại pipeline Part 2/3/4 ở mỗi lượt quét cho đến khi thành công.
+            if key in already_notified:
+                if str(post_id) not in story_completed and message and not URL_PATTERN.search(message or ""):
+                    print(f"[{ts}] [{page_name}] {post_id}: Word chưa hoàn chỉnh -> thử lại Part 2/3/4.")
+                    generate_and_send_story_continuation(page_name, post_id, message)
                 continue
 
             if post_already_has_link(post_id, page_id, page_token, message):
