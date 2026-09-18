@@ -596,7 +596,7 @@ def create_story_docx(story_text: str, out_path: str):
 
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
-    """Chỉ đánh dấu hoàn tất khi đủ 3 part mới + Word tạo và gửi Telegram thành công."""
+    """Pipeline đồng bộ: được gọi ngay sau thông báo bài đang lên; chỉ gửi Word khi đủ Part 2/3/4."""
     global story_completed
     if not ENABLE_STORY_CONTINUATION:
         return False
@@ -955,11 +955,21 @@ def check_all_pages():
             if not meets_threshold(views, comments):
                 continue
 
-            # Nếu đã gửi cảnh báo trước đó nhưng Word chưa hoàn chỉnh, KHÔNG báo Telegram lặp lại;
-            # chỉ thử lại pipeline Part 2/3/4 ở mỗi lượt quét cho đến khi thành công.
+            # Nếu bài đã từng được báo nhưng Word chưa hoàn chỉnh, khi retry PHẢI gửi lại
+            # thông báo BÀI ĐANG LÊN ngay trước pipeline. Nhờ vậy nếu lần retry thành công,
+            # Telegram luôn có đúng thứ tự: BÀI ĐANG LÊN -> Word của chính bài đó.
             if key in already_notified:
                 if str(post_id) not in story_completed and message and not URL_PATTERN.search(message or ""):
-                    print(f"[{ts}] [{page_name}] {post_id}: Word chưa hoàn chỉnh -> thử lại Part 2/3/4.")
+                    retry_msg = (
+                        f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
+                        f"Views: {views}\n"
+                        f"Comments: {comments}\n"
+                        + (f"Link: {link}\n" if link else "")
+                        + "=> Gắn link ngay!\n"
+                        + "🔄 Đang tạo lại file Word hoàn chỉnh cho bài này..."
+                    )
+                    send_telegram_message(retry_msg)
+                    print(f"[{ts}] [{page_name}] {post_id}: Word chưa hoàn chỉnh -> đã báo lại đúng bài, bắt đầu retry Part 2/3/4.")
                     generate_and_send_story_continuation(page_name, post_id, message)
                 continue
 
@@ -979,7 +989,8 @@ def check_all_pages():
                 f"Views: {views}\n"
                 f"Comments: {comments}\n"
                 + (f"Link: {link}\n" if link else "")
-                + "=> Gắn link ngay!"
+                + "=> Gắn link ngay!\n"
+                + "⏳ Đang tạo file Word Part 2, 3 & 4 cho chính bài này..."
             )
             send_telegram_message(msg)
             already_notified.add(key)
