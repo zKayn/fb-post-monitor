@@ -289,7 +289,7 @@ def call_openai_story(caption: str):
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": full_prompt}],
-                    "max_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+                    "max_completion_tokens": OPENAI_MAX_OUTPUT_TOKENS,
                     "temperature": 0.85,
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
