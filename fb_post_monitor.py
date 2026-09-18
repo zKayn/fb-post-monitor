@@ -551,9 +551,12 @@ def call_openai_story(caption: str):
         return None
 
     # Ending chỉ chèn sau khi cả content của part đó đã hoàn chỉnh.
+    # Chỉ kẻ 1 đường phân cách PHÍA TRÊN Part 3 và Part 4 để dễ copy từ TXT.
+    # Không có đường kẻ phía dưới tiêu đề Part.
+    separator = "=" * 60
     part2 = f"{p2_raw}\n\n**{PART_ENDINGS[2]}**"
-    part3 = f"{p3_raw}\n\n**{PART_ENDINGS[3]}**"
-    part4 = f"{p4_raw}\n\n**{PART_ENDINGS[4]}**"
+    part3 = f"{separator}\n\n{p3_raw}\n\n**{PART_ENDINGS[3]}**"
+    part4 = f"{separator}\n\n{p4_raw}\n\n**{PART_ENDINGS[4]}**"
     return "\n\n".join((part2, part3, part4))
 
 
