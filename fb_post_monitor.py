@@ -74,7 +74,7 @@ THRESHOLD_RULES = [
     {"min_views": 7000, "min_comments": 20},
     {"min_views": 3000, "min_comments": 40},
 ]
-COMMENT_ONLY_THRESHOLD = 10  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 30  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
 ONLY_POSTS_NEWER_THAN_HOURS = 120
@@ -302,7 +302,6 @@ Start the requested part now. Remember: do NOT output the END OF PART / NEXT PAR
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": full_prompt}],
                     "max_completion_tokens": OPENAI_MAX_OUTPUT_TOKENS,
-                    "temperature": 0.85,
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
