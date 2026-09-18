@@ -34,7 +34,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
-OPENAI_MODEL = "gpt-5.6-sol"
+OPENAI_MODEL = "gpt-4o"
 OPENAI_MAX_OUTPUT_TOKENS = 8000  # dư địa cho MỖI part; tránh reasoning/length làm content rỗng
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 6  # retry riêng cho sinh truyện
