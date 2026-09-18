@@ -6,7 +6,7 @@ Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấ
 tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API viết tiếp
-Part 2 + Part 3 + Part 4 dựa trên caption gốc, xuất ra file Word, gửi kèm
+Part 2 + Part 3 + Part 4 dựa trên caption gốc, xuất ra file TXT UTF-8, gửi kèm
 thông báo Telegram.
 
 YÊU CẦU
@@ -16,7 +16,7 @@ YÊU CẦU
 2. Telegram Bot Token + Chat ID
 3. OpenAI API Key (lấy tại platform.openai.com/api-keys, cần nạp tiền
    riêng, khác với ChatGPT Plus)
-4. Cài thư viện: pip install requests python-docx
+4. Cài thư viện: pip install requests
 """
 
 import json
@@ -94,7 +94,7 @@ SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
 SPIKE_MIN_VIEWS_TO_CHECK = 2000
 VIEW_HISTORY_FILE = "/data/view_history.json"
-STORY_COMPLETED_FILE = "/data/story_completed_posts.json"  # chỉ đánh dấu sau khi Word đủ Part 2+3+4 đã gửi thành công
+STORY_COMPLETED_FILE = "/data/story_completed_posts.json"  # chỉ đánh dấu sau khi TXT đủ Part 2+3+4 đã gửi thành công
 
 # --- Retry khi gặp lỗi mạng tạm thời ---
 MAX_RETRIES = 3
@@ -276,7 +276,7 @@ def send_telegram_document(file_path: str, caption: str = ""):
         print(f"[CẢNH BÁO] Gửi file Telegram lần {attempt}/{MAX_RETRIES} thất bại: {last_error}")
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
-    send_error_alert("telegram_document_failed", f"Gửi file Word thất bại sau {MAX_RETRIES} lần: {last_error}")
+    send_error_alert("telegram_document_failed", f"Gửi file TXT thất bại sau {MAX_RETRIES} lần: {last_error}")
     return False
 
 
@@ -402,7 +402,7 @@ def _ensure_part_header(text: str, part_number: int) -> str:
 
 
 def _validate_part(text: str, part_number: int):
-    """Validation trước khi cho phép đi tiếp. Không đạt => coi như request lỗi và không tạo Word."""
+    """Validation trước khi cho phép đi tiếp. Không đạt => coi như request lỗi và không tạo TXT."""
     if not text or not text.strip():
         return False, "content rỗng"
     words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
@@ -500,7 +500,7 @@ def generate_valid_part(story_context: str, part_number: int):
     if not raw:
         send_error_alert(
             f"openai_part_{part_number}_generation_failed",
-            f"Part {part_number} không tạo được content nên KHÔNG xuất Word.",
+            f"Part {part_number} không tạo được content nên KHÔNG xuất TXT.",
         )
         return None
 
@@ -528,7 +528,7 @@ def generate_valid_part(story_context: str, part_number: int):
 
     send_error_alert(
         f"openai_part_{part_number}_validation_failed",
-        f"Part {part_number} chưa đạt điều kiện hoàn chỉnh nên KHÔNG xuất Word. Lý do cuối: {reason}",
+        f"Part {part_number} chưa đạt điều kiện hoàn chỉnh nên KHÔNG xuất TXT. Lý do cuối: {reason}",
     )
     return None
 
@@ -558,7 +558,7 @@ def call_openai_story(caption: str):
 
 
 def validate_complete_story(story_text: str):
-    """Cổng cuối: Word tuyệt đối không được tạo nếu thiếu bất kỳ Part 2/3/4 hoặc ending."""
+    """Cổng cuối: TXT tuyệt đối không được tạo nếu thiếu bất kỳ Part 2/3/4 hoặc ending."""
     if not story_text:
         return False, "story_text rỗng"
     for n in (2, 3, 4):
@@ -569,42 +569,27 @@ def validate_complete_story(story_text: str):
     return True, "đủ Part 2 + Part 3 + Part 4"
 
 
-def create_story_docx(story_text: str, out_path: str):
-    """Chỉ tạo Word sau khi story đã qua cổng validation đầy đủ."""
-    from docx import Document
-
+def create_story_txt(story_text: str, out_path: str):
+    """Chỉ tạo TXT UTF-8 sau khi story đã qua cổng validation đầy đủ."""
     ok, reason = validate_complete_story(story_text)
     if not ok:
-        raise ValueError(f"Từ chối tạo Word: {reason}")
+        raise ValueError(f"Từ chối tạo TXT: {reason}")
 
-    lines = story_text.split("\n")
-    title = next((l.strip().replace("**", "") for l in lines if l.strip()), "Story Continuation")
-    doc = Document()
-    doc.add_heading(title, level=1)
-    title_used = False
-    for line in lines:
-        clean = line.strip()
-        if not clean:
-            continue
-        if not title_used and clean.replace("**", "") == title:
-            title_used = True
-            continue
-        normalized = clean.replace("**", "").strip()
-        if normalized.upper() in ("PART 2", "PART 3", "PART 4", "PART 4 (THE END)"):
-            doc.add_heading(normalized, level=2)
-        elif normalized in PART_ENDINGS.values():
-            p = doc.add_paragraph()
-            p.add_run(normalized).bold = True
-        else:
-            doc.add_paragraph(clean.replace("**", ""))
-    doc.save(out_path)
+    # Bỏ ký hiệu Markdown ** để file TXT sạch, dễ copy/paste.
+    clean_text = story_text.replace("**", "").strip() + "\n"
+    lines = clean_text.splitlines()
+    title = next((re.sub(r"^[#\s]+", "", l.strip()) for l in lines if l.strip()), "Story Continuation")
+
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(clean_text)
+
     if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
-        raise IOError("File Word không tồn tại hoặc kích thước bất thường sau khi save")
+        raise IOError("File TXT không tồn tại hoặc kích thước bất thường sau khi save")
     return title
 
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
-    """Pipeline đồng bộ: được gọi ngay sau thông báo bài đang lên; chỉ gửi Word khi đủ Part 2/3/4."""
+    """Pipeline đồng bộ: được gọi ngay sau thông báo bài đang lên; chỉ gửi TXT khi đủ Part 2/3/4."""
     global story_completed
     if not ENABLE_STORY_CONTINUATION:
         return False
@@ -620,35 +605,35 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
     story_text = call_openai_story(caption)
     ok, reason = validate_complete_story(story_text)
     if not ok:
-        print(f"[OPENAI] KHÔNG tạo Word cho {post_id}: {reason}")
+        print(f"[OPENAI] KHÔNG tạo TXT cho {post_id}: {reason}")
         send_error_alert(
             f"story_incomplete_{post_id}",
-            f"Bài {post_id}: chưa đủ Part 2/3/4 ({reason}). Không xuất Word; hệ thống sẽ thử lại ở lượt quét sau.",
+            f"Bài {post_id}: chưa đủ Part 2/3/4 ({reason}). Không xuất TXT; hệ thống sẽ thử lại ở lượt quét sau.",
         )
         return False
 
     safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", post_id)
-    docx_path = f"/tmp/story_{safe_id}.docx"
+    txt_path = f"/tmp/story_{safe_id}.txt"
     try:
-        title = create_story_docx(story_text, docx_path)
+        title = create_story_txt(story_text, txt_path)
         sent = send_telegram_document(
-            docx_path,
+            txt_path,
             caption=f"📖 HOÀN CHỈNH Part 2, 3 & 4 — Page: {page_name}\n{title[:200]}",
         )
         if not sent:
             return False
         story_completed.add(story_key)
         save_story_completed(story_completed)
-        print(f"[OPENAI] Đã gửi Word hoàn chỉnh Part 2/3/4 cho bài {post_id}.")
+        print(f"[OPENAI] Đã gửi TXT hoàn chỉnh Part 2/3/4 cho bài {post_id}.")
         return True
     except Exception as e:
-        print(f"[LỖI] Không tạo/gửi được file Word hoàn chỉnh: {e}")
-        send_error_alert(f"story_docx_error_{post_id}", f"Bài {post_id}: không tạo/gửi Word: {e}. Hệ thống sẽ thử lại.")
+        print(f"[LỖI] Không tạo/gửi được file TXT hoàn chỉnh: {e}")
+        send_error_alert(f"story_txt_error_{post_id}", f"Bài {post_id}: không tạo/gửi TXT: {e}. Hệ thống sẽ thử lại.")
         return False
     finally:
         try:
-            if os.path.exists(docx_path):
-                os.remove(docx_path)
+            if os.path.exists(txt_path):
+                os.remove(txt_path)
         except Exception:
             pass
 
@@ -867,7 +852,7 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
 
 
 def contains_article_link(text: str) -> bool:
-    """Nhận diện link bài đọc cần tránh tạo Word. Domain cấu hình riêng để không nhầm URL Facebook/permalink."""
+    """Nhận diện link bài đọc cần tránh tạo TXT. Domain cấu hình riêng để không nhầm URL Facebook/permalink."""
     value = (text or "").lower()
     return any(domain in value for domain in ARTICLE_LINK_DOMAINS)
 
@@ -999,12 +984,12 @@ def check_all_pages():
             if not meets_threshold(views, comments):
                 continue
 
-            # Nếu bài đã từng được báo nhưng Word chưa hoàn chỉnh, khi retry PHẢI gửi lại
+            # Nếu bài đã từng được báo nhưng TXT chưa hoàn chỉnh, khi retry PHẢI gửi lại
             # thông báo BÀI ĐANG LÊN ngay trước pipeline. Nhờ vậy nếu lần retry thành công,
-            # Telegram luôn có đúng thứ tự: BÀI ĐANG LÊN -> Word của chính bài đó.
+            # Telegram luôn có đúng thứ tự: BÀI ĐANG LÊN -> TXT của chính bài đó.
             if key in already_notified:
                 if str(post_id) not in story_completed and message:
-                    # Word từng lỗi: trước khi báo lại / tốn OpenAI, bắt buộc quét link lại cả caption + comments.
+                    # TXT từng lỗi: trước khi báo lại / tốn OpenAI, bắt buộc quét link lại cả caption + comments.
                     if post_already_has_link(post_id, page_id, page_token, message):
                         print(f"[{ts}] [{page_name}] {post_id}: đã có link trước lượt retry -> bỏ qua, KHÔNG gọi OpenAI.")
                         continue
@@ -1014,10 +999,10 @@ def check_all_pages():
                         f"Comments: {comments}\n"
                         + (f"Link: {link}\n" if link else "")
                         + "=> Gắn link ngay!\n"
-                        + "🔄 Đang tạo lại file Word hoàn chỉnh cho bài này..."
+                        + "🔄 Đang tạo lại file TXT hoàn chỉnh cho bài này..."
                     )
                     send_telegram_message(retry_msg)
-                    print(f"[{ts}] [{page_name}] {post_id}: Word chưa hoàn chỉnh -> đã báo lại đúng bài, chuẩn bị retry Part 2/3/4.")
+                    print(f"[{ts}] [{page_name}] {post_id}: TXT chưa hoàn chỉnh -> đã báo lại đúng bài, chuẩn bị retry Part 2/3/4.")
                     # Kiểm tra lần cuối ngay trước khi tiêu token OpenAI.
                     if post_already_has_link(post_id, page_id, page_token, message):
                         print(f"[{ts}] [{page_name}] {post_id}: link vừa xuất hiện -> HỦY retry OpenAI.")
@@ -1042,7 +1027,7 @@ def check_all_pages():
                 f"Comments: {comments}\n"
                 + (f"Link: {link}\n" if link else "")
                 + "=> Gắn link ngay!\n"
-                + "⏳ Đang tạo file Word Part 2, 3 & 4 cho chính bài này..."
+                + "⏳ Đang tạo file TXT Part 2, 3 & 4 cho chính bài này..."
             )
             send_telegram_message(msg)
             already_notified.add(key)
@@ -1052,10 +1037,10 @@ def check_all_pages():
 
             # --- DOUBLE CHECK LINK ngay trước OpenAI để tránh tốn tiền nếu link vừa được gắn sau thông báo. ---
             if post_already_has_link(post_id, page_id, page_token, message):
-                print(f"[{ts}] [{page_name}] {post_id}: link vừa xuất hiện sau thông báo -> HỦY OpenAI, không tạo Word.")
+                print(f"[{ts}] [{page_name}] {post_id}: link vừa xuất hiện sau thông báo -> HỦY OpenAI, không tạo TXT.")
                 continue
 
-            # --- Tự viết Part 2 + Part 3 + Part 4 dựa trên caption, gửi kèm file Word ---
+            # --- Tự viết Part 2 + Part 3 + Part 4 dựa trên caption, gửi kèm file TXT ---
             generate_and_send_story_continuation(page_name, post_id, message)
 
     if changed:
