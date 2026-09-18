@@ -6,7 +6,7 @@ Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấ
 tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API viết tiếp
-Part 2 + Part 3 dựa trên caption gốc, xuất ra file Word, gửi kèm
+Part 2 + Part 3 + Part 4 dựa trên caption gốc, xuất ra file Word, gửi kèm
 thông báo Telegram.
 
 YÊU CẦU
@@ -32,55 +32,39 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# --- Tự viết Part 2 + Part 3 bằng OpenAI khi bài đạt ngưỡng và CHƯA có link ---
+# --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-sol"
-OPENAI_MAX_OUTPUT_TOKENS = 8000  # đủ cho ~2x 3500-4000 từ theo yêu cầu prompt
-OPENAI_TIMEOUT_SECONDS = 300  # sinh văn bản dài có thể mất vài phút
+OPENAI_MAX_OUTPUT_TOKENS = 5000  # giới hạn cho MỖI part (~2000-2500 từ)
+OPENAI_TIMEOUT_SECONDS = 300
 
-STORY_PROMPT_TEMPLATE = """You are a professional storyteller and novelist capable of crafting emotionally resonant works that emphasize character depth and captivate a wide audience.
+STORY_WRITING_RULES = """You are a professional storyteller and novelist, skilled at creating emotionally rich, character-driven fiction that appeals to a broad mainstream audience.
 
-Please continue by writing Part 2 and Part 3 of the story provided above.
+Write ONLY the requested story part.
 
 Requirements:
-*   Divide the text into two sections: PART 2 and PART 3; present them as separate blocks for easy copying.
-*   Write in a natural, engaging novelistic style with a smooth rhythm and compelling storytelling.
+• Write in a natural, immersive novelistic style with smooth pacing and engaging storytelling.
+• Focus on believable characters, emotional depth, family relationships, personal growth, trust, forgiveness, resilience, and meaningful life choices.
+• Develop suspense through hidden truths, difficult decisions, misunderstandings, subtle clues, and gradual revelations rather than intense confrontations or sensational events.
+• Maintain reader curiosity with realistic dialogue, layered character motivations, emotional conflict, and unexpected yet believable discoveries.
+• Keep all events emotionally grounded and plausible.
+• Avoid graphic violence, physical abuse, domestic abuse, cruelty, intimidation, revenge fantasies, public humiliation, excessive threats, manipulation, or abuse of power.
+• Avoid disturbing, traumatic, or highly emotional scenes involving children or vulnerable characters. If children appear, portray them in safe, supportive, and age-appropriate situations.
+• Avoid sensational plot twists designed only for shock value. Instead, build tension through mystery, relationships, and meaningful character choices.
+• Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling suitable for a wide audience.
+• Allow supporting characters to have meaningful roles, realistic motivations, and emotional growth.
+• Maintain a warm, family-friendly tone suitable for mainstream publishing platforms and advertising-friendly content standards.
+• Length: approximately 2000-2500 words for this part. Aim to complete the full requested length in this single response.
+• Maintain strict consistency in characters, settings, timeline, facts, relationships, and unresolved clues from all story context supplied above.
+• Do NOT repeat scenes or recap large portions unnecessarily. Continue naturally from the exact point where the previous part ended.
+• IMPORTANT: Do NOT write any END OF PART line, NEXT PART line, Facebook CTA, like/share request, or other ending marker. The program will append the correct ending line only after the part has been fully generated.
+"""
 
-*   Focus on authentic characters, emotional depth, family relationships, personal growth, trust, forgiveness, resilience, and meaningful life choices.
-
-*   Build suspense through hidden truths, difficult decisions, misunderstandings, subtle clues, and gradual revelations, rather than through heated confrontations or sensational events.
-
-*   Maintain reader curiosity through authentic dialogue, multi-dimensional character motivations, emotional conflicts, and surprising yet logical discoveries.
-
-*   Ensure all events stem from a solid and convincing emotional foundation.
-
-*   Avoid elements of graphic violence, physical abuse, domestic violence, cruelty, intimidation, revenge, public humiliation, excessive threats, manipulation, or abuse of power.
-
-*   Avoid scenes that are shocking, psychologically traumatic, or emotionally overwhelming for children or vulnerable characters. If children appear, portray them in safe, supported, and age-appropriate situations.
-
-*   Avoid sensational plot twists intended solely for shock value. Instead, build drama through mystery, relationships, and meaningful character choices.
-
-• Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling to engage a broad audience.
-
-• Give supporting characters meaningful roles, realistic motivations, and emotional growth.
-
-• Maintain a warm, family-friendly tone suitable for mass-market publishing platforms and ad-friendly content standards.
-
-Structure:
-
-• Length: Approximately 3,500–4,000 words per part.
-
-• Follow naturally from Part 1 while maintaining consistency in characters, setting, and timeline.
-
-• Gradually reveal new information to deepen the mystery and strengthen emotional bonds between characters.
-
-• Conclude Part 2 with a logical reveal, a compelling open-ended question, or a significant discovery that naturally leads the reader into Part 3, without relying on shock value, violence, or intense conflict. Output format:
-
-1. Always create a concise, engaging title that sparks curiosity and highlights the emotional journey, family relationships, hidden truths, or meaningful choices, while avoiding sensationalist or misleading language. 2. Write the full story for Part 2.
-
-3. End exactly with the following lines (IN BOLD):
--END OF PART 2 – CLICK THE "NEXT PART" SECTION AT THE BOTTOM OF THE PAGE TO CONTINUE READING
--END OF PART 3 – PLEASE "LIKE" AND SHARE THIS POST ON FACEBOOK TO SUPPORT US IN SHARING EVEN MORE STORIES"""
+PART_ENDINGS = {
+    2: '-END OF PART 2, –PRESS NEX PART IN BOTTOM OF PAGE TO READ NEXT PART',
+    3: '-END OF PART 3–PRESS NEX PART IN BOTTOM OF PAGE TO READ NEXT PART',
+    4: '- END OF PART 4 ​​- LET SAY YES AND LIKE, SHARE THIS POST IN FACEBOOK SO THAT WE HAVE THE MOTIVATION TO SHARE MORE STORIES',
+}
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
@@ -267,15 +251,43 @@ def send_telegram_document(file_path: str, caption: str = ""):
         return False
 
 
-# -------------------- Tự viết Part 2 + Part 3 (OpenAI) --------------------
-def call_openai_story(caption: str):
-    """Gọi OpenAI API để viết Part 2 + Part 3 dựa trên caption gốc.
-    Trả về đoạn văn bản kết quả, hoặc None nếu lỗi."""
+# -------------------- Tự viết Part 2 + Part 3 + Part 4 (3 request liên tiếp) --------------------
+def call_openai_part(story_context: str, part_number: int):
+    """Sinh đúng 1 part. Ending không cho model viết; chương trình tự nối sau khi part hoàn tất."""
     if not OPENAI_API_KEY:
-        print("[CẢNH BÁO] Chưa cấu hình OPENAI_API_KEY, bỏ qua bước viết Part 2/3.")
+        print("[CẢNH BÁO] Chưa cấu hình OPENAI_API_KEY, bỏ qua bước viết Part 2/3/4.")
         return None
 
-    full_prompt = f"{caption}\n\n{STORY_PROMPT_TEMPLATE}"
+    if part_number == 2:
+        part_instruction = """Write PART 2 only.
+Create ONE engaging, curiosity-driven headline before PART 2. The headline should highlight emotional journeys, family relationships, hidden truths, or meaningful choices without sensational or misleading wording.
+End the STORY CONTENT of Part 2 with a believable revelation, intriguing unanswered question, or important discovery that naturally leads into Part 3.
+Do not write Part 3 or Part 4."""
+    elif part_number == 3:
+        part_instruction = """Write PART 3 only.
+Do not create a new headline. Continue directly and naturally from Part 2.
+End the STORY CONTENT of Part 3 with a believable revelation, intriguing unanswered question, or important discovery that naturally leads into Part 4.
+Do not rewrite Part 2 and do not write Part 4."""
+    elif part_number == 4:
+        part_instruction = """Write PART 4 (The End) only.
+Do not create a new headline. Continue directly and naturally from Part 3.
+Resolve the important remaining story threads in a believable way. Usually give the story a happy, satisfying, emotionally relieving ending that resolves the reader's earlier frustration.
+Do not rewrite earlier parts."""
+    else:
+        raise ValueError(f"part_number không hợp lệ: {part_number}")
+
+    full_prompt = f"""STORY CONTEXT (everything below is continuity reference):
+
+{story_context}
+
+--- WRITING RULES ---
+{STORY_WRITING_RULES}
+
+--- CURRENT TASK ---
+{part_instruction}
+
+Start the requested part now. Remember: do NOT output the END OF PART / NEXT PART / Facebook CTA line. The program appends it only after generation is complete.
+"""
 
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -296,46 +308,94 @@ def call_openai_story(caption: str):
             )
             data = resp.json()
             if "choices" in data and data["choices"]:
-                return data["choices"][0]["message"]["content"]
+                text = data["choices"][0]["message"]["content"].strip()
+                if not text:
+                    raise ValueError(f"OpenAI trả về Part {part_number} rỗng")
+                # Chỉ append ending SAU KHI request đã sinh xong toàn bộ part.
+                return f"{text}\n\n**{PART_ENDINGS[part_number]}**"
+
             err_msg = data.get("error", {}).get("message", "Không rõ nguyên nhân")
-            print(f"[LỖI] OpenAI API lỗi: {err_msg}")
-            send_error_alert("openai_api_error", f"Lỗi khi gọi OpenAI API để viết Part 2/3:\n{err_msg}")
+            print(f"[LỖI] OpenAI API lỗi khi viết Part {part_number}: {err_msg}")
+            send_error_alert(
+                f"openai_api_error_part_{part_number}",
+                f"Lỗi khi gọi OpenAI API để viết Part {part_number}:\n{err_msg}",
+            )
             return None
         except requests.exceptions.RequestException as e:
             last_exc = e
-            print(f"[CẢNH BÁO] Lỗi mạng khi gọi OpenAI (lần {attempt}/{MAX_RETRIES}): {e}")
+            print(f"[CẢNH BÁO] Lỗi mạng khi viết Part {part_number} (lần {attempt}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+        except Exception as e:
+            last_exc = e
+            print(f"[CẢNH BÁO] Lỗi khi xử lý Part {part_number} (lần {attempt}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
-    send_error_alert("openai_api_network", f"Không kết nối được OpenAI sau {MAX_RETRIES} lần thử: {last_exc}")
+    send_error_alert(
+        f"openai_api_part_{part_number}_failed",
+        f"Không tạo được Part {part_number} sau {MAX_RETRIES} lần thử: {last_exc}",
+    )
     return None
 
 
+def call_openai_story(caption: str):
+    """Sinh tuần tự: Part 2 từ Part 1 -> Part 3 từ Part 1+2 -> Part 4 từ Part 1+2+3."""
+    print("[OPENAI] Request 1/3: Đang viết Part 2...")
+    part2 = call_openai_part(caption, 2)
+    if not part2:
+        return None
+
+    print("[OPENAI] Request 2/3: Đang viết Part 3 với context Part 1 + Part 2...")
+    context_for_part3 = f"{caption}\n\n{part2}"
+    part3 = call_openai_part(context_for_part3, 3)
+    if not part3:
+        return None
+
+    print("[OPENAI] Request 3/3: Đang viết Part 4 với context Part 1 + Part 2 + Part 3...")
+    context_for_part4 = f"{caption}\n\n{part2}\n\n{part3}"
+    part4 = call_openai_part(context_for_part4, 4)
+    if not part4:
+        return None
+
+    return f"{part2}\n\n{part3}\n\n{part4}"
+
+
 def create_story_docx(story_text: str, out_path: str):
-    """Tạo file Word từ đoạn văn bản Part 2/3 do OpenAI trả về."""
+    """Tạo file Word chứa Part 2 + Part 3 + Part 4."""
     from docx import Document
 
-    lines = [l for l in story_text.split("\n")]
-    title = next((l.strip() for l in lines if l.strip()), "Story Continuation")
+    lines = story_text.split("\n")
+    title = next((l.strip().replace("**", "") for l in lines if l.strip()), "Story Continuation")
 
     doc = Document()
     doc.add_heading(title, level=1)
+    title_used = False
     for line in lines:
-        if line.strip():
-            doc.add_paragraph(line.strip())
+        clean = line.strip()
+        if not clean:
+            continue
+        # Không lặp lại headline vì đã dùng làm heading của Word.
+        if not title_used and clean.replace("**", "") == title:
+            title_used = True
+            continue
+        if clean in ("PART 2", "PART 3", "PART 4", "PART 4 (THE END)"):
+            doc.add_heading(clean, level=2)
+        else:
+            doc.add_paragraph(clean)
     doc.save(out_path)
     return title
 
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
-    """Toàn bộ luồng: gọi OpenAI -> tạo file Word -> gửi qua Telegram."""
+    """Gọi 3 request tuần tự -> ghép 3 part -> tạo 1 file Word -> gửi Telegram."""
     if not ENABLE_STORY_CONTINUATION:
         return
     if not caption or not caption.strip():
-        print(f"[CẢNH BÁO] Bài {post_id} không có caption, bỏ qua viết Part 2/3.")
+        print(f"[CẢNH BÁO] Bài {post_id} không có caption, bỏ qua viết Part 2/3/4.")
         return
 
-    print(f"[OPENAI] Đang viết Part 2/3 cho bài {post_id}...")
+    print(f"[OPENAI] Bắt đầu tạo Part 2/3/4 cho bài {post_id} bằng 3 request liên tiếp...")
     story_text = call_openai_story(caption)
     if not story_text:
         return
@@ -346,15 +406,15 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
         title = create_story_docx(story_text, docx_path)
     except Exception as e:
         print(f"[LỖI] Không tạo được file Word: {e}")
-        send_error_alert("story_docx_error", f"Không tạo được file Word cho Part 2/3 bài {post_id}: {e}")
+        send_error_alert("story_docx_error", f"Không tạo được file Word cho Part 2/3/4 bài {post_id}: {e}")
         return
 
     ok = send_telegram_document(
         docx_path,
-        caption=f"📖 Part 2 & 3 tự động — Page: {page_name}\n{title[:200]}",
+        caption=f"📖 Part 2, 3 & 4 tự động — Page: {page_name}\n{title[:200]}",
     )
     if ok:
-        print(f"[OPENAI] Đã gửi file Part 2/3 cho bài {post_id}.")
+        print(f"[OPENAI] Đã gửi file Part 2/3/4 cho bài {post_id}.")
 
     try:
         os.remove(docx_path)
@@ -693,7 +753,7 @@ def check_all_pages():
             save_notified(already_notified)  # lưu ngay lập tức sau khi gửi, giảm cửa sổ race-condition
             print(f"[{ts}] Đã gửi thông báo Telegram cho [{page_name}] {post_id}")
 
-            # --- Tự viết Part 2 + Part 3 dựa trên caption, gửi kèm file Word ---
+            # --- Tự viết Part 2 + Part 3 + Part 4 dựa trên caption, gửi kèm file Word ---
             generate_and_send_story_continuation(page_name, post_id, message)
 
     if changed:
