@@ -37,7 +37,7 @@ ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-4o"
 OPENAI_MAX_OUTPUT_TOKENS = 8000  # dư địa cho MỖI part; tránh reasoning/length làm content rỗng
 OPENAI_TIMEOUT_SECONDS = 600
-OPENAI_PART_RETRIES = 6  # retry riêng cho sinh truyện
+OPENAI_PART_RETRIES = 3  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
 STORY_WRITING_RULES = """You are a professional storyteller and novelist, skilled at creating emotionally rich, character-driven fiction that appeals to a broad mainstream audience.
 
@@ -399,35 +399,128 @@ def _validate_part(text: str, part_number: int):
         return False, "content rỗng"
     words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
     # Yêu cầu prompt là 2000-2500 từ. Cho biên an toàn để tránh loại nhầm văn bản tốt.
-    if words < 1400:
-        return False, f"quá ngắn ({words} từ; tối thiểu an toàn 1400)"
+    if words < 1800:
+        return False, f"quá ngắn ({words} từ; tối thiểu an toàn 1800 sau bước bổ sung)"
     if part_number in (3, 4) and not re.search(rf"(?i)PART\s+{part_number}", text):
         return False, f"thiếu nhãn PART {part_number}"
     return True, f"OK ({words} từ)"
 
 
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w’'-]+\b", text or "", flags=re.UNICODE))
+
+
+def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 2200):
+    """Bổ sung phần còn thiếu thay vì vứt content đã trả tiền và generate lại từ đầu."""
+    current_words = _word_count(existing_part)
+    need_words = max(250, target_words - current_words)
+    # Cho dư nhẹ để model có thể kết thúc tự nhiên, nhưng tránh sinh quá dài/tốn tiền.
+    requested_words = min(max(need_words + 150, 350), 1200)
+
+    if part_number in (2, 3):
+        ending_instruction = f"End with a natural hook or discovery leading into Part {part_number + 1}."
+    else:
+        ending_instruction = "Resolve the remaining story threads with a satisfying, emotionally relieving ending."
+
+    prompt = f"""You are continuing an existing story part. DO NOT rewrite, summarize, or repeat text already written.
+
+STORY CONTEXT:
+{story_context}
+
+EXISTING PART {part_number} (already paid for and must be preserved):
+{existing_part}
+
+TASK:
+Continue PART {part_number} from the exact final sentence above. Write approximately {requested_words} additional words so the COMPLETE part reaches about 2000-2500 words.
+Maintain exact continuity, characters, timeline, tone, and facts.
+{ending_instruction}
+Do NOT add a PART heading, headline, END OF PART line, NEXT PART line, Facebook CTA, like/share request, or commentary.
+Output ONLY the new continuation paragraphs."""
+
+    last_error = "unknown"
+    for attempt in range(1, OPENAI_PART_RETRIES + 1):
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    # Continuation is intentionally much smaller than a full-part generation.
+                    "max_completion_tokens": min(OPENAI_MAX_OUTPUT_TOKENS, 3500),
+                },
+                timeout=OPENAI_TIMEOUT_SECONDS,
+            )
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
+            if resp.status_code != 200:
+                last_error = data.get("error", {}).get("message", resp.text[:1000])
+            else:
+                choices = data.get("choices") or []
+                if choices:
+                    choice = choices[0] or {}
+                    msg = choice.get("message") or {}
+                    extra = msg.get("content") or ""
+                    if isinstance(extra, list):
+                        extra = "".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in extra)
+                    extra = _strip_program_endings(str(extra).strip())
+                    if extra:
+                        usage = data.get("usage", {})
+                        print(f"[OPENAI] Part {part_number} continuation OK | +{_word_count(extra)} từ | usage={usage}")
+                        return extra
+                    last_error = f"continuation rỗng; finish_reason={choice.get('finish_reason')}; usage={data.get('usage', {})}"
+                else:
+                    last_error = f"không có choices; response={str(data)[:1200]}"
+        except requests.exceptions.RequestException as e:
+            last_error = f"network/timeout: {e}"
+        except Exception as e:
+            last_error = f"parse/process: {e}"
+
+        print(f"[CẢNH BÁO] Bổ sung Part {part_number} lần {attempt}/{OPENAI_PART_RETRIES} thất bại: {last_error}")
+        if attempt < OPENAI_PART_RETRIES:
+            time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 20))
+
+    return None
+
+
 def generate_valid_part(story_context: str, part_number: int):
-    """Gọi OpenAI; nếu nội dung không đạt validation thì gọi lại cả part."""
-    validation_rounds = 3
-    last_reason = "unknown"
-    for round_no in range(1, validation_rounds + 1):
-        raw = call_openai_part(story_context, part_number)
-        if not raw:
-            last_reason = "OpenAI không trả content sau retry nội bộ"
-        else:
-            raw = _strip_program_endings(raw)
-            raw = _ensure_part_header(raw, part_number)
-            ok, reason = _validate_part(raw, part_number)
-            if ok:
-                print(f"[OPENAI] Part {part_number} validation: {reason}")
-                return raw
-            last_reason = reason
-            print(f"[CẢNH BÁO] Part {part_number} validation vòng {round_no}/{validation_rounds}: {reason}")
-        if round_no < validation_rounds:
-            time.sleep(RETRY_BACKOFF_SECONDS * round_no)
+    """Sinh 1 lần; nếu ngắn thì GIỮ content và chỉ mua thêm phần còn thiếu."""
+    raw = call_openai_part(story_context, part_number)
+    if not raw:
+        send_error_alert(
+            f"openai_part_{part_number}_generation_failed",
+            f"Part {part_number} không tạo được content nên KHÔNG xuất Word.",
+        )
+        return None
+
+    raw = _strip_program_endings(raw)
+    raw = _ensure_part_header(raw, part_number)
+    words = _word_count(raw)
+
+    # Nếu >= 1400 nhưng dưới mục tiêu, tuyệt đối không regenerate toàn bộ.
+    # Giữ content và gọi continuation ngắn để đạt ~2000-2500 từ.
+    continuation_rounds = 3
+    while words < 1900 and continuation_rounds > 0:
+        print(f"[OPENAI] Part {part_number} mới có {words} từ -> giữ nguyên và viết bổ sung, KHÔNG regenerate.")
+        extra = call_openai_continue_part(story_context, raw, part_number, target_words=2200)
+        if not extra:
+            break
+        raw = f"{raw.rstrip()}\n\n{extra.strip()}"
+        raw = _strip_program_endings(raw)
+        words = _word_count(raw)
+        continuation_rounds -= 1
+
+    ok, reason = _validate_part(raw, part_number)
+    if ok:
+        print(f"[OPENAI] Part {part_number} validation: {reason}")
+        return raw
+
     send_error_alert(
         f"openai_part_{part_number}_validation_failed",
-        f"Part {part_number} chưa đạt điều kiện hoàn chỉnh nên KHÔNG xuất Word. Lý do cuối: {last_reason}",
+        f"Part {part_number} chưa đạt điều kiện hoàn chỉnh nên KHÔNG xuất Word. Lý do cuối: {reason}",
     )
     return None
 
