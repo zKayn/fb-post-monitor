@@ -80,7 +80,7 @@ INCLUDE_PAGE_NAMES = []
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 THRESHOLD_RULES = [
-    {"min_views": 7000, "min_comments": 20},
+    {"min_views": 6000, "min_comments": 20},
     {"min_views": 3000, "min_comments": 40},
 ]
 COMMENT_ONLY_THRESHOLD = 50  # comments vượt mốc này thì báo luôn, không cần xét views
@@ -572,27 +572,45 @@ def validate_complete_story(story_text: str):
     return True, "đủ Part 2 + Part 3 + Part 4"
 
 
-def create_story_txt(story_text: str, out_path: str):
-    """Chỉ tạo TXT UTF-8 sau khi story đã qua cổng validation đầy đủ."""
+def split_story_into_parts(story_text: str):
+    """Tách story đã hoàn chỉnh thành 3 nội dung TXT độc lập, không gọi lại OpenAI."""
     ok, reason = validate_complete_story(story_text)
     if not ok:
-        raise ValueError(f"Từ chối tạo TXT: {reason}")
+        raise ValueError(f"Từ chối tách TXT: {reason}")
 
-    # Bỏ ký hiệu Markdown ** để file TXT sạch, dễ copy/paste.
-    clean_text = story_text.replace("**", "").strip() + "\n"
-    lines = clean_text.splitlines()
-    title = next((re.sub(r"^[#\s]+", "", l.strip()) for l in lines if l.strip()), "Story Continuation")
+    separator = "=" * 60
+    chunks = story_text.split(separator)
+    if len(chunks) != 3:
+        raise ValueError(f"Không thể tách chính xác 3 Part (tìm thấy {len(chunks)} khối)")
+
+    parts = {}
+    for n, chunk in zip((2, 3, 4), chunks):
+        clean = chunk.replace("**", "").strip() + "\n"
+        if not re.search(rf"(?i)PART\s+{n}", clean):
+            raise ValueError(f"Khối TXT thứ {n - 1} không chứa PART {n}")
+        if clean.count(PART_ENDINGS[n]) != 1:
+            raise ValueError(f"TXT Part {n} không có ending đúng 1 lần")
+        parts[n] = clean
+    return parts
+
+
+def create_part_txt(part_text: str, part_number: int, out_path: str):
+    """Ghi đúng một Part thành một file TXT UTF-8 riêng."""
+    if not re.search(rf"(?i)PART\s+{part_number}", part_text):
+        raise ValueError(f"Từ chối tạo TXT: thiếu PART {part_number}")
+    if part_text.count(PART_ENDINGS[part_number]) != 1:
+        raise ValueError(f"Từ chối tạo TXT: ending Part {part_number} không đúng 1 lần")
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(clean_text)
+        f.write(part_text.strip() + "\n")
 
-    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
-        raise IOError("File TXT không tồn tại hoặc kích thước bất thường sau khi save")
-    return title
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 500:
+        raise IOError(f"File Part {part_number} TXT không tồn tại hoặc kích thước bất thường")
+    return True
 
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
-    """Pipeline đồng bộ: được gọi ngay sau thông báo bài đang lên; chỉ gửi TXT khi đủ Part 2/3/4."""
+    """Tạo Part 2/3/4 một lần bằng OpenAI, sau đó xuất và gửi 3 file TXT riêng."""
     global story_completed
     if not ENABLE_STORY_CONTINUATION:
         return False
@@ -616,29 +634,46 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
         return False
 
     safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", post_id)
-    txt_path = f"/tmp/story_{safe_id}.txt"
+    txt_paths = {
+        2: f"/tmp/story_{safe_id}_PART_2.txt",
+        3: f"/tmp/story_{safe_id}_PART_3.txt",
+        4: f"/tmp/story_{safe_id}_PART_4.txt",
+    }
+
     try:
-        title = create_story_txt(story_text, txt_path)
-        sent = send_telegram_document(
-            txt_path,
-            caption=f"📖 HOÀN CHỈNH Part 2, 3 & 4 — Page: {page_name}\n{title[:200]}",
-        )
-        if not sent:
-            return False
+        # Chỉ tách kết quả đã tạo; KHÔNG phát sinh request OpenAI mới.
+        parts = split_story_into_parts(story_text)
+        for n in (2, 3, 4):
+            create_part_txt(parts[n], n, txt_paths[n])
+
+        # Gửi tuần tự để Telegram hiển thị Part 2 -> Part 3 -> Part 4 ngay sau thông báo bài đang lên.
+        for n in (2, 3, 4):
+            sent = send_telegram_document(
+                txt_paths[n],
+                caption=f"📄 PART {n} — Page: {page_name}",
+            )
+            if not sent:
+                raise RuntimeError(f"Gửi TXT Part {n} thất bại")
+
+        # Chỉ đánh dấu hoàn thành sau khi cả 3 file đều gửi thành công.
         story_completed.add(story_key)
         save_story_completed(story_completed)
-        print(f"[OPENAI] Đã gửi TXT hoàn chỉnh Part 2/3/4 cho bài {post_id}.")
+        print(f"[OPENAI] Đã gửi 3 TXT riêng Part 2, Part 3, Part 4 cho bài {post_id}.")
         return True
     except Exception as e:
-        print(f"[LỖI] Không tạo/gửi được file TXT hoàn chỉnh: {e}")
-        send_error_alert(f"story_txt_error_{post_id}", f"Bài {post_id}: không tạo/gửi TXT: {e}. Hệ thống sẽ thử lại.")
+        print(f"[LỖI] Không tạo/gửi đủ 3 file TXT: {e}")
+        send_error_alert(
+            f"story_txt_error_{post_id}",
+            f"Bài {post_id}: không tạo/gửi đủ 3 TXT: {e}. Hệ thống sẽ thử lại.",
+        )
         return False
     finally:
-        try:
-            if os.path.exists(txt_path):
-                os.remove(txt_path)
-        except Exception:
-            pass
+        for path in txt_paths.values():
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
 
 ERROR_COOLDOWN_MINUTES = 30
