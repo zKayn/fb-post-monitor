@@ -24,6 +24,8 @@ import os
 import re
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
 
 # ========================== CONFIG ==========================
@@ -97,8 +99,8 @@ VIEW_HISTORY_FILE = "/data/view_history.json"
 STORY_COMPLETED_FILE = "/data/story_completed_posts.json"  # chỉ đánh dấu sau khi TXT đủ Part 2+3+4 đã gửi thành công
 
 # --- Retry khi gặp lỗi mạng tạm thời ---
-MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 3  # tăng dần: 3s, 6s, 9s giữa các lần thử lại
+MAX_RETRIES = 5
+RETRY_BACKOFF_SECONDS = 3  # 3s, 6s, 9s...; cộng thêm retry ở HTTP adapter
 
 # --- Batch API ---
 # Mỗi bài viết cần 3 sub-request: 2 request insights riêng biệt (giữ cơ chế
@@ -121,31 +123,51 @@ URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 
 
 # ==================== RETRY HELPER ====================
+def _build_http_session():
+    # Retry cả lỗi connect/read và HTTP tạm thời. POST được phép retry vì các POST
+    # Facebook ở đây chỉ là Batch API đọc dữ liệu; Telegram/OpenAI vẫn có retry riêng.
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(("GET", "POST")),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+HTTP_SESSION = _build_http_session()
+
 def api_get(url, params=None, timeout=20):
-    """GET request có tự động retry khi gặp lỗi mạng tạm thời."""
+    """GET có nhiều lớp retry; chỉ raise sau khi đã thử hết."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return requests.get(url, params=params, timeout=timeout)
+            return HTTP_SESSION.get(url, params=params, timeout=(10, timeout))
         except requests.exceptions.RequestException as e:
             last_exc = e
-            print(f"[CẢNH BÁO] Lỗi mạng (lần {attempt}/{MAX_RETRIES}): {e}")
+            print(f"[CẢNH BÁO] GET lỗi mạng (vòng {attempt}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 20))
     raise last_exc
 
-
 def api_post(url, data=None, timeout=30):
-    """POST request có tự động retry khi gặp lỗi mạng tạm thời."""
+    """POST có nhiều lớp retry; dùng cho Facebook Batch/Telegram text."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return requests.post(url, data=data, timeout=timeout)
+            return HTTP_SESSION.post(url, data=data, timeout=(10, timeout))
         except requests.exceptions.RequestException as e:
             last_exc = e
-            print(f"[CẢNH BÁO] Lỗi mạng (lần {attempt}/{MAX_RETRIES}): {e}")
+            print(f"[CẢNH BÁO] POST lỗi mạng (vòng {attempt}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 20))
     raise last_exc
 
 
@@ -726,6 +748,31 @@ def check_token_expiry():
         )
 
 
+# -------------------- Chống spam cảnh báo lỗi mạng Facebook --------------------
+FB_NETWORK_ALERT_AFTER_FAILURES = 3
+_fb_network_failures = {}
+_fb_network_alerted = set()
+
+def note_fb_network_failure(error_key: str, text: str):
+    """Chỉ Telegram sau 3 vòng lỗi liên tiếp; lỗi thoáng qua chỉ log."""
+    count = _fb_network_failures.get(error_key, 0) + 1
+    _fb_network_failures[error_key] = count
+    print(f"[FACEBOOK NETWORK] {error_key}: lỗi liên tiếp {count}/{FB_NETWORK_ALERT_AFTER_FAILURES} - {text}")
+    if count >= FB_NETWORK_ALERT_AFTER_FAILURES and error_key not in _fb_network_alerted:
+        send_error_alert(error_key, f"Facebook mất kết nối {count} lần liên tiếp.\n{text}")
+        _fb_network_alerted.add(error_key)
+
+def note_fb_network_success(error_key: str):
+    """Reset bộ đếm khi request Facebook thành công."""
+    had_failures = _fb_network_failures.get(error_key, 0)
+    was_alerted = error_key in _fb_network_alerted
+    _fb_network_failures[error_key] = 0
+    _fb_network_alerted.discard(error_key)
+    if was_alerted:
+        send_telegram_message("✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
+    elif had_failures:
+        print(f"[FACEBOOK NETWORK] {error_key}: kết nối đã phục hồi sau {had_failures} lần lỗi.")
+
 # -------------------- Facebook API --------------------
 def get_managed_pages():
     pages = []
@@ -735,8 +782,9 @@ def get_managed_pages():
         try:
             r = api_get(url, params=params)
         except Exception as e:
-            send_error_alert("get_managed_pages_network", f"Không kết nối được Facebook để lấy danh sách Page: {e}")
+            note_fb_network_failure("get_managed_pages_network", f"Không kết nối được Facebook để lấy danh sách Page: {e}")
             return []
+        note_fb_network_success("get_managed_pages_network")
         data = r.json()
         if "error" in data:
             err_msg = data["error"].get("message", "Không rõ nguyên nhân")
@@ -762,9 +810,13 @@ def get_recent_post_ids(page_id: str, page_token: str):
             params={"fields": "id,created_time", "limit": 25, "access_token": page_token},
         )
     except Exception as e:
-        send_error_alert(f"get_recent_post_ids_net_{page_id}", f"Page ID {page_id}: lỗi mạng khi lấy danh sách bài viết: {e}")
+        note_fb_network_failure(
+            f"get_recent_post_ids_net_{page_id}",
+            f"Page ID {page_id}: lỗi mạng khi lấy danh sách bài viết: {e}",
+        )
         return []
 
+    note_fb_network_success(f"get_recent_post_ids_net_{page_id}")
     data = r.json()
     if "error" in data:
         err_msg = data["error"].get("message", "Không rõ nguyên nhân")
@@ -826,9 +878,10 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
                 data={"access_token": page_token, "batch": json.dumps(batch_items)},
             )
         except Exception as e:
-            send_error_alert("batch_request_network", f"Lỗi mạng khi gọi Batch API: {e}")
+            note_fb_network_failure("batch_request_network", f"Lỗi mạng khi gọi Batch API: {e}")
             continue
 
+        note_fb_network_success("batch_request_network")
         try:
             batch_resp = resp.json()
         except Exception as e:
