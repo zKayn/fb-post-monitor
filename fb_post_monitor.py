@@ -1,9 +1,8 @@
 """
-FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN + AUTO PART 2/3)
+FB POST MONITOR (FAST SCAN + BATCH API + AUTO PART 2/3/4)
 =================================================================
 Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi thông báo
-Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
-tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
+Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API viết tiếp
 Part 2 + Part 3 + Part 4 dựa trên caption gốc, xuất ra file TXT UTF-8, gửi kèm
@@ -29,6 +28,7 @@ import queue
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========================== CONFIG ==========================
 USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "")
@@ -87,7 +87,7 @@ THRESHOLD_RULES = [
     {"min_views": 5000, "min_comments": 0},
     {"min_views": 3000, "min_comments": 40},
 ]
-COMMENT_ONLY_THRESHOLD = 50  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 55  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
 ONLY_POSTS_NEWER_THAN_HOURS = 120
@@ -115,7 +115,14 @@ METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 # --- Cảnh báo token sắp hết hạn ---
 TOKEN_EXPIRY_WARNING_DAYS = 5
 
-CHECK_INTERVAL_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 60
+PAGE_DISCOVERY_INTERVAL_SECONDS = 900
+FULL_POST_DISCOVERY_INTERVAL_SECONDS = 300
+FAST_POST_AGE_HOURS = 12
+FAST_NEAR_THRESHOLD_RATIO = 0.65
+SLOW_POST_CHECK_INTERVAL_SECONDS = 300
+PAGE_WORKERS = 3
+TRACKED_POSTS_FILE = "/data/tracked_posts.json"
 POSTS_PAGE_LIMIT = 100
 POSTS_MAX_PAGES = 20
 
@@ -848,7 +855,7 @@ def get_recent_post_ids(page_id: str, page_token: str):
                 continue
             oldest = min(oldest, dt) if oldest else dt
             if dt >= cutoff:
-                found.append(pid)
+                found.append((pid, dt.isoformat()))
                 seen.add(pid)
         url = data.get("paging", {}).get("next")
         params = None
@@ -858,6 +865,46 @@ def get_recent_post_ids(page_id: str, page_token: str):
         print(f"[CẢNH BÁO] Page {page_id}: đã quét {POSTS_MAX_PAGES} trang, có thể còn bài cũ hơn.")
     print(f"[FACEBOOK] Page {page_id}: tìm thấy {len(found)} bài trong {ONLY_POSTS_NEWER_THAN_HOURS} giờ.")
     return found
+
+
+# Persist discovered posts so a fast scan does not have to paginate 120 hours each minute.
+def load_tracked_posts():
+    try:
+        with open(TRACKED_POSTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_tracked_posts():
+    try:
+        os.makedirs(os.path.dirname(TRACKED_POSTS_FILE), exist_ok=True)
+        tmp = TRACKED_POSTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(tracked_posts, f, ensure_ascii=False)
+        os.replace(tmp, TRACKED_POSTS_FILE)
+    except OSError as e:
+        print(f"[CACHE] Không lưu được bài theo dõi: {e}")
+
+
+tracked_posts = load_tracked_posts()
+for _page_posts in tracked_posts.values():
+    if isinstance(_page_posts, dict):
+        for _entry in _page_posts.values():
+            if isinstance(_entry, dict):
+                _entry["last_check"] = 0
+_last_discovery = {}
+_last_page_discovery = 0.0
+_cached_pages = []
+
+
+def near_threshold(views, comments):
+    if comments >= COMMENT_ONLY_THRESHOLD * FAST_NEAR_THRESHOLD_RATIO:
+        return True
+    return any(views >= rule["min_views"] * FAST_NEAR_THRESHOLD_RATIO and
+               comments >= rule["min_comments"] * FAST_NEAR_THRESHOLD_RATIO
+               for rule in THRESHOLD_RULES)
 
 
 def chunked(lst, n):
@@ -1046,6 +1093,7 @@ def story_worker():
                     continue
                 if notified_key not in already_notified:
                     send_telegram_message(alert_text)
+                    print(f"[TELEGRAM] post={post_id} alert_at={datetime.now(timezone.utc).isoformat()}")
                     already_notified.add(notified_key)
                     save_notified(already_notified)
                 else:
@@ -1061,87 +1109,113 @@ def story_worker():
                 _story_pending.discard(post_id)
             STORY_QUEUE.task_done()
 
+def _scan_page(page, now_mono, now_utc):
+    page_id, page_name, page_token = page["id"], page["name"], page["access_token"]
+    tracked = tracked_posts.setdefault(str(page_id), {})
+    cutoff = now_utc - timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)
+    for pid, item in list(tracked.items()):
+        try:
+            created = datetime.fromisoformat(item["created"])
+            if created < cutoff or pid in story_completed:
+                del tracked[pid]
+        except (ValueError, KeyError, TypeError):
+            del tracked[pid]
+
+    # Full discovery every 5 min, while fresh posts are discovered every minute.
+    full = now_mono - _last_discovery.get((page_id, "full"), -1e12) >= FULL_POST_DISCOVERY_INTERVAL_SECONDS
+    if full:
+        discovered = get_recent_post_ids(page_id, page_token)
+        _last_discovery[(page_id, "full")] = now_mono
+    else:
+        discovered = get_recent_post_ids_fast(page_id, page_token)
+    for pid, created in discovered:
+        if pid not in story_completed:
+            tracked.setdefault(pid, {"created": created, "last_check": 0, "near": False})
+
+    candidates = []
+    for pid, item in tracked.items():
+        try:
+            age = (now_utc - datetime.fromisoformat(item["created"])).total_seconds()
+        except (ValueError, KeyError, TypeError):
+            continue
+        interval = CHECK_INTERVAL_SECONDS if age <= FAST_POST_AGE_HOURS * 3600 or item.get("near") else SLOW_POST_CHECK_INTERVAL_SECONDS
+        if now_mono - item.get("last_check", 0) >= interval:
+            candidates.append(pid)
+    # Prioritize recently published and near-threshold posts; limit fast scan work.
+    candidates.sort(key=lambda pid: (not tracked[pid].get("near", False), -datetime.fromisoformat(tracked[pid]["created"]).timestamp()))
+    if not candidates:
+        return
+    stats = get_stats_batch(candidates, page_token)
+    ts = datetime.now().strftime("%H:%M:%S")
+    for pid in candidates:
+        if pid not in stats:
+            continue  # retry failed batch next scan
+        views, comments, link, message = stats[pid]
+        if comments is None or (views is None and comments <= COMMENT_ONLY_THRESHOLD):
+            continue
+        item = tracked[pid]
+        item["last_check"] = now_mono
+        item["near"] = near_threshold(views or 0, comments)
+        if not meets_threshold(views or 0, comments):
+            continue
+        key = f"{page_id}_{pid}"
+        if pid in story_completed:
+            continue
+        if pid in _story_pending:
+            continue
+        if post_already_has_link(pid, page_id, page_token, message):
+            already_notified.add(key)
+            save_notified(already_notified)
+            continue
+        alert = (f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\nViews: {views}\nComments: {comments}\n"
+                 + (f"Link: {link}\n" if link else "")
+                 + "=> Gắn link ngay!\n⏳ Đang tạo file TXT Part 2, 3 & 4 cho bài này...")
+        print(f"[DETECTED] post={pid} page={page_name} api_threshold_at={datetime.now(timezone.utc).isoformat()} "
+              f"published_at={item['created']} views={views} comments={comments} queue={STORY_QUEUE.qsize()}")
+        enqueue_story(page_name, pid, message, page_id, page_token, alert, key)
+
+
+def get_recent_post_ids_fast(page_id, page_token):
+    """Fetch first page each minute; deep pagination runs every 5 minutes."""
+    try:
+        r = api_get(f"{GRAPH_URL}/{page_id}/posts",
+                    params={"fields": "id,created_time", "limit": POSTS_PAGE_LIMIT, "access_token": page_token})
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            raise ValueError(data["error"].get("message", "Graph API error"))
+        return [(p["id"], datetime.strptime(p["created_time"], "%Y-%m-%dT%H:%M:%S%z").isoformat())
+                for p in data.get("data", []) if p.get("id") and p.get("created_time")]
+    except Exception as e:
+        print(f"[FAST DISCOVERY] Page {page_id}: {e}")
+        return []
+
+
 def check_all_pages():
-    # Token expiry được kiểm tra theo ngày để vòng quét nhanh hơn.
+    global _last_page_discovery, _cached_pages
+    started = time.monotonic()
     if not hasattr(check_all_pages, "_last_token_check") or time.time() - check_all_pages._last_token_check > 86400:
         check_token_expiry()
         check_all_pages._last_token_check = time.time()
-
-    pages = get_managed_pages()
-    ts = datetime.now().strftime("%H:%M:%S")
-
-    if not pages:
-        print(f"[{ts}] Không tìm thấy Page nào (kiểm tra lại USER_ACCESS_TOKEN).")
+    if not _cached_pages or started - _last_page_discovery >= PAGE_DISCOVERY_INTERVAL_SECONDS:
+        pages = get_managed_pages()
+        if pages:
+            _cached_pages = pages
+            _last_page_discovery = started
+    if not _cached_pages:
+        print("[SCAN] Không có Page nào để quét")
         return
-
-    print(f"[{ts}] Đang quét {len(pages)} Page: {', '.join(p['name'] for p in pages)}")
-
-    changed = False
-    now_dt = datetime.now()
-
-    for page in pages:
-        page_id = page["id"]
-        page_name = page["name"]
-        page_token = page["access_token"]
-
-        all_post_ids = get_recent_post_ids(page_id, page_token)
-
-        # Không quét lại bài đã gửi đủ 3 TXT; bài chưa xong vẫn được kiểm tra lại.
-        post_ids_to_check = [pid for pid in all_post_ids if str(pid) not in story_completed]
-
-        if not post_ids_to_check:
-            continue
-
-        stats = get_stats_batch(post_ids_to_check, page_token)
-
-        for post_id in post_ids_to_check:
-            key = f"{page_id}_{post_id}"
-            views, comments, link, message = stats.get(post_id, (None, None, None, ""))
-
-            if comments is None or (views is None and comments <= COMMENT_ONLY_THRESHOLD):
-                print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
-                continue
-
-            print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
-
-            if not meets_threshold(views or 0, comments):
-                continue
-
-            # Bài đã báo nhưng chưa đủ TXT: xếp hàng retry, không báo chen vào bài khác.
-            if key in already_notified:
-                if message and post_id not in _story_pending:
-                    retry_msg = (f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                                 f"Views: {views}\nComments: {comments}\n"
-                                 + (f"Link: {link}\n" if link else "")
-                                 + "=> Gắn link ngay!\n🔄 Đang tạo lại file TXT hoàn chỉnh cho bài này...")
-                    enqueue_story(page_name, post_id, message, page_id, page_token, retry_msg, key)
-                continue
-
-            if post_already_has_link(post_id, page_id, page_token, message):
-                print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
-                already_notified.add(key)
-                changed = True
-                continue
-
-            if key in load_notified():  # đọc lại file mới nhất, giảm rủi ro trùng nếu có tiến trình khác vừa ghi
-                print(f"[{ts}] [{page_name}] {post_id}: vừa được báo bởi tiến trình khác, bỏ qua.")
-                already_notified.add(key)
-                continue
-
-            msg = (
-                f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                f"Views: {views}\n"
-                f"Comments: {comments}\n"
-                + (f"Link: {link}\n" if link else "")
-                + "=> Gắn link ngay!\n"
-                + "⏳ Đang tạo file TXT Part 2, 3 & 4 cho chính bài này..."
-            )
-            # Worker gửi thông báo ngay trước khi tạo/gửi 3 TXT; scanner không gửi chen.
-            enqueue_story(page_name, post_id, message, page_id, page_token, msg, key)
-
-    if changed:
-        save_notified(already_notified)
-    save_view_history(view_history)
+    now_utc = datetime.now(timezone.utc)
+    with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as executor:
+        jobs = [executor.submit(_scan_page, page, started, now_utc) for page in _cached_pages]
+        for job in as_completed(jobs):
+            try:
+                job.result()
+            except Exception as e:
+                print(f"[SCAN] Page scan error: {e}")
+    save_tracked_posts()
+    print(f"[SCAN] completed_at={datetime.now(timezone.utc).isoformat()} elapsed={time.monotonic()-started:.1f}s "
+          f"pages={len(_cached_pages)} queued={STORY_QUEUE.qsize()}")
 
 
 def main():
