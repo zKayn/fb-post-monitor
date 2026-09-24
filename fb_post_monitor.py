@@ -87,7 +87,7 @@ THRESHOLD_RULES = [
     {"min_views": 5000, "min_comments": 0},
     {"min_views": 3000, "min_comments": 40},
 ]
-COMMENT_ONLY_THRESHOLD = 55  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 50  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
 ONLY_POSTS_NEWER_THAN_HOURS = 120
@@ -1072,22 +1072,29 @@ STORY_QUEUE = queue.Queue()
 _story_pending = set()
 _story_lock = threading.Lock()
 
-def enqueue_story(page_name, post_id, message, page_id, page_token, alert_text, notified_key):
+def enqueue_story(page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at):
     with _story_lock:
         if post_id in _story_pending or post_id in story_completed:
             return False
         _story_pending.add(post_id)
-    STORY_QUEUE.put((page_name, post_id, message, page_id, page_token, alert_text, notified_key))
+    STORY_QUEUE.put((page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at))
     return True
 
 def story_worker():
     while True:
-        page_name, post_id, message, page_id, page_token, alert_text, notified_key = STORY_QUEUE.get()
+        page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at = STORY_QUEUE.get()
         try:
             if post_id in story_completed:
                 continue
+            # Bài có thể đã quá 120 giờ trong lúc chờ hàng đợi OpenAI.
+            if not is_post_within_window(created_at):
+                print(f"[SKIP OLD QUEUED] {post_id}: bài đã quá {ONLY_POSTS_NEWER_THAN_HOURS} giờ")
+                continue
             # Đợi đến lượt gửi cả nhóm; scan vẫn chạy mỗi 5 phút.
             with TELEGRAM_GROUP_LOCK:
+                if not is_post_within_window(created_at):
+                    print(f"[SKIP OLD BEFORE SEND] {post_id}")
+                    continue
                 if post_already_has_link(post_id, page_id, page_token, message):
                     print(f"[WORKER] {post_id}: đã có link, không báo và không tạo TXT.")
                     continue
@@ -1109,6 +1116,19 @@ def story_worker():
                 _story_pending.discard(post_id)
             STORY_QUEUE.task_done()
 
+def is_post_within_window(created_at, now_utc=None):
+    """Fail closed: thiếu/sai ngày đăng hoặc bài quá 120 giờ đều không được báo."""
+    try:
+        published = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if published.tzinfo is None:
+            return False
+        now_utc = now_utc or datetime.now(timezone.utc)
+        age = (now_utc - published.astimezone(timezone.utc)).total_seconds()
+        return 0 <= age <= ONLY_POSTS_NEWER_THAN_HOURS * 3600
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
 def _scan_page(page, now_mono, now_utc):
     page_id, page_name, page_token = page["id"], page["name"], page["access_token"]
     tracked = tracked_posts.setdefault(str(page_id), {})
@@ -1116,7 +1136,7 @@ def _scan_page(page, now_mono, now_utc):
     for pid, item in list(tracked.items()):
         try:
             created = datetime.fromisoformat(item["created"])
-            if created < cutoff or pid in story_completed:
+            if not is_post_within_window(item["created"], now_utc) or pid in story_completed:
                 del tracked[pid]
         except (ValueError, KeyError, TypeError):
             del tracked[pid]
@@ -1129,7 +1149,7 @@ def _scan_page(page, now_mono, now_utc):
     else:
         discovered = get_recent_post_ids_fast(page_id, page_token)
     for pid, created in discovered:
-        if pid not in story_completed:
+        if pid not in story_completed and is_post_within_window(created, now_utc):
             tracked.setdefault(pid, {"created": created, "last_check": 0, "near": False})
 
     candidates = []
@@ -1137,6 +1157,8 @@ def _scan_page(page, now_mono, now_utc):
         try:
             age = (now_utc - datetime.fromisoformat(item["created"])).total_seconds()
         except (ValueError, KeyError, TypeError):
+            continue
+        if not is_post_within_window(item["created"], now_utc):
             continue
         interval = CHECK_INTERVAL_SECONDS if age <= FAST_POST_AGE_HOURS * 3600 or item.get("near") else SLOW_POST_CHECK_INTERVAL_SECONDS
         if now_mono - item.get("last_check", 0) >= interval:
@@ -1154,6 +1176,9 @@ def _scan_page(page, now_mono, now_utc):
         if comments is None or (views is None and comments <= COMMENT_ONLY_THRESHOLD):
             continue
         item = tracked[pid]
+        if not is_post_within_window(item["created"]):
+            print(f"[SKIP OLD BEFORE ALERT] {pid}")
+            continue
         item["last_check"] = now_mono
         item["near"] = near_threshold(views or 0, comments)
         if not meets_threshold(views or 0, comments):
@@ -1172,7 +1197,7 @@ def _scan_page(page, now_mono, now_utc):
                  + "=> Gắn link ngay!\n⏳ Đang tạo file TXT Part 2, 3 & 4 cho bài này...")
         print(f"[DETECTED] post={pid} page={page_name} api_threshold_at={datetime.now(timezone.utc).isoformat()} "
               f"published_at={item['created']} views={views} comments={comments} queue={STORY_QUEUE.qsize()}")
-        enqueue_story(page_name, pid, message, page_id, page_token, alert, key)
+        enqueue_story(page_name, pid, message, page_id, page_token, alert, key, item["created"])
 
 
 def get_recent_post_ids_fast(page_id, page_token):
@@ -1184,8 +1209,12 @@ def get_recent_post_ids_fast(page_id, page_token):
         data = r.json()
         if "error" in data:
             raise ValueError(data["error"].get("message", "Graph API error"))
-        return [(p["id"], datetime.strptime(p["created_time"], "%Y-%m-%dT%H:%M:%S%z").isoformat())
-                for p in data.get("data", []) if p.get("id") and p.get("created_time")]
+        result = []
+        for post in data.get("data", []):
+            pid, created = post.get("id"), post.get("created_time")
+            if pid and is_post_within_window(created):
+                result.append((pid, created))
+        return result
     except Exception as e:
         print(f"[FAST DISCOVERY] Page {page_id}: {e}")
         return []
