@@ -722,18 +722,36 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
                 pass
 
 
-ERROR_COOLDOWN_MINUTES = 30
-_last_error_sent_at = {}
+# Persist one-time notifications across Railway restarts (mount /data as a volume).
+ONE_TIME_EVENTS_FILE = "/data/one_time_events.json"
+def _load_one_time_events():
+    try:
+        with open(ONE_TIME_EVENTS_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, ValueError, TypeError):
+        return set()
 
+_one_time_events = _load_one_time_events()
+_one_time_lock = threading.RLock()
+
+def notify_once(event_key, text):
+    """One Telegram message per event key, including after process restart."""
+    with _one_time_lock:
+        if event_key in _one_time_events:
+            return False
+        # Reserve before sending, so concurrent workers cannot send duplicates.
+        _one_time_events.add(event_key)
+        try:
+            os.makedirs(os.path.dirname(ONE_TIME_EVENTS_FILE), exist_ok=True)
+            with open(ONE_TIME_EVENTS_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(_one_time_events), f, ensure_ascii=False)
+        except OSError as e:
+            print(f"[WARN] Cannot persist one-time event {event_key}: {e}")
+        send_telegram_message(text)
+        return True
 
 def send_error_alert(error_key: str, text: str):
-    now = datetime.now()
-    last_sent = _last_error_sent_at.get(error_key)
-    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
-        return
-    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
-    _last_error_sent_at[error_key] = now
-
+    return notify_once(f"error:{error_key}", f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
 def check_token_expiry():
@@ -793,7 +811,7 @@ def note_fb_network_success(error_key: str):
     _fb_network_failures[error_key] = 0
     _fb_network_alerted.discard(error_key)
     if was_alerted:
-        send_telegram_message("✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
+        notify_once(f"recovered:{error_key}", "✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
     elif had_failures:
         print(f"[FACEBOOK NETWORK] {error_key}: kết nối đã phục hồi sau {had_failures} lần lỗi.")
 
@@ -1014,59 +1032,60 @@ def contains_article_link(text: str) -> bool:
     return any(domain in value for domain in ARTICLE_LINK_DOMAINS)
 
 
-def post_already_has_link(post_id: str, page_id: str, page_token: str, post_message: str) -> bool:
-    """
-    Kiểm tra link chắc hơn:
-    1) Caption có URL -> coi là đã gắn link (giữ hành vi cũ).
-    2) Quét comment có phân trang, tối đa COMMENT_LINK_MAX_PAGES.
-    3) Nếu comment chứa domain bài đọc cấu hình -> coi là đã gắn link, không phụ thuộc from.id.
-    4) Nếu Graph API trả đúng from.id của Page và comment có bất kỳ URL -> cũng coi là đã gắn link.
+def post_already_has_link(post_id: str, page_id: str, page_token: str, post_message: str):
+    """Return True=link found, False=verified no link, None=unable to verify.
+
+    Fail closed: Graph API permission/network errors must NEVER be treated as no link.
     """
     if URL_PATTERN.search(post_message or ""):
         return True
-
     url = f"{GRAPH_URL}/{post_id}/comments"
-    params = {
-        "filter": "stream",
-        "limit": 100,
-        "fields": "message,from",
-        "access_token": page_token,
-    }
-
+    params = {"filter": "stream", "limit": 100, "fields": "message,from", "access_token": page_token}
     pages_checked = 0
     while url and pages_checked < COMMENT_LINK_MAX_PAGES:
         try:
             r = api_get(url, params=params)
             data = r.json()
+            if r.status_code != 200 or "error" in data:
+                error = data.get("error", {}).get("message", f"HTTP {r.status_code}")
+                raise ValueError(error)
         except Exception as e:
-            print(f"[CẢNH BÁO] {post_id}: không kiểm tra được comment link: {e}")
-            return False
-
-        if "error" in data:
-            err = data.get("error", {}).get("message", "Không rõ")
-            print(f"[CẢNH BÁO] {post_id}: Graph API lỗi khi kiểm tra comment link: {err}")
-            return False
-
-        for c in data.get("data", []):
-            msg = c.get("message", "") or ""
-            from_id = str((c.get("from") or {}).get("id") or "")
-
-            # Domain bài đọc: không phụ thuộc from.id vì Graph đôi khi không trả author ổn định.
-            if contains_article_link(msg):
-                print(f"[LINK] {post_id}: phát hiện article link trong comment -> SKIP.")
+            print(f"[LINK CHECK BLOCKED] {post_id}: {e}; skip story until permission/API recovers")
+            send_error_alert(f"comment_link_check:{page_id}",
+                             f"Page {page_id}: không xác minh được link trong bình luận ({e}). Tạm bỏ qua tạo truyện để tránh tạo lại bài đã gắn link.")
+            return None
+        for comment in data.get("data", []):
+            msg = comment.get("message", "") or ""
+            from_id = str((comment.get("from") or {}).get("id") or "")
+            if contains_article_link(msg) or (from_id == str(page_id) and URL_PATTERN.search(msg)):
+                print(f"[LINK] {post_id}: article/Page URL detected; skip")
                 return True
-
-            # Fallback: nếu xác định chắc comment là của Page thì bất kỳ URL nào cũng được tính.
-            if from_id == str(page_id) and URL_PATTERN.search(msg):
-                print(f"[LINK] {post_id}: phát hiện URL trong comment của Page -> SKIP.")
-                return True
-
         url = data.get("paging", {}).get("next")
         params = None
         pages_checked += 1
-
+    # If comments were truncated, absence of link has not been established.
+    if url:
+        print(f"[LINK CHECK INCOMPLETE] {post_id}: reached {COMMENT_LINK_MAX_PAGES} pages; skip")
+        return None
     return False
 
+
+LINKED_POSTS_FILE = "/data/linked_posts.json"
+def _load_linked_posts():
+    try:
+        with open(LINKED_POSTS_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, ValueError, TypeError):
+        return set()
+linked_posts = _load_linked_posts()
+def mark_linked_post(post_id):
+    linked_posts.add(str(post_id))
+    try:
+        os.makedirs(os.path.dirname(LINKED_POSTS_FILE), exist_ok=True)
+        with open(LINKED_POSTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(linked_posts), f)
+    except OSError as e:
+        print(f"[WARN] Cannot persist linked post: {e}")
 
 STORY_QUEUE = queue.Queue()
 _story_pending = set()
@@ -1074,7 +1093,7 @@ _story_lock = threading.Lock()
 
 def enqueue_story(page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at):
     with _story_lock:
-        if post_id in _story_pending or post_id in story_completed:
+        if post_id in _story_pending or post_id in story_completed or str(post_id) in linked_posts:
             return False
         _story_pending.add(post_id)
     STORY_QUEUE.put((page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at))
@@ -1084,7 +1103,7 @@ def story_worker():
     while True:
         page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at = STORY_QUEUE.get()
         try:
-            if post_id in story_completed:
+            if post_id in story_completed or str(post_id) in linked_posts:
                 continue
             # Bài có thể đã quá 120 giờ trong lúc chờ hàng đợi OpenAI.
             if not is_post_within_window(created_at):
@@ -1095,8 +1114,11 @@ def story_worker():
                 if not is_post_within_window(created_at):
                     print(f"[SKIP OLD BEFORE SEND] {post_id}")
                     continue
-                if post_already_has_link(post_id, page_id, page_token, message):
-                    print(f"[WORKER] {post_id}: đã có link, không báo và không tạo TXT.")
+                link_status = post_already_has_link(post_id, page_id, page_token, message)
+                if link_status is True:
+                    mark_linked_post(post_id)
+                if link_status is not False:
+                    print(f"[WORKER] {post_id}: link exists or verification unavailable; skip TXT.")
                     continue
                 if notified_key not in already_notified:
                     send_telegram_message(alert_text)
@@ -1104,7 +1126,7 @@ def story_worker():
                     already_notified.add(notified_key)
                     save_notified(already_notified)
                 else:
-                    send_telegram_message(alert_text.replace("⏳ Đang tạo", "🔄 Đang tạo lại"))
+                    print(f"[WORKER] {post_id}: already alerted; retry story without duplicate alert")
                 # Khóa được giữ xuyên suốt 3 TXT: không tin Telegram nào từ
                 # cùng tiến trình này có thể chen vào giữa nhóm bài.
                 generate_and_send_story_continuation(page_name, post_id, message)
@@ -1184,14 +1206,17 @@ def _scan_page(page, now_mono, now_utc):
         if not meets_threshold(views or 0, comments):
             continue
         key = f"{page_id}_{pid}"
-        if pid in story_completed:
+        if pid in story_completed or str(pid) in linked_posts:
             continue
         if pid in _story_pending:
             continue
-        if post_already_has_link(pid, page_id, page_token, message):
-            already_notified.add(key)
-            save_notified(already_notified)
-            continue
+        link_status = post_already_has_link(pid, page_id, page_token, message)
+        if link_status is not False:
+            if link_status is True:
+                mark_linked_post(pid)
+                already_notified.add(key)
+                save_notified(already_notified)
+            continue  # None: retry verification later, do not generate or notify
         alert = (f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\nViews: {views}\nComments: {comments}\n"
                  + (f"Link: {link}\n" if link else "")
                  + "=> Gắn link ngay!\n⏳ Đang tạo file TXT Part 2, 3 & 4 cho bài này...")
