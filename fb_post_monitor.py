@@ -1,8 +1,9 @@
 """
-FB POST MONITOR (FAST SCAN + BATCH API + AUTO PART 2/3/4)
+FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN + AUTO PART 2/3)
 =================================================================
 Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi thông báo
-Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện). Bỏ qua bài đã có link. Tự báo lỗi qua
+Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
+tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
 Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
 Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API viết tiếp
 Part 2 + Part 3 + Part 4 dựa trên caption gốc, xuất ra file TXT UTF-8, gửi kèm
@@ -25,10 +26,10 @@ import time
 import requests
 import threading
 import queue
+import hashlib
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========================== CONFIG ==========================
 USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "")
@@ -49,7 +50,7 @@ ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-luna"
 OPENAI_MAX_OUTPUT_TOKENS = 8000  # dư địa cho MỖI part; tránh reasoning/length làm content rỗng
 OPENAI_TIMEOUT_SECONDS = 600
-OPENAI_PART_RETRIES = 3  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
+OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
 STORY_WRITING_RULES = """You are a professional storyteller and novelist, skilled at creating emotionally rich, character-driven fiction that appeals to a broad mainstream audience.
 
@@ -98,7 +99,12 @@ SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
 SPIKE_MIN_VIEWS_TO_CHECK = 2000
 VIEW_HISTORY_FILE = "/data/view_history.json"
-STORY_COMPLETED_FILE = "/data/story_completed_posts.json"  # chỉ đánh dấu sau khi TXT đủ Part 2+3+4 đã gửi thành công
+STORY_COMPLETED_FILE = "/data/story_completed_posts.json"
+STORY_CLAIMED_FILE = "/data/story_claimed_posts.json"
+STORY_PROGRESS_DIR = "/data/story_progress"
+STORY_RETRY_SECONDS = 900  # 15 phút giữa các lượt thử; không gọi lại liên tục
+ERROR_ONCE_FILE = "/data/error_once_keys.json"
+ENABLE_PAID_GENERATION = True  # chỉ đánh dấu sau khi TXT đủ Part 2+3+4 đã gửi thành công
 
 # --- Retry khi gặp lỗi mạng tạm thời ---
 MAX_RETRIES = 5
@@ -115,14 +121,7 @@ METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 # --- Cảnh báo token sắp hết hạn ---
 TOKEN_EXPIRY_WARNING_DAYS = 5
 
-CHECK_INTERVAL_SECONDS = 60
-PAGE_DISCOVERY_INTERVAL_SECONDS = 900
-FULL_POST_DISCOVERY_INTERVAL_SECONDS = 300
-FAST_POST_AGE_HOURS = 12
-FAST_NEAR_THRESHOLD_RATIO = 0.65
-SLOW_POST_CHECK_INTERVAL_SECONDS = 300
-PAGE_WORKERS = 3
-TRACKED_POSTS_FILE = "/data/tracked_posts.json"
+CHECK_INTERVAL_SECONDS = 300
 POSTS_PAGE_LIMIT = 100
 POSTS_MAX_PAGES = 20
 
@@ -232,6 +231,26 @@ def save_story_completed(items):
         print(f"[LỖI] Không lưu được {STORY_COMPLETED_FILE}: {e}")
 
 story_completed = load_story_completed()
+
+def _load_keys(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+def _save_keys(path, keys):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(sorted(keys), f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+
+story_claimed = _load_keys(STORY_CLAIMED_FILE)
+error_once_keys = _load_keys(ERROR_ONCE_FILE)
+
 # already_spike_notified không dùng set riêng nữa -> lưu chung vào already_notified
 # với tiền tố "spike_" để không bị mất khi restart (trước đây chỉ lưu trong bộ nhớ).
 
@@ -655,103 +674,132 @@ def create_part_txt(part_text: str, part_number: int, out_path: str):
     return True
 
 
-def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
-    """Tạo Part 2/3/4 một lần bằng OpenAI, sau đó xuất và gửi 3 file TXT riêng."""
-    global story_completed
-    if not ENABLE_STORY_CONTINUATION:
-        return False
-    if not caption or not caption.strip():
-        print(f"[CẢNH BÁO] Bài {post_id} không có caption, bỏ qua viết Part 2/3/4.")
-        return False
+def _progress_path(post_id):
+    safe = re.sub(r"[^a-zA-Z0-9_]", "_", str(post_id))
+    return os.path.join(STORY_PROGRESS_DIR, safe + ".json")
 
-    story_key = str(post_id)
-    if story_key in story_completed:
-        return True
 
-    print(f"[OPENAI] Bắt đầu ALL-OR-NOTHING Part 2/3/4 cho bài {post_id}...")
-    story_text = call_openai_story(caption)
-    ok, reason = validate_complete_story(story_text)
-    if not ok:
-        print(f"[OPENAI] KHÔNG tạo TXT cho {post_id}: {reason}")
-        send_error_alert(
-            f"story_incomplete_{post_id}",
-            f"Bài {post_id}: chưa đủ Part 2/3/4 ({reason}). Không xuất TXT; hệ thống sẽ thử lại ở lượt quét sau.",
-        )
-        return False
+def _save_progress(post_id, progress):
+    os.makedirs(STORY_PROGRESS_DIR, exist_ok=True)
+    path = _progress_path(post_id)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(progress, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
-    safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", post_id)
-    txt_paths = {
-        2: f"/tmp/story_{safe_id}_PART_2.txt",
-        3: f"/tmp/story_{safe_id}_PART_3.txt",
-        4: f"/tmp/story_{safe_id}_PART_4.txt",
-    }
 
+def _load_progress(post_id):
     try:
-        # Chỉ tách kết quả đã tạo; KHÔNG phát sinh request OpenAI mới.
-        parts = split_story_into_parts(story_text)
-        for n in (2, 3, 4):
-            create_part_txt(parts[n], n, txt_paths[n])
+        with open(_progress_path(post_id), "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
 
-        # Gửi tuần tự để Telegram hiển thị Part 2 -> Part 3 -> Part 4 ngay sau thông báo bài đang lên.
-        for n in (2, 3, 4):
-            sent = send_telegram_document(
-                txt_paths[n],
-                caption=f"📄 PART {n} — Page: {page_name}",
-            )
-            if not sent:
-                raise RuntimeError(f"Gửi TXT Part {n} thất bại")
 
-        # Chỉ đánh dấu hoàn thành sau khi cả 3 file đều gửi thành công.
-        story_completed.add(story_key)
-        save_story_completed(story_completed)
-        print(f"[OPENAI] Đã gửi 3 TXT riêng Part 2, Part 3, Part 4 cho bài {post_id}.")
+def _retry_due(post_id):
+    state = _load_progress(post_id)
+    return time.time() >= float(state.get("retry_after", 0))
+
+
+def _resume_story(page_name, post_id, caption):
+    """Persist each successful part; only generate missing parts. Never re-buy saved parts."""
+    state = _load_progress(post_id)
+    if state.get("caption") and state["caption"] != caption:
+        # A changed caption cannot safely be combined with already-generated parts.
+        send_error_alert("caption_changed_" + str(post_id), f"Bài {post_id}: caption đã thay đổi; giữ bản đã lưu, không tạo lại để tránh phí trùng.")
+        return False
+    if not state:
+        state = {"caption": caption, "parts": {}, "sent": [], "retry_after": 0}
+        _save_progress(post_id, state)  # fail closed before any paid request
+    parts = state.setdefault("parts", {})
+    for n in (2, 3, 4):
+        key = str(n)
+        if key in parts:
+            valid, reason = _validate_part(parts[key], n)
+            if not valid:
+                raise ValueError(f"Part {n} đã lưu không hợp lệ ({reason}); không tự mua lại")
+            continue
+        context = caption + "".join("\n\n" + parts[str(k)] for k in range(2, n))
+        print(f"[OPENAI] Bài {post_id}: tiếp tục Part {n}, giữ các Part đã lưu.")
+        result = generate_valid_part(context, n)
+        if not result:
+            return False
+        parts[key] = result
+        _save_progress(post_id, state)  # atomic checkpoint immediately after success
+
+    story = "\n\n".join((
+        ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n**" + PART_ENDINGS[n] + "**"
+        for n in (2, 3, 4)
+    ))
+    outputs = split_story_into_parts(story)
+    sent = state.setdefault("sent", [])
+    for n in (2, 3, 4):
+        if n in sent:
+            continue
+        path = f"/tmp/story_{re.sub(r'[^a-zA-Z0-9_]', '_', str(post_id))}_PART_{n}.txt"
+        try:
+            create_part_txt(outputs[n], n, path)
+            if not send_telegram_document(path, caption=f"📄 PART {n} — Page: {page_name}"):
+                return False
+            sent.append(n)
+            _save_progress(post_id, state)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+    story_completed.add(str(post_id))
+    save_story_completed(story_completed)
+    print(f"[OPENAI] Bài {post_id}: đã gửi đủ Part 2/3/4, không tạo lại.")
+    return True
+
+
+def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
+    if not ENABLE_STORY_CONTINUATION or not ENABLE_PAID_GENERATION or not caption.strip():
+        return False
+    if str(post_id) in story_completed:
         return True
-    except Exception as e:
-        print(f"[LỖI] Không tạo/gửi đủ 3 file TXT: {e}")
-        send_error_alert(
-            f"story_txt_error_{post_id}",
-            f"Bài {post_id}: không tạo/gửi đủ 3 TXT: {e}. Hệ thống sẽ thử lại.",
-        )
+    if not _retry_due(post_id):
+        return False
+    try:
+        # Old claimed keys are no longer permanent locks; checkpoint is authoritative.
+        return _resume_story(page_name, post_id, caption)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        print(f"[STORY] {post_id}: {exc}")
+        send_error_alert("story_resume_" + str(post_id), f"Bài {post_id}: tạm hoãn tiếp tục truyện: {exc}")
         return False
     finally:
-        for path in txt_paths.values():
+        state = _load_progress(post_id)
+        if state and str(post_id) not in story_completed:
+            state["retry_after"] = time.time() + STORY_RETRY_SECONDS
             try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except Exception:
-                pass
+                _save_progress(post_id, state)
+            except OSError as exc:
+                print(f"[STORY] Không lưu được lịch thử lại {post_id}: {exc}")
 
 
-# Persist one-time notifications across Railway restarts (mount /data as a volume).
-ONE_TIME_EVENTS_FILE = "/data/one_time_events.json"
-def _load_one_time_events():
-    try:
-        with open(ONE_TIME_EVENTS_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
-    except (OSError, ValueError, TypeError):
-        return set()
+ERROR_COOLDOWN_MINUTES = 30
+_last_error_sent_at = {}
 
-_one_time_events = _load_one_time_events()
-_one_time_lock = threading.RLock()
-
-def notify_once(event_key, text):
-    """One Telegram message per event key, including after process restart."""
-    with _one_time_lock:
-        if event_key in _one_time_events:
-            return False
-        # Reserve before sending, so concurrent workers cannot send duplicates.
-        _one_time_events.add(event_key)
-        try:
-            os.makedirs(os.path.dirname(ONE_TIME_EVENTS_FILE), exist_ok=True)
-            with open(ONE_TIME_EVENTS_FILE, "w", encoding="utf-8") as f:
-                json.dump(sorted(_one_time_events), f, ensure_ascii=False)
-        except OSError as e:
-            print(f"[WARN] Cannot persist one-time event {event_key}: {e}")
-        send_telegram_message(text)
-        return True
 
 def send_error_alert(error_key: str, text: str):
-    return notify_once(f"error:{error_key}", f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}")
+    now = datetime.now()
+    # Chỉ gửi một lần cho mỗi loại lỗi, kể cả sau khi restart.
+    error_key = re.sub(r"\b\d{10,}_\d{10,}\b", "POST_ID", error_key)
+    if error_key in error_once_keys:
+        return
+    last_sent = _last_error_sent_at.get(error_key)
+    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
+        return
+    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
+    _last_error_sent_at[error_key] = now
+    error_once_keys.add(error_key)
+    try:
+        _save_keys(ERROR_ONCE_FILE, error_once_keys)
+    except OSError as exc:
+        print(f"[CẢNH BÁO] Không lưu được error-once: {exc}")
+
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
 def check_token_expiry():
@@ -811,7 +859,14 @@ def note_fb_network_success(error_key: str):
     _fb_network_failures[error_key] = 0
     _fb_network_alerted.discard(error_key)
     if was_alerted:
-        notify_once(f"recovered:{error_key}", "✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
+        recovery_key = f"recovered_{error_key}"
+        if recovery_key not in error_once_keys:
+            send_telegram_message("✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
+            error_once_keys.add(recovery_key)
+            try:
+                _save_keys(ERROR_ONCE_FILE, error_once_keys)
+            except OSError as exc:
+                print(f"[CẢNH BÁO] Không lưu được recovery-once: {exc}")
     elif had_failures:
         print(f"[FACEBOOK NETWORK] {error_key}: kết nối đã phục hồi sau {had_failures} lần lỗi.")
 
@@ -873,7 +928,7 @@ def get_recent_post_ids(page_id: str, page_token: str):
                 continue
             oldest = min(oldest, dt) if oldest else dt
             if dt >= cutoff:
-                found.append((pid, dt.isoformat()))
+                found.append(pid)
                 seen.add(pid)
         url = data.get("paging", {}).get("next")
         params = None
@@ -883,46 +938,6 @@ def get_recent_post_ids(page_id: str, page_token: str):
         print(f"[CẢNH BÁO] Page {page_id}: đã quét {POSTS_MAX_PAGES} trang, có thể còn bài cũ hơn.")
     print(f"[FACEBOOK] Page {page_id}: tìm thấy {len(found)} bài trong {ONLY_POSTS_NEWER_THAN_HOURS} giờ.")
     return found
-
-
-# Persist discovered posts so a fast scan does not have to paginate 120 hours each minute.
-def load_tracked_posts():
-    try:
-        with open(TRACKED_POSTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
-
-
-def save_tracked_posts():
-    try:
-        os.makedirs(os.path.dirname(TRACKED_POSTS_FILE), exist_ok=True)
-        tmp = TRACKED_POSTS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(tracked_posts, f, ensure_ascii=False)
-        os.replace(tmp, TRACKED_POSTS_FILE)
-    except OSError as e:
-        print(f"[CACHE] Không lưu được bài theo dõi: {e}")
-
-
-tracked_posts = load_tracked_posts()
-for _page_posts in tracked_posts.values():
-    if isinstance(_page_posts, dict):
-        for _entry in _page_posts.values():
-            if isinstance(_entry, dict):
-                _entry["last_check"] = 0
-_last_discovery = {}
-_last_page_discovery = 0.0
-_cached_pages = []
-
-
-def near_threshold(views, comments):
-    if comments >= COMMENT_ONLY_THRESHOLD * FAST_NEAR_THRESHOLD_RATIO:
-        return True
-    return any(views >= rule["min_views"] * FAST_NEAR_THRESHOLD_RATIO and
-               comments >= rule["min_comments"] * FAST_NEAR_THRESHOLD_RATIO
-               for rule in THRESHOLD_RULES)
 
 
 def chunked(lst, n):
@@ -1032,101 +1047,110 @@ def contains_article_link(text: str) -> bool:
     return any(domain in value for domain in ARTICLE_LINK_DOMAINS)
 
 
-def post_already_has_link(post_id: str, page_id: str, page_token: str, post_message: str):
-    """Return True=link found, False=verified no link, None=unable to verify.
-
-    Fail closed: Graph API permission/network errors must NEVER be treated as no link.
+def post_already_has_link(post_id: str, page_id: str, page_token: str, post_message: str) -> bool:
+    """
+    Kiểm tra link chắc hơn:
+    1) Caption có URL -> coi là đã gắn link (giữ hành vi cũ).
+    2) Quét comment có phân trang, tối đa COMMENT_LINK_MAX_PAGES.
+    3) Nếu comment chứa domain bài đọc cấu hình -> coi là đã gắn link, không phụ thuộc from.id.
+    4) Nếu Graph API trả đúng from.id của Page và comment có bất kỳ URL -> cũng coi là đã gắn link.
     """
     if URL_PATTERN.search(post_message or ""):
         return True
+
     url = f"{GRAPH_URL}/{post_id}/comments"
-    params = {"filter": "stream", "limit": 100, "fields": "message,from", "access_token": page_token}
+    params = {
+        "filter": "stream",
+        "limit": 100,
+        "fields": "message,from",
+        "access_token": page_token,
+    }
+
     pages_checked = 0
     while url and pages_checked < COMMENT_LINK_MAX_PAGES:
         try:
             r = api_get(url, params=params)
             data = r.json()
-            if r.status_code != 200 or "error" in data:
-                error = data.get("error", {}).get("message", f"HTTP {r.status_code}")
-                raise ValueError(error)
         except Exception as e:
-            print(f"[LINK CHECK BLOCKED] {post_id}: {e}; skip story until permission/API recovers")
-            send_error_alert(f"comment_link_check:{page_id}",
-                             f"Page {page_id}: không xác minh được link trong bình luận ({e}). Tạm bỏ qua tạo truyện để tránh tạo lại bài đã gắn link.")
+            print(f"[CẢNH BÁO] {post_id}: không kiểm tra được comment link: {e}")
+            return None  # Không xác minh được link: tuyệt đối không coi là chưa có link.
+
+        if "error" in data:
+            err = data.get("error", {}).get("message", "Không rõ")
+            print(f"[CẢNH BÁO] {post_id}: Graph API lỗi khi kiểm tra comment link: {err}")
+            return None  # Facebook lỗi quyền/API: chặn OpenAI.
+
+        if not isinstance(data.get("data"), list):
             return None
-        for comment in data.get("data", []):
-            msg = comment.get("message", "") or ""
-            from_id = str((comment.get("from") or {}).get("id") or "")
-            if contains_article_link(msg) or (from_id == str(page_id) and URL_PATTERN.search(msg)):
-                print(f"[LINK] {post_id}: article/Page URL detected; skip")
+        for c in data.get("data", []):
+            msg = c.get("message", "") or ""
+            from_id = str((c.get("from") or {}).get("id") or "")
+
+            # Domain bài đọc: không phụ thuộc from.id vì Graph đôi khi không trả author ổn định.
+            if contains_article_link(msg):
+                print(f"[LINK] {post_id}: phát hiện article link trong comment -> SKIP.")
                 return True
+
+            # Fallback: nếu xác định chắc comment là của Page thì bất kỳ URL nào cũng được tính.
+            if from_id == str(page_id) and URL_PATTERN.search(msg):
+                print(f"[LINK] {post_id}: phát hiện URL trong comment của Page -> SKIP.")
+                return True
+
         url = data.get("paging", {}).get("next")
         params = None
         pages_checked += 1
-    # If comments were truncated, absence of link has not been established.
+
+    # Nếu đã chạm giới hạn phân trang mà còn bình luận chưa đọc, kết quả chưa chắc chắn.
     if url:
-        print(f"[LINK CHECK INCOMPLETE] {post_id}: reached {COMMENT_LINK_MAX_PAGES} pages; skip")
+        print(f"[LINK] {post_id}: chưa đọc hết comments; bỏ qua để tránh tạo trùng.")
         return None
     return False
 
-
-LINKED_POSTS_FILE = "/data/linked_posts.json"
-def _load_linked_posts():
-    try:
-        with open(LINKED_POSTS_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
-    except (OSError, ValueError, TypeError):
-        return set()
-linked_posts = _load_linked_posts()
-def mark_linked_post(post_id):
-    linked_posts.add(str(post_id))
-    try:
-        os.makedirs(os.path.dirname(LINKED_POSTS_FILE), exist_ok=True)
-        with open(LINKED_POSTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(linked_posts), f)
-    except OSError as e:
-        print(f"[WARN] Cannot persist linked post: {e}")
 
 STORY_QUEUE = queue.Queue()
 _story_pending = set()
 _story_lock = threading.Lock()
 
-def enqueue_story(page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at):
+def enqueue_story(page_name, post_id, message, page_id, page_token, alert_text, notified_key):
     with _story_lock:
-        if post_id in _story_pending or post_id in story_completed or str(post_id) in linked_posts:
+        if (post_id in _story_pending or post_id in story_completed
+                or not _retry_due(post_id) or STORY_QUEUE.qsize() >= 3):
             return False
         _story_pending.add(post_id)
-    STORY_QUEUE.put((page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at))
+    STORY_QUEUE.put((page_name, post_id, message, page_id, page_token, alert_text, notified_key))
     return True
 
 def story_worker():
     while True:
-        page_name, post_id, message, page_id, page_token, alert_text, notified_key, created_at = STORY_QUEUE.get()
+        page_name, post_id, message, page_id, page_token, alert_text, notified_key = STORY_QUEUE.get()
         try:
-            if post_id in story_completed or str(post_id) in linked_posts:
+            if post_id in story_completed or not _retry_due(post_id):
                 continue
-            # Bài có thể đã quá 120 giờ trong lúc chờ hàng đợi OpenAI.
-            if not is_post_within_window(created_at):
-                print(f"[SKIP OLD QUEUED] {post_id}: bài đã quá {ONLY_POSTS_NEWER_THAN_HOURS} giờ")
+            if not ENABLE_PAID_GENERATION:
+                print(f"[COST GUARD] {post_id}: chưa bật ENABLE_PAID_GENERATION; bỏ qua hàng đợi.")
                 continue
             # Đợi đến lượt gửi cả nhóm; scan vẫn chạy mỗi 5 phút.
             with TELEGRAM_GROUP_LOCK:
-                if not is_post_within_window(created_at):
-                    print(f"[SKIP OLD BEFORE SEND] {post_id}")
-                    continue
                 link_status = post_already_has_link(post_id, page_id, page_token, message)
-                if link_status is True:
-                    mark_linked_post(post_id)
                 if link_status is not False:
-                    print(f"[WORKER] {post_id}: link exists or verification unavailable; skip TXT.")
+                    print(f"[WORKER] {post_id}: đã có link hoặc không xác minh được; không gọi OpenAI.")
+                    continue
+                try:
+                    verify = api_get(f"{GRAPH_URL}/{post_id}", params={"fields": "created_time", "access_token": page_token}).json()
+                    published = datetime.strptime(verify["created_time"], "%Y-%m-%dT%H:%M:%S%z")
+                    age = datetime.now(timezone.utc) - published
+                    if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
+                        print(f"[COST GUARD] {post_id}: ngoài giới hạn 120 giờ; bỏ qua.")
+                        continue
+                except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
+                    print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
                     continue
                 if notified_key not in already_notified:
                     send_telegram_message(alert_text)
-                    print(f"[TELEGRAM] post={post_id} alert_at={datetime.now(timezone.utc).isoformat()}")
                     already_notified.add(notified_key)
                     save_notified(already_notified)
                 else:
-                    print(f"[WORKER] {post_id}: already alerted; retry story without duplicate alert")
+                    print(f"[WORKER] {post_id}: đã báo trước đó; không báo lặp.")
                 # Khóa được giữ xuyên suốt 3 TXT: không tin Telegram nào từ
                 # cùng tiến trình này có thể chen vào giữa nhóm bài.
                 generate_and_send_story_continuation(page_name, post_id, message)
@@ -1138,138 +1162,94 @@ def story_worker():
                 _story_pending.discard(post_id)
             STORY_QUEUE.task_done()
 
-def is_post_within_window(created_at, now_utc=None):
-    """Fail closed: thiếu/sai ngày đăng hoặc bài quá 120 giờ đều không được báo."""
-    try:
-        published = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
-        if published.tzinfo is None:
-            return False
-        now_utc = now_utc or datetime.now(timezone.utc)
-        age = (now_utc - published.astimezone(timezone.utc)).total_seconds()
-        return 0 <= age <= ONLY_POSTS_NEWER_THAN_HOURS * 3600
-    except (ValueError, TypeError, OverflowError):
-        return False
-
-
-def _scan_page(page, now_mono, now_utc):
-    page_id, page_name, page_token = page["id"], page["name"], page["access_token"]
-    tracked = tracked_posts.setdefault(str(page_id), {})
-    cutoff = now_utc - timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)
-    for pid, item in list(tracked.items()):
-        try:
-            created = datetime.fromisoformat(item["created"])
-            if not is_post_within_window(item["created"], now_utc) or pid in story_completed:
-                del tracked[pid]
-        except (ValueError, KeyError, TypeError):
-            del tracked[pid]
-
-    # Full discovery every 5 min, while fresh posts are discovered every minute.
-    full = now_mono - _last_discovery.get((page_id, "full"), -1e12) >= FULL_POST_DISCOVERY_INTERVAL_SECONDS
-    if full:
-        discovered = get_recent_post_ids(page_id, page_token)
-        _last_discovery[(page_id, "full")] = now_mono
-    else:
-        discovered = get_recent_post_ids_fast(page_id, page_token)
-    for pid, created in discovered:
-        if pid not in story_completed and is_post_within_window(created, now_utc):
-            tracked.setdefault(pid, {"created": created, "last_check": 0, "near": False})
-
-    candidates = []
-    for pid, item in tracked.items():
-        try:
-            age = (now_utc - datetime.fromisoformat(item["created"])).total_seconds()
-        except (ValueError, KeyError, TypeError):
-            continue
-        if not is_post_within_window(item["created"], now_utc):
-            continue
-        interval = CHECK_INTERVAL_SECONDS if age <= FAST_POST_AGE_HOURS * 3600 or item.get("near") else SLOW_POST_CHECK_INTERVAL_SECONDS
-        if now_mono - item.get("last_check", 0) >= interval:
-            candidates.append(pid)
-    # Prioritize recently published and near-threshold posts; limit fast scan work.
-    candidates.sort(key=lambda pid: (not tracked[pid].get("near", False), -datetime.fromisoformat(tracked[pid]["created"]).timestamp()))
-    if not candidates:
-        return
-    stats = get_stats_batch(candidates, page_token)
-    ts = datetime.now().strftime("%H:%M:%S")
-    for pid in candidates:
-        if pid not in stats:
-            continue  # retry failed batch next scan
-        views, comments, link, message = stats[pid]
-        if comments is None or (views is None and comments <= COMMENT_ONLY_THRESHOLD):
-            continue
-        item = tracked[pid]
-        if not is_post_within_window(item["created"]):
-            print(f"[SKIP OLD BEFORE ALERT] {pid}")
-            continue
-        item["last_check"] = now_mono
-        item["near"] = near_threshold(views or 0, comments)
-        if not meets_threshold(views or 0, comments):
-            continue
-        key = f"{page_id}_{pid}"
-        if pid in story_completed or str(pid) in linked_posts:
-            continue
-        if pid in _story_pending:
-            continue
-        link_status = post_already_has_link(pid, page_id, page_token, message)
-        if link_status is not False:
-            if link_status is True:
-                mark_linked_post(pid)
-                already_notified.add(key)
-                save_notified(already_notified)
-            continue  # None: retry verification later, do not generate or notify
-        alert = (f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\nViews: {views}\nComments: {comments}\n"
-                 + (f"Link: {link}\n" if link else "")
-                 + "=> Gắn link ngay!\n⏳ Đang tạo file TXT Part 2, 3 & 4 cho bài này...")
-        print(f"[DETECTED] post={pid} page={page_name} api_threshold_at={datetime.now(timezone.utc).isoformat()} "
-              f"published_at={item['created']} views={views} comments={comments} queue={STORY_QUEUE.qsize()}")
-        enqueue_story(page_name, pid, message, page_id, page_token, alert, key, item["created"])
-
-
-def get_recent_post_ids_fast(page_id, page_token):
-    """Fetch first page each minute; deep pagination runs every 5 minutes."""
-    try:
-        r = api_get(f"{GRAPH_URL}/{page_id}/posts",
-                    params={"fields": "id,created_time", "limit": POSTS_PAGE_LIMIT, "access_token": page_token})
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            raise ValueError(data["error"].get("message", "Graph API error"))
-        result = []
-        for post in data.get("data", []):
-            pid, created = post.get("id"), post.get("created_time")
-            if pid and is_post_within_window(created):
-                result.append((pid, created))
-        return result
-    except Exception as e:
-        print(f"[FAST DISCOVERY] Page {page_id}: {e}")
-        return []
-
-
 def check_all_pages():
-    global _last_page_discovery, _cached_pages
-    started = time.monotonic()
+    # Token expiry được kiểm tra theo ngày để vòng quét nhanh hơn.
     if not hasattr(check_all_pages, "_last_token_check") or time.time() - check_all_pages._last_token_check > 86400:
         check_token_expiry()
         check_all_pages._last_token_check = time.time()
-    if not _cached_pages or started - _last_page_discovery >= PAGE_DISCOVERY_INTERVAL_SECONDS:
-        pages = get_managed_pages()
-        if pages:
-            _cached_pages = pages
-            _last_page_discovery = started
-    if not _cached_pages:
-        print("[SCAN] Không có Page nào để quét")
+
+    pages = get_managed_pages()
+    ts = datetime.now().strftime("%H:%M:%S")
+
+    if not pages:
+        print(f"[{ts}] Không tìm thấy Page nào (kiểm tra lại USER_ACCESS_TOKEN).")
         return
-    now_utc = datetime.now(timezone.utc)
-    with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as executor:
-        jobs = [executor.submit(_scan_page, page, started, now_utc) for page in _cached_pages]
-        for job in as_completed(jobs):
-            try:
-                job.result()
-            except Exception as e:
-                print(f"[SCAN] Page scan error: {e}")
-    save_tracked_posts()
-    print(f"[SCAN] completed_at={datetime.now(timezone.utc).isoformat()} elapsed={time.monotonic()-started:.1f}s "
-          f"pages={len(_cached_pages)} queued={STORY_QUEUE.qsize()}")
+
+    print(f"[{ts}] Đang quét {len(pages)} Page: {', '.join(p['name'] for p in pages)}")
+
+    changed = False
+    now_dt = datetime.now()
+
+    for page in pages:
+        page_id = page["id"]
+        page_name = page["name"]
+        page_token = page["access_token"]
+
+        all_post_ids = get_recent_post_ids(page_id, page_token)
+
+        # Không quét lại bài đã gửi đủ 3 TXT; bài chưa xong vẫn được kiểm tra lại.
+        post_ids_to_check = [pid for pid in all_post_ids if str(pid) not in story_completed]
+
+        if not post_ids_to_check:
+            continue
+
+        stats = get_stats_batch(post_ids_to_check, page_token)
+
+        for post_id in post_ids_to_check:
+            key = f"{page_id}_{post_id}"
+            views, comments, link, message = stats.get(post_id, (None, None, None, ""))
+
+            if comments is None or (views is None and comments <= COMMENT_ONLY_THRESHOLD):
+                print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
+                continue
+
+            print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
+
+            if not meets_threshold(views or 0, comments):
+                continue
+
+            # Bài đã báo nhưng chưa đủ TXT: xếp hàng retry, không báo chen vào bài khác.
+            if key in already_notified:
+                if False:  # Không tự tạo lại: có thể request trước đã bị tính phí.
+                    retry_msg = (f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
+                                 f"Views: {views}\nComments: {comments}\n"
+                                 + (f"Link: {link}\n" if link else "")
+                                 + "=> Gắn link ngay!\n🔄 Đang tạo lại file TXT hoàn chỉnh cho bài này...")
+                    enqueue_story(page_name, post_id, message, page_id, page_token, retry_msg, key)
+                continue
+
+            link_status = post_already_has_link(post_id, page_id, page_token, message)
+            if link_status is None:
+                print(f"[{ts}] [{page_name}] {post_id}: chưa xác minh được link; bỏ qua.")
+                continue
+            if link_status:
+                print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
+                already_notified.add(key)
+                changed = True
+                continue
+
+            if key in load_notified():  # đọc lại file mới nhất, giảm rủi ro trùng nếu có tiến trình khác vừa ghi
+                print(f"[{ts}] [{page_name}] {post_id}: vừa được báo bởi tiến trình khác, bỏ qua.")
+                already_notified.add(key)
+                continue
+
+            msg = (
+                f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
+                f"Views: {views}\n"
+                f"Comments: {comments}\n"
+                + (f"Link: {link}\n" if link else "")
+                + "=> Gắn link ngay!\n"
+                + "⏳ Đang tạo file TXT Part 2, 3 & 4 cho chính bài này..."
+            )
+            # Chặn bài đã bắt đầu tạo và không xếp hàng khi chế độ trả phí đang tắt.
+            if not _retry_due(post_id) or not ENABLE_PAID_GENERATION:
+                continue
+            # Worker gửi thông báo ngay trước khi tạo/gửi 3 TXT; scanner không gửi chen.
+            enqueue_story(page_name, post_id, message, page_id, page_token, msg, key)
+
+    if changed:
+        save_notified(already_notified)
+    save_view_history(view_history)
 
 
 def main():
