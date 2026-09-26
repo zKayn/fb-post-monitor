@@ -121,7 +121,11 @@ METRIC_FALLBACKS = ["post_media_view", "post_total_media_view_unique"]
 # --- Cảnh báo token sắp hết hạn ---
 TOKEN_EXPIRY_WARNING_DAYS = 5
 
-CHECK_INTERVAL_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 60  # vòng quét nhanh; từng bài được adaptive polling để giảm tải Graph API
+POST_POLL_NEAR_SECONDS = 60
+POST_POLL_WARM_SECONDS = 120
+POST_POLL_COLD_SECONDS = 300
+MANAGED_PAGES_CACHE_SECONDS = 600
 POSTS_PAGE_LIMIT = 100
 POSTS_MAX_PAGES = 20
 
@@ -303,7 +307,7 @@ def record_and_check_spike(post_id: str, current_views: int, now: datetime):
 
 
 # -------------------- Telegram --------------------
-TELEGRAM_GROUP_LOCK = threading.RLock()  # Không cho tin khác chen giữa thông báo và 3 TXT.
+TELEGRAM_GROUP_LOCK = threading.RLock()  # Giữ nguyên yêu cầu: không cho tin khác chen giữa thông báo và các TXT của chính bài đó.
 
 def _send_telegram_message_unlocked(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -871,7 +875,27 @@ def note_fb_network_success(error_key: str):
         print(f"[FACEBOOK NETWORK] {error_key}: kết nối đã phục hồi sau {had_failures} lần lỗi.")
 
 # -------------------- Facebook API --------------------
+_managed_pages_cache = {"at": 0.0, "pages": []}
+_post_next_check = {}
+
+
+def _adaptive_poll_seconds(views: int, comments: int) -> int:
+    """Bài càng gần ngưỡng càng được kiểm tra nhanh; bài xa ngưỡng giảm tần suất để tiết kiệm Graph API."""
+    views = int(views or 0)
+    comments = int(comments or 0)
+    if views >= 2000 or comments >= 25:
+        return POST_POLL_NEAR_SECONDS
+    if views >= 1000 or comments >= 10:
+        return POST_POLL_WARM_SECONDS
+    return POST_POLL_COLD_SECONDS
+
+
 def get_managed_pages():
+    now_mono = time.monotonic()
+    cached = _managed_pages_cache.get("pages") or []
+    if cached and now_mono - float(_managed_pages_cache.get("at", 0)) < MANAGED_PAGES_CACHE_SECONDS:
+        return cached
+
     pages = []
     url = f"{GRAPH_URL}/me/accounts"
     params = {"fields": "id,name,access_token", "limit": 100, "access_token": USER_ACCESS_TOKEN}
@@ -897,6 +921,8 @@ def get_managed_pages():
         params = None
     if INCLUDE_PAGE_NAMES:
         pages = [p for p in pages if p.get("name") in INCLUDE_PAGE_NAMES]
+    _managed_pages_cache["pages"] = pages
+    _managed_pages_cache["at"] = time.monotonic()
     return pages
 
 
@@ -1129,7 +1155,7 @@ def story_worker():
             if not ENABLE_PAID_GENERATION:
                 print(f"[COST GUARD] {post_id}: chưa bật ENABLE_PAID_GENERATION; bỏ qua hàng đợi.")
                 continue
-            # Đợi đến lượt gửi cả nhóm; scan vẫn chạy mỗi 5 phút.
+            # Đợi đến lượt gửi cả nhóm; scanner vẫn chạy độc lập mỗi 60 giây.
             with TELEGRAM_GROUP_LOCK:
                 link_status = post_already_has_link(post_id, page_id, page_token, message)
                 if link_status is not False:
@@ -1187,8 +1213,13 @@ def check_all_pages():
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
 
-        # Không quét lại bài đã gửi đủ 3 TXT; bài chưa xong vẫn được kiểm tra lại.
-        post_ids_to_check = [pid for pid in all_post_ids if str(pid) not in story_completed]
+        # Không quét lại bài đã gửi đủ TXT. Adaptive polling: bài gần ngưỡng 1 phút,
+        # bài xa ngưỡng 2-5 phút. Vòng scanner vẫn chạy mỗi 60 giây để bắt bài mới nhanh.
+        now_mono = time.monotonic()
+        post_ids_to_check = [
+            pid for pid in all_post_ids
+            if str(pid) not in story_completed and now_mono >= _post_next_check.get(str(pid), 0)
+        ]
 
         if not post_ids_to_check:
             continue
@@ -1201,9 +1232,13 @@ def check_all_pages():
 
             if comments is None or (views is None and comments <= COMMENT_ONLY_THRESHOLD):
                 print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
+                # Dữ liệu lỗi: thử lại ngay vòng 60 giây kế tiếp, không cache kết quả lỗi lâu.
+                _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
                 continue
 
-            print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}")
+            poll_seconds = _adaptive_poll_seconds(views or 0, comments)
+            _post_next_check[str(post_id)] = time.monotonic() + poll_seconds
+            print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments} | next={poll_seconds}s")
 
             if not meets_threshold(views or 0, comments):
                 continue
