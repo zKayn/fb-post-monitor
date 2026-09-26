@@ -91,7 +91,7 @@ THRESHOLD_RULES = [
 COMMENT_ONLY_THRESHOLD = 50  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
-ONLY_POSTS_NEWER_THAN_HOURS = 120
+ONLY_POSTS_NEWER_THAN_HOURS = 72
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
 SPIKE_LOOKBACK_MINUTES = 30
