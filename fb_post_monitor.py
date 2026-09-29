@@ -1153,24 +1153,24 @@ def get_comment_count_fallback(post_id: str, page_token: str, summary_count=None
 
 
 def should_deep_count_comments(views: int, comments: int) -> bool:
-    """Chỉ gọi fallback khi sai số comment có thể làm đổi kết quả threshold."""
+    """Deep-count mọi bài có khả năng đạt/gần ngưỡng để Telegram dùng TOP_LEVEL sát Facebook."""
     views = int(views or 0)
     comments = int(comments or 0)
 
-    # Đã đạt rồi thì không cần tốn thêm request chỉ để xác nhận.
-    if meets_threshold(views, comments):
-        return False
+    # Nếu views đã đạt bất kỳ rule nào, cần top_level chính xác trước khi xét/báo.
+    for rule in THRESHOLD_RULES:
+        if views >= int(rule["min_views"]):
+            return True
 
-    # Gần ngưỡng comments-only.
+    # Hoặc summary comments đang gần mốc comments-only.
     if comments >= max(0, COMMENT_ONLY_THRESHOLD - COMMENT_COUNT_NEAR_THRESHOLD):
         return True
 
-    # Gần min_comments của bất kỳ rule mà views đã đạt.
+    # Hoặc summary đang gần min_comments của bất kỳ rule.
     for rule in THRESHOLD_RULES:
-        if views >= rule["min_views"]:
-            min_comments = int(rule["min_comments"])
-            if min_comments > 0 and comments >= max(0, min_comments - COMMENT_COUNT_NEAR_THRESHOLD):
-                return True
+        min_comments = int(rule["min_comments"])
+        if min_comments > 0 and comments >= max(0, min_comments - COMMENT_COUNT_NEAR_THRESHOLD):
+            return True
 
     return False
 
@@ -1346,8 +1346,9 @@ def check_all_pages():
                 continue
 
             # Facebook UI và comments.summary.total_count có thể lệch nhau.
-            # Nếu bài đang sát threshold và summary chưa đủ, deep-count comment/replies
-            # rồi dùng TOP-LEVEL khi pagination hoàn tất. Không cộng replies vào threshold.
+            # Deep-count trước khi xét threshold/soạn Telegram cho mọi bài có khả năng đạt/gần ngưỡng.
+            # Khi pagination hoàn tất, biến comments được thay bằng TOP_LEVEL; vì vậy cả threshold
+            # VÀ dòng "Comments:" trong Telegram đều dùng cùng một số top_level sát Facebook.
             summary_comments = int(comments or 0)
             if should_deep_count_comments(views or 0, summary_comments):
                 effective_comments, comment_debug = get_comment_count_fallback(
