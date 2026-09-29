@@ -44,6 +44,8 @@ ARTICLE_LINK_DOMAINS = [
     if d.strip()
 ]
 COMMENT_LINK_MAX_PAGES = 5  # quét tối đa 5 trang x 100 comments trước khi báo / gọi OpenAI
+COMMENT_COUNT_MAX_PAGES = 10  # fallback đếm comment thực tế khi summary có thể thấp hơn UI
+COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comment <= 15 để tiết kiệm Graph API
 
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
@@ -993,7 +995,7 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             batch_items.append(
                 {
                     "method": "GET",
-                    "relative_url": f"{pid}?fields=message,comments.summary(true),permalink_url",
+                    "relative_url": f"{pid}?fields=message,comments.limit(0).summary(true),permalink_url",
                 }
             )
 
@@ -1066,6 +1068,104 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
 
     return results
 
+
+
+def get_comment_count_fallback(post_id: str, page_token: str, summary_count=None):
+    """Đếm comment bằng pagination khi summary.total_count có thể thấp hơn UI.
+
+    Trả về (effective_count, details).
+    - effective_count luôn >= summary_count nếu summary_count hợp lệ.
+    - Dùng filter=stream và limit=100 để đếm các comment Graph thực sự trả về.
+    - Nếu API lỗi giữa chừng, vẫn giữ summary_count và không làm mất dữ liệu.
+    - Chỉ đếm top-level objects Graph trả về; nếu từng comment có comments.summary,
+      cộng thêm replies_count để gần hơn với tổng comment/conversation trên UI.
+    """
+    summary = int(summary_count or 0)
+    url = f"{GRAPH_URL}/{post_id}/comments"
+    params = {
+        "filter": "stream",
+        "limit": 100,
+        "fields": "id,comments.limit(0).summary(true)",
+        "access_token": page_token,
+    }
+
+    top_level = 0
+    replies = 0
+    pages = 0
+    complete = True
+
+    while url and pages < COMMENT_COUNT_MAX_PAGES:
+        try:
+            r = api_get(url, params=params)
+            data = r.json()
+        except Exception as exc:
+            print(f"[COMMENT-COUNT] {post_id}: lỗi đọc comments page {pages + 1}: {exc}")
+            complete = False
+            break
+
+        if "error" in data or not isinstance(data.get("data"), list):
+            err = data.get("error", {}).get("message", "response không hợp lệ")
+            print(f"[COMMENT-COUNT] {post_id}: Graph API lỗi: {err}")
+            complete = False
+            break
+
+        rows = data.get("data", [])
+        top_level += len(rows)
+
+        for row in rows:
+            try:
+                replies += int(
+                    ((row.get("comments") or {}).get("summary") or {}).get("total_count") or 0
+                )
+            except (TypeError, ValueError):
+                pass
+
+        url = data.get("paging", {}).get("next")
+        params = None
+        pages += 1
+
+    if url:
+        complete = False
+
+    enumerated = top_level + replies
+    effective = max(summary, enumerated)
+
+    print(
+        f"[COMMENT-COUNT] {post_id}: summary={summary} | top_level={top_level} "
+        f"| replies={replies} | enumerated={enumerated} | effective={effective} "
+        f"| pages={pages} | complete={complete}"
+    )
+    return effective, {
+        "summary": summary,
+        "top_level": top_level,
+        "replies": replies,
+        "enumerated": enumerated,
+        "pages": pages,
+        "complete": complete,
+    }
+
+
+def should_deep_count_comments(views: int, comments: int) -> bool:
+    """Chỉ gọi fallback khi sai số comment có thể làm đổi kết quả threshold."""
+    views = int(views or 0)
+    comments = int(comments or 0)
+
+    # Đã đạt rồi thì không cần tốn thêm request chỉ để xác nhận.
+    if meets_threshold(views, comments):
+        return False
+
+    # Gần ngưỡng comments-only.
+    if comments >= max(0, COMMENT_ONLY_THRESHOLD - COMMENT_COUNT_NEAR_THRESHOLD):
+        return True
+
+    # Gần min_comments của bất kỳ rule mà views đã đạt.
+    for rule in THRESHOLD_RULES:
+        if views >= rule["min_views"]:
+            min_comments = int(rule["min_comments"])
+            if min_comments > 0 and comments >= max(0, min_comments - COMMENT_COUNT_NEAR_THRESHOLD):
+                return True
+
+    return False
 
 def contains_article_link(text: str) -> bool:
     """Nhận diện link bài đọc cần tránh tạo TXT. Domain cấu hình riêng để không nhầm URL Facebook/permalink."""
@@ -1238,9 +1338,28 @@ def check_all_pages():
                 _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
                 continue
 
+            # Facebook UI và comments.summary.total_count có thể lệch nhau.
+            # Nếu bài đang sát threshold và summary chưa đủ, deep-count comment/replies
+            # rồi dùng số LỚN HƠN. Không hạ threshold, không tự suy đoán số UI.
+            summary_comments = int(comments or 0)
+            if should_deep_count_comments(views or 0, summary_comments):
+                effective_comments, comment_debug = get_comment_count_fallback(
+                    post_id, page_token, summary_comments
+                )
+                if effective_comments > summary_comments:
+                    print(
+                        f"[COMMENT-FALLBACK] [{page_name}] {post_id}: "
+                        f"summary={summary_comments} -> effective={effective_comments}"
+                    )
+                comments = effective_comments
+
             poll_seconds = _adaptive_poll_seconds(views or 0, comments)
             _post_next_check[str(post_id)] = time.monotonic() + poll_seconds
-            print(f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments} | next={poll_seconds}s")
+            print(
+                f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}"
+                + (f" (summary={summary_comments})" if comments != summary_comments else "")
+                + f" | next={poll_seconds}s"
+            )
 
             if not meets_threshold(views or 0, comments):
                 continue
