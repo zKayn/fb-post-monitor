@@ -1166,7 +1166,7 @@ def story_worker():
                     published = datetime.strptime(verify["created_time"], "%Y-%m-%dT%H:%M:%S%z")
                     age = datetime.now(timezone.utc) - published
                     if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
-                        print(f"[COST GUARD] {post_id}: ngoài giới hạn 120 giờ; bỏ qua.")
+                        print(f"[COST GUARD] {post_id}: ngoài giới hạn {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
                         continue
                 except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
@@ -1243,19 +1243,73 @@ def check_all_pages():
             if not meets_threshold(views or 0, comments):
                 continue
 
-            # Bài đã báo nhưng chưa đủ TXT: xếp hàng retry, không báo chen vào bài khác.
+            # Log rõ ràng để biết chính xác bài đã đạt ngưỡng ở vòng quét nào.
+            qualified_reasons = []
+            if comments > COMMENT_ONLY_THRESHOLD:
+                qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
+            for rule in THRESHOLD_RULES:
+                if (views or 0) >= rule["min_views"] and comments >= rule["min_comments"]:
+                    qualified_reasons.append(
+                        f"views>={rule['min_views']} & comments>={rule['min_comments']}"
+                    )
+            print(
+                f"[QUALIFIED] [{page_name}] {post_id} | views={views} | comments={comments} "
+                f"| reason={'; '.join(qualified_reasons) or 'threshold'}"
+            )
+
+            # Nếu bài đã từng được báo:
+            # - Đã gửi đủ TXT => bỏ qua.
+            # - Có checkpoint nhưng TXT chưa đủ => cho phép RESUME phần còn thiếu.
+            # - Không có checkpoint => không tự mua lại OpenAI vì request cũ có thể đã bị tính phí.
             if key in already_notified:
-                if False:  # Không tự tạo lại: có thể request trước đã bị tính phí.
-                    retry_msg = (f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                                 f"Views: {views}\nComments: {comments}\n"
-                                 + (f"Link: {link}\n" if link else "")
-                                 + "=> Gắn link ngay!\n🔄 Đang tạo lại file TXT hoàn chỉnh cho bài này...")
-                    enqueue_story(page_name, post_id, message, page_id, page_token, retry_msg, key)
+                if str(post_id) in story_completed:
+                    print(f"[QUALIFIED] {post_id}: đã hoàn thành đủ TXT -> SKIP.")
+                    continue
+
+                progress = _load_progress(post_id)
+                has_saved_progress = bool(progress and (
+                    progress.get("parts") or progress.get("sent") or progress.get("caption")
+                ))
+                if has_saved_progress and _retry_due(post_id):
+                    retry_msg = (
+                        f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
+                        f"Views: {views}\nComments: {comments}\n"
+                        + (f"Link: {link}\n" if link else "")
+                        + "=> Gắn link ngay!\n"
+                        + "🔄 Tiếp tục tạo/gửi các file TXT còn thiếu..."
+                    )
+                    queued = enqueue_story(
+                        page_name, post_id, message, page_id, page_token,
+                        retry_msg, key
+                    )
+                    print(
+                        f"[RESUME] {post_id}: checkpoint tồn tại | "
+                        f"queued={queued} | parts={sorted((progress.get('parts') or {}).keys())} "
+                        f"| sent={progress.get('sent') or []}"
+                    )
+                else:
+                    print(
+                        f"[QUALIFIED] {post_id}: đã có trong notified nhưng không có checkpoint "
+                        f"an toàn để resume -> không tự gọi lại OpenAI."
+                    )
                 continue
 
             link_status = post_already_has_link(post_id, page_id, page_token, message)
             if link_status is None:
-                print(f"[{ts}] [{page_name}] {post_id}: chưa xác minh được link; bỏ qua.")
+                print(
+                    f"[QUALIFIED-BUT-BLOCKED] [{page_name}] {post_id}: "
+                    f"đã đạt ngưỡng nhưng KHÔNG xác minh được comments/link; "
+                    f"không gọi OpenAI để tránh tạo trùng."
+                )
+                send_error_alert(
+                    f"qualified_link_check_{post_id}",
+                    f"Bài {post_id} trên Page {page_name} ĐÃ ĐẠT NGƯỠNG "
+                    f"(views={views}, comments={comments}) nhưng Facebook API không cho "
+                    f"xác minh đầy đủ comments/link. Bot tạm chặn thông báo + OpenAI để "
+                    f"tránh tạo TXT trùng. Hãy xem log [QUALIFIED-BUT-BLOCKED] để biết bài nào bị giữ."
+                )
+                # Thử lại ngay ở vòng quét kế tiếp thay vì chờ adaptive interval.
+                _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
                 continue
             if link_status:
                 print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
@@ -1280,7 +1334,16 @@ def check_all_pages():
             if not _retry_due(post_id) or not ENABLE_PAID_GENERATION:
                 continue
             # Worker gửi thông báo ngay trước khi tạo/gửi 3 TXT; scanner không gửi chen.
-            enqueue_story(page_name, post_id, message, page_id, page_token, msg, key)
+            queued = enqueue_story(page_name, post_id, message, page_id, page_token, msg, key)
+            if queued:
+                print(f"[QUEUE] [{page_name}] {post_id}: đã xếp hàng thông báo + TXT.")
+            else:
+                print(
+                    f"[QUEUE-BUSY] [{page_name}] {post_id}: đạt ngưỡng nhưng chưa vào queue "
+                    f"(pending/completed/retry-delay/queue-full). Sẽ được xét lại vòng sau."
+                )
+                # Đừng để adaptive polling kéo dài lần thử lại của một bài đã đạt ngưỡng.
+                _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
 
     if changed:
         save_notified(already_notified)
