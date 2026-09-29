@@ -1128,11 +1128,18 @@ def get_comment_count_fallback(post_id: str, page_token: str, summary_count=None
         complete = False
 
     enumerated = top_level + replies
-    effective = max(summary, enumerated)
+
+    # Facebook UI của Page này khớp sát nhất với số comment top-level.
+    # Vì vậy khi pagination đọc HOÀN TẤT, dùng top_level để xét threshold,
+    # KHÔNG cộng replies để tránh đếm trùng (ví dụ 73 + 34 = 107).
+    #
+    # Nếu pagination không hoàn tất/lỗi, không được dùng số đếm dở dang;
+    # fallback về summary để tránh quyết định từ dữ liệu thiếu.
+    effective = top_level if complete else summary
 
     print(
         f"[COMMENT-COUNT] {post_id}: summary={summary} | top_level={top_level} "
-        f"| replies={replies} | enumerated={enumerated} | effective={effective} "
+        f"| replies={replies} | enumerated={enumerated} | effective(top_level)={effective} "
         f"| pages={pages} | complete={complete}"
     )
     return effective, {
@@ -1340,7 +1347,7 @@ def check_all_pages():
 
             # Facebook UI và comments.summary.total_count có thể lệch nhau.
             # Nếu bài đang sát threshold và summary chưa đủ, deep-count comment/replies
-            # rồi dùng số LỚN HƠN. Không hạ threshold, không tự suy đoán số UI.
+            # rồi dùng TOP-LEVEL khi pagination hoàn tất. Không cộng replies vào threshold.
             summary_comments = int(comments or 0)
             if should_deep_count_comments(views or 0, summary_comments):
                 effective_comments, comment_debug = get_comment_count_fallback(
@@ -1349,7 +1356,7 @@ def check_all_pages():
                 if effective_comments > summary_comments:
                     print(
                         f"[COMMENT-FALLBACK] [{page_name}] {post_id}: "
-                        f"summary={summary_comments} -> effective={effective_comments}"
+                        f"summary={summary_comments} -> top_level={effective_comments}"
                     )
                 comments = effective_comments
 
