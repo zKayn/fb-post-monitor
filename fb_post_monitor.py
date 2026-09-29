@@ -1172,9 +1172,11 @@ def story_worker():
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
                     continue
                 if notified_key not in already_notified:
+                    print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN.")
                     send_telegram_message(alert_text)
                     already_notified.add(notified_key)
                     save_notified(already_notified)
+                    print(f"[ALERT-SENT] {post_id}: đã lưu notified sau khi gửi Telegram.")
                 else:
                     print(f"[WORKER] {post_id}: đã báo trước đó; không báo lặp.")
                 # Khóa được giữ xuyên suốt 3 TXT: không tin Telegram nào từ
@@ -1257,43 +1259,10 @@ def check_all_pages():
                 f"| reason={'; '.join(qualified_reasons) or 'threshold'}"
             )
 
-            # Nếu bài đã từng được báo:
-            # - Đã gửi đủ TXT => bỏ qua.
-            # - Có checkpoint nhưng TXT chưa đủ => cho phép RESUME phần còn thiếu.
-            # - Không có checkpoint => không tự mua lại OpenAI vì request cũ có thể đã bị tính phí.
-            if key in already_notified:
-                if str(post_id) in story_completed:
-                    print(f"[QUALIFIED] {post_id}: đã hoàn thành đủ TXT -> SKIP.")
-                    continue
-
-                progress = _load_progress(post_id)
-                has_saved_progress = bool(progress and (
-                    progress.get("parts") or progress.get("sent") or progress.get("caption")
-                ))
-                if has_saved_progress and _retry_due(post_id):
-                    retry_msg = (
-                        f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                        f"Views: {views}\nComments: {comments}\n"
-                        + (f"Link: {link}\n" if link else "")
-                        + "=> Gắn link ngay!\n"
-                        + "🔄 Tiếp tục tạo/gửi các file TXT còn thiếu..."
-                    )
-                    queued = enqueue_story(
-                        page_name, post_id, message, page_id, page_token,
-                        retry_msg, key
-                    )
-                    print(
-                        f"[RESUME] {post_id}: checkpoint tồn tại | "
-                        f"queued={queued} | parts={sorted((progress.get('parts') or {}).keys())} "
-                        f"| sent={progress.get('sent') or []}"
-                    )
-                else:
-                    print(
-                        f"[QUALIFIED] {post_id}: đã có trong notified nhưng không có checkpoint "
-                        f"an toàn để resume -> không tự gọi lại OpenAI."
-                    )
-                continue
-
+            # QUAN TRỌNG: luôn kiểm tra link TRƯỚC khi tin trạng thái already_notified.
+            # Các phiên bản cũ từng ghi cả bài "đã có link" vào notified_posts.json,
+            # làm notified bị lẫn giữa "đã gửi Telegram" và "chỉ bị skip vì có link".
+            # Vì vậy notified cũ không được phép chặn một bài đạt ngưỡng trước khi link được xác minh.
             link_status = post_already_has_link(post_id, page_id, page_token, message)
             if link_status is None:
                 print(
@@ -1312,15 +1281,62 @@ def check_all_pages():
                 _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
                 continue
             if link_status:
+                # Có link thì chỉ SKIP. KHÔNG ghi vào already_notified nữa.
+                # notified phải chỉ mang nghĩa "Telegram alert thực sự đã được gửi".
                 print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
-                already_notified.add(key)
-                changed = True
                 continue
 
-            if key in load_notified():  # đọc lại file mới nhất, giảm rủi ro trùng nếu có tiến trình khác vừa ghi
-                print(f"[{ts}] [{page_name}] {post_id}: vừa được báo bởi tiến trình khác, bỏ qua.")
-                already_notified.add(key)
-                continue
+            # Tới đây đã xác minh chắc chắn: bài đạt ngưỡng + CHƯA có link.
+            # Xử lý notified sau link-check để sửa dữ liệu legacy bị ô nhiễm.
+            if key in already_notified or key in load_notified():
+                if str(post_id) in story_completed:
+                    print(f"[QUALIFIED] {post_id}: đã gửi đủ TXT -> SKIP.")
+                    already_notified.add(key)
+                    continue
+
+                progress = _load_progress(post_id)
+                has_saved_progress = bool(progress and (
+                    progress.get("parts") or progress.get("sent") or progress.get("caption")
+                ))
+
+                if has_saved_progress:
+                    # Đây là dấu hiệu mạnh rằng alert trước đó đã thật sự đi qua worker.
+                    already_notified.add(key)
+                    if _retry_due(post_id):
+                        retry_msg = (
+                            f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
+                            f"Views: {views}\nComments: {comments}\n"
+                            + (f"Link: {link}\n" if link else "")
+                            + "=> Gắn link ngay!\n"
+                            + "🔄 Tiếp tục tạo/gửi các file TXT còn thiếu..."
+                        )
+                        queued = enqueue_story(
+                            page_name, post_id, message, page_id, page_token,
+                            retry_msg, key
+                        )
+                        print(
+                            f"[RESUME] {post_id}: có checkpoint thật | queued={queued} "
+                            f"| parts={sorted((progress.get('parts') or {}).keys())} "
+                            f"| sent={progress.get('sent') or []}"
+                        )
+                    else:
+                        print(f"[RESUME-WAIT] {post_id}: có checkpoint nhưng chưa tới retry_after.")
+                    continue
+
+                # Legacy repair:
+                # notified nhưng KHÔNG completed và KHÔNG có checkpoint thường là key
+                # do bản cũ ghi nhầm khi gặp bài đã có link. Xóa key đó để bài được báo bình thường.
+                print(
+                    f"[LEGACY-NOTIFIED-FIX] {post_id}: có notified cũ nhưng không có "
+                    f"story checkpoint/completed; coi là trạng thái legacy không đáng tin "
+                    f"và cho phép bài đi tiếp."
+                )
+                already_notified.discard(key)
+                disk_notified = load_notified()
+                if key in disk_notified:
+                    disk_notified.discard(key)
+                    save_notified(disk_notified)
+                changed = True
 
             msg = (
                 f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
