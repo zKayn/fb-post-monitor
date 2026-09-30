@@ -88,9 +88,9 @@ INCLUDE_PAGE_NAMES = []
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 THRESHOLD_RULES = [
     {"min_views": 5000, "min_comments": 0},
-    {"min_views": 3000, "min_comments": 40},
+    {"min_views": 3500, "min_comments": 50},
 ]
-COMMENT_ONLY_THRESHOLD = 50  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
 ONLY_POSTS_NEWER_THAN_HOURS = 72
