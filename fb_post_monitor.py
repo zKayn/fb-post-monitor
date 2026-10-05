@@ -87,7 +87,7 @@ INCLUDE_PAGE_NAMES = []
 
 # --- Page đặc biệt ---
 # Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng views/comments.
-SPECIAL_INSTANT_PAGE_IDS = {"61591782185355"}
+SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
