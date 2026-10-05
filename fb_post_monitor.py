@@ -1371,6 +1371,7 @@ def story_worker():
             STORY_QUEUE.task_done()
 
 def check_all_pages():
+    global _special_baseline_ready, special_baseline_posts
     # Token expiry được kiểm tra theo ngày để vòng quét nhanh hơn.
     if not hasattr(check_all_pages, "_last_token_check") or time.time() - check_all_pages._last_token_check > 86400:
         check_token_expiry()
