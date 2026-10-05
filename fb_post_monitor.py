@@ -96,6 +96,9 @@ COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, khô
 ONLY_POSTS_NEWER_THAN_HOURS = 72
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
+# Railway Variable: ENABLE_SPIKE_ALERT=true để BẬT, false để TẮT.
+# Mặc định false để không tự phát sinh cảnh báo ngoài ý muốn sau khi deploy.
+ENABLE_SPIKE_ALERT = os.getenv("ENABLE_SPIKE_ALERT", "false").strip().lower() in ("1", "true", "yes", "on")
 SPIKE_LOOKBACK_MINUTES = 30
 SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
@@ -1368,6 +1371,26 @@ def check_all_pages():
                 + (f" (summary={summary_comments})" if comments != summary_comments else "")
                 + f" | next={poll_seconds}s"
             )
+
+            # Luôn ghi lịch sử views để khi bật công tắc spike đã có baseline 30 phút.
+            # Cảnh báo "BÀI ĐANG DỰNG ĐỨNG" độc lập với ngưỡng BÀI ĐANG LÊN
+            # và chỉ gửi đúng 1 lần/post nhờ key spike_ được lưu persistent.
+            spike_detected = record_and_check_spike(post_id, int(views or 0), datetime.now())
+            spike_key = f"spike_{page_id}_{post_id}"
+            if ENABLE_SPIKE_ALERT and spike_detected and spike_key not in already_notified:
+                spike_msg = (
+                    f"🚀 BÀI ĐANG DỰNG ĐỨNG! (Page: {page_name})\n"
+                    f"Views: {views}\n"
+                    f"Comments: {comments}\n"
+                    + (f"Link: {link}\n" if link else "")
+                    + f"Tăng mạnh trong khoảng {SPIKE_LOOKBACK_MINUTES} phút.\n"
+                    + "=> Kiểm tra bài ngay!"
+                )
+                print(f"[SPIKE] [{page_name}] {post_id}: phát hiện tăng dựng đứng -> gửi Telegram.")
+                send_telegram_message(spike_msg)
+                already_notified.add(spike_key)
+                save_notified(already_notified)
+                changed = True
 
             if not meets_threshold(views or 0, comments):
                 continue
