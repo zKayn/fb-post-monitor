@@ -85,6 +85,11 @@ PART_ENDINGS = {
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
 
+# --- Page đặc biệt ---
+# Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng views/comments.
+SPECIAL_INSTANT_PAGE_IDS = {"61591782185355"}
+SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
+
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 THRESHOLD_RULES = [
     {"min_views": 5000, "min_comments": 0},
@@ -221,6 +226,30 @@ def save_notified(notified_set):
 
 
 already_notified = load_notified()
+
+def load_special_baseline():
+    if os.path.exists(SPECIAL_BASELINE_FILE):
+        try:
+            with open(SPECIAL_BASELINE_FILE, "r", encoding="utf-8") as f:
+                return set(str(x) for x in json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_special_baseline(items):
+    try:
+        os.makedirs(os.path.dirname(SPECIAL_BASELINE_FILE) or ".", exist_ok=True)
+        tmp = SPECIAL_BASELINE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sorted(items), f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SPECIAL_BASELINE_FILE)
+    except Exception as e:
+        print(f"[LỖI] Không lưu được {SPECIAL_BASELINE_FILE}: {e}")
+
+special_baseline_posts = load_special_baseline()
+_special_baseline_ready = bool(special_baseline_posts)
 
 def load_story_completed():
     if os.path.exists(STORY_COMPLETED_FILE):
@@ -1324,13 +1353,28 @@ def check_all_pages():
         page_token = page["access_token"]
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
+        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS
+
+        # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
+        # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
+        if is_special_page and not _special_baseline_ready:
+            special_baseline_posts.update(str(pid) for pid in all_post_ids)
+            save_special_baseline(special_baseline_posts)
+            _special_baseline_ready = True
+            print(
+                f"[SPECIAL-BASELINE] [{page_name}] đã ghi nhận {len(all_post_ids)} bài hiện có. "
+                "Từ bây giờ bài mới sẽ tạo TXT ngay, không cần chờ ngưỡng."
+            )
+            continue
 
         # Không quét lại bài đã gửi đủ TXT. Adaptive polling: bài gần ngưỡng 1 phút,
         # bài xa ngưỡng 2-5 phút. Vòng scanner vẫn chạy mỗi 60 giây để bắt bài mới nhanh.
         now_mono = time.monotonic()
         post_ids_to_check = [
             pid for pid in all_post_ids
-            if str(pid) not in story_completed and now_mono >= _post_next_check.get(str(pid), 0)
+            if str(pid) not in story_completed
+            and (not is_special_page or str(pid) not in special_baseline_posts)
+            and now_mono >= _post_next_check.get(str(pid), 0)
         ]
 
         if not post_ids_to_check:
@@ -1342,7 +1386,9 @@ def check_all_pages():
             key = f"{page_id}_{post_id}"
             views, comments, link, message = stats.get(post_id, (None, None, None, ""))
 
-            if comments is None or (views is None and comments <= COMMENT_ONLY_THRESHOLD):
+            if comments is None or (
+                not is_special_page and views is None and comments <= COMMENT_ONLY_THRESHOLD
+            ):
                 print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
                 # Dữ liệu lỗi: thử lại ngay vòng 60 giây kế tiếp, không cache kết quả lỗi lâu.
                 _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
@@ -1353,7 +1399,7 @@ def check_all_pages():
             # Khi pagination hoàn tất, biến comments được thay bằng TOP_LEVEL; vì vậy cả threshold
             # VÀ dòng "Comments:" trong Telegram đều dùng cùng một số top_level sát Facebook.
             summary_comments = int(comments or 0)
-            if should_deep_count_comments(views or 0, summary_comments):
+            if not is_special_page and should_deep_count_comments(views or 0, summary_comments):
                 effective_comments, comment_debug = get_comment_count_fallback(
                     post_id, page_token, summary_comments
                 )
@@ -1392,11 +1438,13 @@ def check_all_pages():
                 save_notified(already_notified)
                 changed = True
 
-            if not meets_threshold(views or 0, comments):
+            if not is_special_page and not meets_threshold(views or 0, comments):
                 continue
 
-            # Log rõ ràng để biết chính xác bài đã đạt ngưỡng ở vòng quét nào.
+            # Riêng Little Girl: bài mới đi tiếp ngay, không xét views/comments.
             qualified_reasons = []
+            if is_special_page:
+                qualified_reasons.append("SPECIAL_PAGE_NEW_POST")
             if comments > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
             for rule in THRESHOLD_RULES:
@@ -1417,7 +1465,7 @@ def check_all_pages():
             if link_status is None:
                 print(
                     f"[QUALIFIED-BUT-BLOCKED] [{page_name}] {post_id}: "
-                    f"đã đạt ngưỡng nhưng KHÔNG xác minh được comments/link; "
+                    f"đã đủ điều kiện xử lý nhưng KHÔNG xác minh được comments/link; "
                     f"không gọi OpenAI để tránh tạo trùng."
                 )
                 send_error_alert(
