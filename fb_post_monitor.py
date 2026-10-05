@@ -925,40 +925,81 @@ def _adaptive_poll_seconds(views: int, comments: int) -> int:
 
 
 def get_managed_pages():
+    """Lấy toàn bộ Page do via tổng USER_ACCESS_TOKEN quản lý."""
     now_mono = time.monotonic()
     cached = _managed_pages_cache.get("pages") or []
     if cached and now_mono - float(_managed_pages_cache.get("at", 0)) < MANAGED_PAGES_CACHE_SECONDS:
         return cached
 
-    pages = []
     url = f"{GRAPH_URL}/me/accounts"
-    params = {"fields": "id,name,access_token", "limit": 100, "access_token": USER_ACCESS_TOKEN}
+    params = {
+        "fields": "id,name,access_token",
+        "limit": 100,
+        "access_token": USER_ACCESS_TOKEN,
+    }
+    pages = []
+
     while url:
         try:
             r = api_get(url, params=params)
+            data = r.json()
         except Exception as e:
-            note_fb_network_failure("get_managed_pages_network", f"Không kết nối được Facebook để lấy danh sách Page: {e}")
-            return []
+            note_fb_network_failure(
+                "get_managed_pages_network",
+                f"Không kết nối được Facebook để lấy danh sách Page: {e}",
+            )
+            break
+
         note_fb_network_success("get_managed_pages_network")
-        data = r.json()
+
         if "error" in data:
             err_msg = data["error"].get("message", "Không rõ nguyên nhân")
             print(f"[LỖI] Không lấy được danh sách Page: {err_msg}")
             send_error_alert(
                 "get_managed_pages",
-                f"Không lấy được danh sách Page (có thể USER_ACCESS_TOKEN đã hết hạn/sai quyền).\nChi tiết: {err_msg}",
+                f"Không lấy được danh sách Page từ USER_ACCESS_TOKEN. Chi tiết: {err_msg}",
             )
-            return []
+            break
+
         pages.extend(data.get("data", []))
-        next_url = data.get("paging", {}).get("next")
-        url = next_url
+        url = data.get("paging", {}).get("next")
         params = None
+
+    # Khử trùng Page ID nếu Facebook trả lặp qua pagination.
+    unique = {}
+    for page in pages:
+        pid = str(page.get("id") or "")
+        if pid:
+            unique[pid] = page
+    pages = list(unique.values())
+
     if INCLUDE_PAGE_NAMES:
         pages = [p for p in pages if p.get("name") in INCLUDE_PAGE_NAMES]
+
     _managed_pages_cache["pages"] = pages
     _managed_pages_cache["at"] = time.monotonic()
-    return pages
 
+    print(f"[FACEBOOK] Tổng Page từ USER_ACCESS_TOKEN: {len(pages)}")
+    for p in pages:
+        pid = str(p.get("id") or "")
+        pname = p.get("name") or "(không tên)"
+        marker = "  <<< SPECIAL-INSTANT" if pid in SPECIAL_INSTANT_PAGE_IDS else ""
+        print(f"[PAGE] {pname} | ID={pid}{marker}")
+
+    special_found = [p for p in pages if str(p.get("id") or "") in SPECIAL_INSTANT_PAGE_IDS]
+    if special_found:
+        print(
+            "[SPECIAL-PAGE] OK: USER_ACCESS_TOKEN nhìn thấy "
+            + ", ".join(f"{p.get('name')} ({p.get('id')})" for p in special_found)
+        )
+    else:
+        print(
+            "[SPECIAL-PAGE] CẢNH BÁO: USER_ACCESS_TOKEN KHÔNG trả về Page "
+            + ", ".join(sorted(SPECIAL_INSTANT_PAGE_IDS))
+            + " qua /me/accounts. Bot chưa thể phát hiện bài mới của Page này."
+        )
+
+    return pages
 
 def get_recent_post_ids(page_id: str, page_token: str):
     """Đọc nhiều trang /posts thay vì chỉ 25 bài đầu; không đánh dấu thiếu dữ liệu là đã xử lý."""
