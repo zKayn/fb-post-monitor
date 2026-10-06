@@ -70,7 +70,7 @@ Requirements:
 • Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling suitable for a wide audience.
 • Allow supporting characters to have meaningful roles, realistic motivations, and emotional growth.
 • Maintain a warm, family-friendly tone suitable for mainstream publishing platforms and advertising-friendly content standards.
-• Length: at least 3500 words for this part. Aim for approximately 3600-4000 words and NEVER finish below 3500 words.
+• Length: approximately 3500-4000 words for this part. Aim for about 3700 words. NEVER finish below 3500 words and avoid exceeding 4000 words.
 • Maintain strict consistency in characters, settings, timeline, facts, relationships, and unresolved clues from all story context supplied above.
 • Do NOT repeat scenes or recap large portions unnecessarily. Continue naturally from the exact point where the previous part ended.
 • IMPORTANT: Do NOT write any END OF PART line, NEXT PART line, Facebook CTA, like/share request, or other ending marker. The program will append the correct ending line only after the part has been fully generated.
@@ -531,9 +531,11 @@ def _validate_part(text: str, part_number: int):
     if not text or not text.strip():
         return False, "content rỗng"
     words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
-    # Mỗi Part bắt buộc tối thiểu 3500 từ.
+    # Mỗi Part phải nằm khoảng 3500-4000 từ.
     if words < 3500:
-        return False, f"quá ngắn ({words} từ; bắt buộc tối thiểu 3500 từ)"
+        return False, f"quá ngắn ({words} từ; yêu cầu khoảng 3500-4000 từ)"
+    if words > 4000:
+        return False, f"quá dài ({words} từ; yêu cầu khoảng 3500-4000 từ)"
     if part_number in (3, 4) and not re.search(rf"(?i)PART\s+{part_number}", text):
         return False, f"thiếu nhãn PART {part_number}"
     return True, f"OK ({words} từ)"
@@ -543,12 +545,12 @@ def _word_count(text: str) -> int:
     return len(re.findall(r"\b[\w’'-]+\b", text or "", flags=re.UNICODE))
 
 
-def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 3800):
+def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 3700):
     """Bổ sung phần còn thiếu thay vì vứt content đã trả tiền và generate lại từ đầu."""
     current_words = _word_count(existing_part)
     need_words = max(250, target_words - current_words)
     # Cho dư nhẹ để model có thể kết thúc tự nhiên, nhưng tránh sinh quá dài/tốn tiền.
-    requested_words = min(max(need_words + 250, 500), 2200)
+    requested_words = min(max(need_words + 100, 300), 1800)
 
     if part_number in (2, 3):
         ending_instruction = f"End with a natural hook or discovery leading into Part {part_number + 1}."
@@ -564,7 +566,7 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Write approximately {requested_words} additional words so the COMPLETE part reaches at least 3500 words, ideally about 3600-4000 words.
+Continue PART {part_number} from the exact final sentence above. Write only about {requested_words} additional words so the COMPLETE part finishes around 3500-4000 words, ideally near 3700 words. Do not intentionally push the complete part beyond 4000 words.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
 Do NOT add a PART heading, headline, END OF PART line, NEXT PART line, Facebook CTA, like/share request, or commentary.
@@ -638,7 +640,7 @@ def generate_valid_part(story_context: str, part_number: int):
     continuation_rounds = 4
     while words < 3500 and continuation_rounds > 0:
         print(f"[OPENAI] Part {part_number} mới có {words} từ -> giữ nguyên và viết bổ sung, KHÔNG regenerate.")
-        extra = call_openai_continue_part(story_context, raw, part_number, target_words=3800)
+        extra = call_openai_continue_part(story_context, raw, part_number, target_words=3700)
         if not extra:
             break
         raw = f"{raw.rstrip()}\n\n{extra.strip()}"
