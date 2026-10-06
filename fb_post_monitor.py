@@ -50,7 +50,7 @@ COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comme
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-luna"
-OPENAI_MAX_OUTPUT_TOKENS = 8000  # dư địa cho MỖI part; tránh reasoning/length làm content rỗng
+OPENAI_MAX_OUTPUT_TOKENS = 16000  # tăng ngân sách để tránh reasoning dùng hết token làm content rỗng
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
@@ -422,15 +422,21 @@ Do not rewrite earlier parts."""
 Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
 
     last_error = "unknown"
-    for attempt in range(1, OPENAI_PART_RETRIES + 1):
+    force_length_retry = False
+    total_attempts = OPENAI_PART_RETRIES + 1  # thêm 1 lượt CHỈ dành cho content rỗng + finish_reason=length
+    for attempt in range(1, total_attempts + 1):
         try:
+            # Lượt bình thường dùng 16k. Nếu lượt trước bị reasoning ăn hết token và content rỗng,
+            # retry đúng request đó với 24k; không regenerate các Part đã checkpoint.
+            request_token_budget = 24000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
+            force_length_retry = False
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": full_prompt}],
-                    "max_completion_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+                    "max_completion_tokens": request_token_budget,
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
@@ -457,9 +463,20 @@ Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
                         print(f"[OPENAI] Part {part_number} OK | finish_reason={finish_reason} | usage={usage}")
                         return text
                     last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}"
+                    if finish_reason == "length" and attempt < total_attempts:
+                        force_length_retry = True
+                        print(
+                            f"[OPENAI] Part {part_number}: content rỗng + finish_reason=length "
+                            f"-> retry riêng với 24000 tokens."
+                        )
+                    elif attempt >= OPENAI_PART_RETRIES:
+                        # Không dùng lượt dự phòng cho các lỗi khác.
+                        break
                 else:
                     last_error = f"không có choices; response={str(data)[:1200]}"
-                print(f"[CẢNH BÁO] Part {part_number} rỗng/lỗi, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
+                    if attempt >= OPENAI_PART_RETRIES:
+                        break
+                print(f"[CẢNH BÁO] Part {part_number} rỗng/lỗi, lần {attempt}/{total_attempts}: {last_error}")
         except requests.exceptions.RequestException as e:
             last_error = f"network/timeout: {e}"
             print(f"[CẢNH BÁO] Part {part_number}, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
@@ -467,10 +484,15 @@ Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
             last_error = f"parse/process: {e}"
             print(f"[CẢNH BÁO] Part {part_number}, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
 
+        if force_length_retry and attempt < total_attempts:
+            time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 20))
+            continue
         if attempt < OPENAI_PART_RETRIES:
             time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 20))
+        else:
+            break
 
-    send_error_alert(f"openai_api_part_{part_number}_failed", f"Không tạo được Part {part_number} sau {OPENAI_PART_RETRIES} lần thử. Chi tiết cuối: {last_error}")
+    send_error_alert(f"openai_api_part_{part_number}_failed", f"Không tạo được Part {part_number}. Chi tiết cuối: {last_error}")
     return None
 
 
@@ -558,7 +580,7 @@ Output ONLY the new continuation paragraphs."""
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     # Continuation may need substantial length to guarantee the 3500-word minimum.
-                    "max_completion_tokens": min(OPENAI_MAX_OUTPUT_TOKENS, 6000),
+                    "max_completion_tokens": min(OPENAI_MAX_OUTPUT_TOKENS, 12000),
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
