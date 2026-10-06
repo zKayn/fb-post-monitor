@@ -50,7 +50,7 @@ COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comme
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-luna"
-OPENAI_MAX_OUTPUT_TOKENS = 16000  # tăng ngân sách để tránh reasoning dùng hết token làm content rỗng
+OPENAI_MAX_OUTPUT_TOKENS = 12000  # tối ưu tốc độ: đủ dư địa cho Part 3500-4000 từ
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
@@ -70,7 +70,7 @@ Requirements:
 • Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling suitable for a wide audience.
 • Allow supporting characters to have meaningful roles, realistic motivations, and emotional growth.
 • Maintain a warm, family-friendly tone suitable for mainstream publishing platforms and advertising-friendly content standards.
-• Length: approximately 3500-4000 words for this part. Aim for about 3700 words. NEVER finish below 3500 words and avoid exceeding 4000 words.
+• Length: approximately 3500-4000 words for this part. Aim for about 3600-3700 words. NEVER finish below 3500 words and avoid exceeding 4000 words.
 • Maintain strict consistency in characters, settings, timeline, facts, relationships, and unresolved clues from all story context supplied above.
 • Do NOT repeat scenes or recap large portions unnecessarily. Continue naturally from the exact point where the previous part ended.
 • IMPORTANT: Do NOT write any END OF PART line, NEXT PART line, Facebook CTA, like/share request, or other ending marker. The program will append the correct ending line only after the part has been fully generated.
@@ -112,7 +112,7 @@ VIEW_HISTORY_FILE = "/data/view_history.json"
 STORY_COMPLETED_FILE = "/data/story_completed_posts.json"
 STORY_CLAIMED_FILE = "/data/story_claimed_posts.json"
 STORY_PROGRESS_DIR = "/data/story_progress"
-STORY_RETRY_SECONDS = 900  # 15 phút giữa các lượt thử; không gọi lại liên tục
+STORY_RETRY_SECONDS = 60  # thử lại sau 60 giây để không phải chờ 15 phút
 ERROR_ONCE_FILE = "/data/error_once_keys.json"
 ENABLE_PAID_GENERATION = True  # chỉ đánh dấu sau khi TXT đủ Part 2+3+4 đã gửi thành công
 
@@ -428,7 +428,7 @@ Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
         try:
             # Lượt bình thường dùng 16k. Nếu lượt trước bị reasoning ăn hết token và content rỗng,
             # retry đúng request đó với 24k; không regenerate các Part đã checkpoint.
-            request_token_budget = 24000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
+            request_token_budget = 18000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
             force_length_retry = False
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -467,7 +467,7 @@ Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
                         force_length_retry = True
                         print(
                             f"[OPENAI] Part {part_number}: content rỗng + finish_reason=length "
-                            f"-> retry riêng với 24000 tokens."
+                            f"-> retry riêng với 18000 tokens."
                         )
                     elif attempt >= OPENAI_PART_RETRIES:
                         # Không dùng lượt dự phòng cho các lỗi khác.
@@ -531,11 +531,11 @@ def _validate_part(text: str, part_number: int):
     if not text or not text.strip():
         return False, "content rỗng"
     words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
-    # Mỗi Part phải nằm khoảng 3500-4000 từ.
+    # Mỗi Part giữ trong khoảng 3500-4000 từ.
     if words < 3500:
-        return False, f"quá ngắn ({words} từ; yêu cầu khoảng 3500-4000 từ)"
+        return False, f"quá ngắn ({words} từ; yêu cầu 3500-4000 từ)"
     if words > 4000:
-        return False, f"quá dài ({words} từ; yêu cầu khoảng 3500-4000 từ)"
+        return False, f"quá dài ({words} từ; yêu cầu 3500-4000 từ)"
     if part_number in (3, 4) and not re.search(rf"(?i)PART\s+{part_number}", text):
         return False, f"thiếu nhãn PART {part_number}"
     return True, f"OK ({words} từ)"
@@ -545,12 +545,12 @@ def _word_count(text: str) -> int:
     return len(re.findall(r"\b[\w’'-]+\b", text or "", flags=re.UNICODE))
 
 
-def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 3700):
+def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 3650):
     """Bổ sung phần còn thiếu thay vì vứt content đã trả tiền và generate lại từ đầu."""
     current_words = _word_count(existing_part)
     need_words = max(250, target_words - current_words)
     # Cho dư nhẹ để model có thể kết thúc tự nhiên, nhưng tránh sinh quá dài/tốn tiền.
-    requested_words = min(max(need_words + 100, 300), 1800)
+    requested_words = min(max(need_words + 100, 300), 1400)
 
     if part_number in (2, 3):
         ending_instruction = f"End with a natural hook or discovery leading into Part {part_number + 1}."
@@ -566,7 +566,7 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Write only about {requested_words} additional words so the COMPLETE part finishes around 3500-4000 words, ideally near 3700 words. Do not intentionally push the complete part beyond 4000 words.
+Continue PART {part_number} from the exact final sentence above. Write only approximately {requested_words} additional words so the COMPLETE part reaches about 3500-4000 words, ideally near 3650 words. Do not intentionally exceed 4000 words.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
 Do NOT add a PART heading, headline, END OF PART line, NEXT PART line, Facebook CTA, like/share request, or commentary.
@@ -582,7 +582,7 @@ Output ONLY the new continuation paragraphs."""
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     # Continuation may need substantial length to guarantee the 3500-word minimum.
-                    "max_completion_tokens": min(OPENAI_MAX_OUTPUT_TOKENS, 12000),
+                    "max_completion_tokens": min(OPENAI_MAX_OUTPUT_TOKENS, 6000),
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
@@ -637,10 +637,10 @@ def generate_valid_part(story_context: str, part_number: int):
 
     # Nếu chưa đủ 3500 từ, tuyệt đối không regenerate toàn bộ.
     # Giữ content và gọi continuation để đạt tối thiểu 3500 từ.
-    continuation_rounds = 4
+    continuation_rounds = 2
     while words < 3500 and continuation_rounds > 0:
         print(f"[OPENAI] Part {part_number} mới có {words} từ -> giữ nguyên và viết bổ sung, KHÔNG regenerate.")
-        extra = call_openai_continue_part(story_context, raw, part_number, target_words=3700)
+        extra = call_openai_continue_part(story_context, raw, part_number, target_words=3650)
         if not extra:
             break
         raw = f"{raw.rstrip()}\n\n{extra.strip()}"
