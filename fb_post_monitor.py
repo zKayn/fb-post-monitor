@@ -70,7 +70,7 @@ Requirements:
 • Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling suitable for a wide audience.
 • Allow supporting characters to have meaningful roles, realistic motivations, and emotional growth.
 • Maintain a warm, family-friendly tone suitable for mainstream publishing platforms and advertising-friendly content standards.
-• Length: approximately 3500-4000 words for this part. Aim for about 3600-3700 words. NEVER finish below 3500 words and avoid exceeding 4000 words.
+• Length: approximately 3500-4000 words for this part. Aim tightly for about 3600-3700 words. NEVER finish below 3500 words. Keep the writing concise and avoid unnecessary expansion beyond 4000 words.
 • Maintain strict consistency in characters, settings, timeline, facts, relationships, and unresolved clues from all story context supplied above.
 • Do NOT repeat scenes or recap large portions unnecessarily. Continue naturally from the exact point where the previous part ended.
 • IMPORTANT: Do NOT write any END OF PART line, NEXT PART line, Facebook CTA, like/share request, or other ending marker. The program will append the correct ending line only after the part has been fully generated.
@@ -531,11 +531,11 @@ def _validate_part(text: str, part_number: int):
     if not text or not text.strip():
         return False, "content rỗng"
     words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
-    # Mỗi Part giữ trong khoảng 3500-4000 từ.
+    # 3500-4000 từ là MỤC TIÊU viết, không phải giới hạn cứng phía trên.
+    # Chỉ thiếu dưới 3500 mới cần bổ sung. Nếu model lỡ viết >4000 thì vẫn giữ
+    # nguyên nội dung và xuất TXT, tuyệt đối không gọi lại chỉ vì quá dài.
     if words < 3500:
-        return False, f"quá ngắn ({words} từ; yêu cầu 3500-4000 từ)"
-    if words > 4000:
-        return False, f"quá dài ({words} từ; yêu cầu 3500-4000 từ)"
+        return False, f"quá ngắn ({words} từ; bắt buộc tối thiểu 3500 từ)"
     if part_number in (3, 4) and not re.search(rf"(?i)PART\s+{part_number}", text):
         return False, f"thiếu nhãn PART {part_number}"
     return True, f"OK ({words} từ)"
@@ -550,7 +550,7 @@ def call_openai_continue_part(story_context: str, existing_part: str, part_numbe
     current_words = _word_count(existing_part)
     need_words = max(250, target_words - current_words)
     # Cho dư nhẹ để model có thể kết thúc tự nhiên, nhưng tránh sinh quá dài/tốn tiền.
-    requested_words = min(max(need_words + 100, 300), 1400)
+    requested_words = min(max(need_words + 75, 250), 1200)
 
     if part_number in (2, 3):
         ending_instruction = f"End with a natural hook or discovery leading into Part {part_number + 1}."
@@ -566,7 +566,7 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Write only approximately {requested_words} additional words so the COMPLETE part reaches about 3500-4000 words, ideally near 3650 words. Do not intentionally exceed 4000 words.
+Continue PART {part_number} from the exact final sentence above. Write only approximately {requested_words} additional words so the COMPLETE part reaches about 3500-4000 words, ideally near 3650 words. Stop promptly once the story is complete; do not add filler.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
 Do NOT add a PART heading, headline, END OF PART line, NEXT PART line, Facebook CTA, like/share request, or commentary.
