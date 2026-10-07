@@ -50,7 +50,7 @@ COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comme
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-luna"
-OPENAI_MAX_OUTPUT_TOKENS = 6000  # cost-control: reasoning=none, đủ cho mục tiêu ~3500-3800 từ nhưng chặn output phình quá lớn
+OPENAI_MAX_OUTPUT_TOKENS = 5000  # cost-control: reasoning=none, mục tiêu 2500-3000 từ/Part
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
@@ -70,7 +70,7 @@ Requirements:
 • Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling suitable for a wide audience.
 • Allow supporting characters to have meaningful roles, realistic motivations, and emotional growth.
 • Maintain a warm, family-friendly tone suitable for mainstream publishing platforms and advertising-friendly content standards.
-• Length: target 3500-3800 words for this part. Aim tightly for about 3550-3650 words. NEVER intentionally exceed 3800 words. NEVER finish below 3500 words. Keep scenes concise; no filler, repeated explanations, recaps, or unnecessary dialogue.
+• Length: target approximately 2500-3000 words for this part. Aim tightly for about 2600-2800 words. NEVER finish below 2500 words. Keep the story concise and naturally complete; avoid filler, repeated explanations, recaps, and unnecessary extra scenes.
 • Maintain strict consistency in characters, settings, timeline, facts, relationships, and unresolved clues from all story context supplied above.
 • Do NOT repeat scenes or recap large portions unnecessarily. Continue naturally from the exact point where the previous part ended.
 • IMPORTANT: Do NOT write any END OF PART line, NEXT PART line, Facebook CTA, like/share request, or other ending marker. The program will append the correct ending line only after the part has been fully generated.
@@ -427,8 +427,8 @@ Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
     for attempt in range(1, total_attempts + 1):
         try:
             # Bình thường dùng trần 6000 và reasoning=none để giảm chi phí/độ trễ.
-            # Chỉ nếu content rỗng + length mới cứu đúng request đó với 8000; checkpoint cũ vẫn giữ.
-            request_token_budget = 8000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
+            # Chỉ nếu content rỗng + length mới cứu đúng request đó với 7000; checkpoint cũ vẫn giữ.
+            request_token_budget = 7000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
             force_length_retry = False
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -468,7 +468,7 @@ Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
                         force_length_retry = True
                         print(
                             f"[OPENAI] Part {part_number}: content rỗng + finish_reason=length "
-                            f"-> retry riêng với 8000 tokens."
+                            f"-> retry riêng với 7000 tokens."
                         )
                     elif attempt >= OPENAI_PART_RETRIES:
                         # Không dùng lượt dự phòng cho các lỗi khác.
@@ -532,10 +532,10 @@ def _validate_part(text: str, part_number: int):
     if not text or not text.strip():
         return False, "content rỗng"
     words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
-    # 3500-3800 là mục tiêu để kiểm soát chi phí. Chỉ <3500 mới là lỗi.
+    # 2500-3000 là mục tiêu để kiểm soát chi phí. Chỉ <2500 mới là lỗi.
     # Nếu model hiếm khi vượt mục tiêu, vẫn giữ và xuất TXT để không vứt nội dung đã trả tiền.
-    if words < 3500:
-        return False, f"quá ngắn ({words} từ; bắt buộc tối thiểu 3500 từ)"
+    if words < 2500:
+        return False, f"quá ngắn ({words} từ; bắt buộc tối thiểu 2500 từ)"
     if part_number in (3, 4) and not re.search(rf"(?i)PART\s+{part_number}", text):
         return False, f"thiếu nhãn PART {part_number}"
     return True, f"OK ({words} từ)"
@@ -545,12 +545,12 @@ def _word_count(text: str) -> int:
     return len(re.findall(r"\b[\w’'-]+\b", text or "", flags=re.UNICODE))
 
 
-def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 3550):
+def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 2650):
     """Bổ sung phần còn thiếu thay vì vứt content đã trả tiền và generate lại từ đầu."""
     current_words = _word_count(existing_part)
-    need_words = max(120, target_words - current_words)
+    need_words = max(100, target_words - current_words)
     # Cho dư nhẹ để model có thể kết thúc tự nhiên, nhưng tránh sinh quá dài/tốn tiền.
-    requested_words = min(max(need_words + 40, 150), 900)
+    requested_words = min(max(need_words + 40, 150), 750)
 
     if part_number in (2, 3):
         ending_instruction = f"End with a natural hook or discovery leading into Part {part_number + 1}."
@@ -566,7 +566,7 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 3500-3700 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
+Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 2500-2900 words, ideally near 2650 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
 Do NOT add a PART heading, headline, END OF PART line, NEXT PART line, Facebook CTA, like/share request, or commentary.
@@ -636,12 +636,12 @@ def generate_valid_part(story_context: str, part_number: int):
     raw = _ensure_part_header(raw, part_number)
     words = _word_count(raw)
 
-    # Nếu chưa đủ 3500 từ, tuyệt đối không regenerate toàn bộ.
-    # Giữ content và gọi continuation để đạt tối thiểu 3500 từ.
+    # Nếu chưa đủ 2500 từ, tuyệt đối không regenerate toàn bộ.
+    # Giữ content và gọi continuation để đạt tối thiểu 2500 từ.
     continuation_rounds = 1
-    while words < 3500 and continuation_rounds > 0:
+    while words < 2500 and continuation_rounds > 0:
         print(f"[OPENAI] Part {part_number} mới có {words} từ -> giữ nguyên và viết bổ sung, KHÔNG regenerate.")
-        extra = call_openai_continue_part(story_context, raw, part_number, target_words=3550)
+        extra = call_openai_continue_part(story_context, raw, part_number, target_words=2650)
         if not extra:
             break
         raw = f"{raw.rstrip()}\n\n{extra.strip()}"
@@ -1489,21 +1489,52 @@ def check_all_pages():
             # Cảnh báo "BÀI ĐANG DỰNG ĐỨNG" độc lập với ngưỡng BÀI ĐANG LÊN
             # và chỉ gửi đúng 1 lần/post nhờ key spike_ được lưu persistent.
             spike_detected = record_and_check_spike(post_id, int(views or 0), datetime.now())
+
             spike_key = f"spike_{page_id}_{post_id}"
+
             if ENABLE_SPIKE_ALERT and spike_detected and spike_key not in already_notified:
-                spike_msg = (
-                    f"🚀 BÀI ĐANG DỰNG ĐỨNG! (Page: {page_name})\n"
-                    f"Views: {views}\n"
-                    f"Comments: {comments}\n"
-                    + (f"Link: {link}\n" if link else "")
-                    + f"Tăng mạnh trong khoảng {SPIKE_LOOKBACK_MINUTES} phút.\n"
-                    + "=> Kiểm tra bài ngay!"
-                )
-                print(f"[SPIKE] [{page_name}] {post_id}: phát hiện tăng dựng đứng -> gửi Telegram.")
-                send_telegram_message(spike_msg)
-                already_notified.add(spike_key)
-                save_notified(already_notified)
-                changed = True
+
+                # Spike cũng phải kiểm tra link TRƯỚC khi báo Telegram.
+
+                spike_link_status = post_already_has_link(post_id, page_id, page_token, message)
+
+                if spike_link_status is True:
+
+                    print(f"[SPIKE-SKIP-LINK] [{page_name}] {post_id}: đang dựng đứng nhưng đã có link -> KHÔNG BÁO.")
+
+                elif spike_link_status is None:
+
+                    print(f"[SPIKE-BLOCKED] [{page_name}] {post_id}: chưa xác minh được link -> KHÔNG BÁO, thử lại vòng sau.")
+
+                    _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
+
+                else:
+
+                    spike_msg = (
+
+                        f"🚀 BÀI ĐANG DỰNG ĐỨNG! (Page: {page_name})\n"
+
+                        f"Views: {views}\n"
+
+                        f"Comments: {comments}\n"
+
+                        + (f"Link: {link}\n" if link else "")
+
+                        + f"Tăng mạnh trong khoảng {SPIKE_LOOKBACK_MINUTES} phút.\n"
+
+                        + "=> Kiểm tra bài ngay!"
+
+                    )
+
+                    print(f"[SPIKE] [{page_name}] {post_id}: dựng đứng + CHƯA có link -> gửi Telegram.")
+
+                    send_telegram_message(spike_msg)
+
+                    already_notified.add(spike_key)
+
+                    save_notified(already_notified)
+
+                    changed = True
 
             if not is_special_page and not meets_threshold(views or 0, comments):
                 continue
