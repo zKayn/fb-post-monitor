@@ -27,6 +27,10 @@ import requests
 import threading
 import queue
 import hashlib
+import html
+from urllib.parse import urlparse
+from io import BytesIO
+import mimetypes
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
@@ -89,6 +93,28 @@ INCLUDE_PAGE_NAMES = []
 # Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng views/comments.
 SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
+
+# TEST xuất bản: CHỈ Page đặc biệt. Mặc định tắt mọi thao tác ghi bên ngoài.
+PUBLISH_TEST_PAGE_ID = "1285539704638198"
+ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "false").lower() == "true"
+ENABLE_FB_COMMENT_TEST = os.getenv("ENABLE_FB_COMMENT_TEST", "false").lower() == "true"
+WEB_BASE_URL = "https://puretales.idolsgift.com"
+WEB_ADMIN_EMAIL = os.getenv("WEB_ADMIN_EMAIL", "")
+WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "")
+# Đường dẫn login tùy cấu hình website; cần xác minh trước khi bật publish.
+WEB_LOGIN_PATH = os.getenv("WEB_LOGIN_PATH", "/login")
+WEB_LOGIN_EMAIL_FIELD = os.getenv("WEB_LOGIN_EMAIL_FIELD", "email")
+WEB_LOGIN_PASSWORD_FIELD = os.getenv("WEB_LOGIN_PASSWORD_FIELD", "password")
+WEB_POST_IMAGE_URL = os.getenv("WEB_POST_IMAGE_URL", "")  # Chỉ fallback khi WEB_ALLOW_IMAGE_FALLBACK=true
+WEB_ALLOW_IMAGE_FALLBACK = os.getenv("WEB_ALLOW_IMAGE_FALLBACK", "false").lower() == "true"
+WEB_IMAGE_MAX_BYTES = 15 * 1024 * 1024
+WEB_POSTS_PUBLIC = os.getenv("WEB_POSTS_PUBLIC", "true").lower() == "true"
+WEB_UPDATE_METHOD = "PUT"
+AUTHOR_CODE = os.getenv("AUTHOR_CODE", "026").strip()
+if not re.fullmatch(r"[0-9A-Za-z_-]{1,16}", AUTHOR_CODE):
+    raise ValueError("AUTHOR_CODE không hợp lệ")
+PUBLISH_APPROVAL_POLL_SECONDS = 8
+
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 THRESHOLD_RULES = [
@@ -812,11 +838,359 @@ def _resume_story(page_name, post_id, caption):
         finally:
             if os.path.exists(path):
                 os.remove(path)
+    if str(post_id).split("_", 1)[0] == PUBLISH_TEST_PAGE_ID and not state.get("approval_notice_sent"):
+        send_telegram_message(
+            f"🧪 TEST Page đặc biệt: đủ TXT Part 2/3/4 cho bài {post_id}.\n"
+            f"Để xuất bản web và (nếu đã bật) bình luận Facebook, gửi:\n/publish {post_id}"
+        )
+        state["approval_notice_sent"] = True
+        _save_progress(post_id, state)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
     print(f"[OPENAI] Bài {post_id}: đã gửi đủ Part 2/3/4, không tạo lại.")
     return True
 
+
+
+# ==================== TEST WEBSITE + FACEBOOK ====================
+# Chỉ sau khi 3 TXT đã hoàn tất, Telegram /publish POST_ID mới cho phép xuất bản.
+# Dùng checkpoint hiện tại: web_posts + fb_comments tách biệt với story_completed.
+
+def _story_title(part2):
+    for line in part2.splitlines():
+        line = line.strip().strip("*# ")
+        if line and not re.fullmatch(r"PART\s+2", line, re.I):
+            return line[:180]
+    return "Story continuation"
+
+
+def _web_part_title(base_title, n):
+    # Không lặp mã định danh ở cuối tiêu đề.
+    title = re.sub(r"\s+" + re.escape(AUTHOR_CODE) + r"$", "", base_title.strip(), flags=re.I)
+    title = re.sub(r"(?i)^PART\s*[234](?:\s*\(THE END\))?\s*[:\-–—]?\s*", "", title).strip()
+    prefix = "PART 4 (THE END): " if n == 4 else f"PART {n}: "
+    return f"{prefix}{title} {AUTHOR_CODE}"
+
+
+def _story_body(raw, part):
+    raw = _strip_program_endings(raw)
+    raw = re.sub(r"(?im)^\s*PART\s+%d(?:\s*\(THE END\))?\s*$" % part, "", raw).strip()
+    if part == 2:
+        lines = raw.splitlines()
+        if lines:
+            raw = "\n".join(lines[1:]).strip()
+    return raw
+
+
+def _to_html(body, navigation=None):
+    paragraphs = re.split(r"\n\s*\n", body.strip())
+    content = "\n".join("<p>" + html.escape(p).replace("\n", "<br>") + "</p>" for p in paragraphs if p.strip())
+    if navigation:
+        content += '<hr><nav aria-label="Story chapters">' + " | ".join(
+            '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
+            for label, url in navigation
+        ) + '</nav>'
+    return content
+
+
+def _web_login():
+    """Đăng nhập bằng Laravel session và CSRF; kiểm tra API /me trước khi ghi."""
+    if not WEB_ADMIN_EMAIL or not WEB_ADMIN_PASSWORD:
+        raise RuntimeError("Thiếu WEB_ADMIN_EMAIL hoặc WEB_ADMIN_PASSWORD")
+    session = requests.Session()
+    login_url = WEB_BASE_URL + WEB_LOGIN_PATH
+    r = session.get(login_url, timeout=25)
+    r.raise_for_status()
+    patterns = (
+        r'<input[^>]*name=["\']_token["\'][^>]*value=["\']([^"\']+)',
+        r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)',
+    )
+    token = next((html.unescape(m.group(1)) for pattern in patterns if (m := re.search(pattern, r.text, re.I))), None)
+    if not token:
+        raise RuntimeError("Không tìm thấy CSRF trong form đăng nhập")
+    form = {"email": WEB_ADMIN_EMAIL, "password": WEB_ADMIN_PASSWORD, "_token": token}
+    result = session.post(login_url, data=form, headers={"Referer": login_url}, timeout=25, allow_redirects=False)
+    if result.status_code not in (302, 303):
+        raise RuntimeError(f"Đăng nhập không trả redirect hợp lệ: HTTP {result.status_code}")
+    redirect = result.headers.get("Location", "")
+    if "dashboard" not in redirect and "admin" not in redirect:
+        raise RuntimeError("Đăng nhập không chuyển đến Admin; có thể sai thông tin")
+    session.headers.update({"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
+    # Laravel session thường xoay CSRF token sau login: lấy token mới ở trang admin.
+    dashboard = session.get(WEB_BASE_URL + "/admin/dashboard", timeout=25)
+    dashboard.raise_for_status()
+    fresh = re.search(r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)', dashboard.text, re.I)
+    if fresh:
+        token = html.unescape(fresh.group(1))
+    session.headers["X-CSRF-TOKEN"] = token
+    # Cookie XSRF-TOKEN tự động được requests gửi kèm.
+    xsrf = session.cookies.get("XSRF-TOKEN")
+    if xsrf:
+        from urllib.parse import unquote
+        session.headers["X-XSRF-TOKEN"] = unquote(xsrf)
+    me = session.get(WEB_BASE_URL + "/admin/api/v1/me", timeout=25)
+    if me.status_code != 200:
+        raise RuntimeError(f"Không xác minh được phiên Admin qua /me: HTTP {me.status_code}")
+    try:
+        info = me.json()
+    except ValueError:
+        raise RuntimeError("API /me không trả JSON")
+    if not info:
+        raise RuntimeError("API /me trả dữ liệu rỗng")
+    return session
+
+
+def _facebook_original_image(post_id, page_token):
+    """Tìm ảnh gốc của post, không sử dụng ảnh thumbnail nếu có bản full."""
+    response = requests.get(f"{GRAPH_URL}/{post_id}", params={
+        "fields": "full_picture,attachments{type,media,subattachments{media,type}}",
+        "access_token": page_token,
+    }, timeout=30)
+    response.raise_for_status()
+    obj = response.json()
+    if obj.get("error"):
+        raise RuntimeError("Facebook không cấp quyền đọc ảnh bài gốc")
+    attachments = ((obj.get("attachments") or {}).get("data") or [])
+    candidates = []
+    for att in attachments:
+        candidates.append(((att.get("media") or {}).get("image") or {}).get("src"))
+        for sub in ((att.get("subattachments") or {}).get("data") or []):
+            candidates.append(((sub.get("media") or {}).get("image") or {}).get("src"))
+    candidates.append(obj.get("full_picture"))
+    return next((u for u in candidates if isinstance(u, str) and u.startswith("https://")), None)
+
+
+def _download_facebook_image(image_url):
+    """Giới hạn domain và dung lượng, tránh truy cập URL tùy ý."""
+    host = (urlparse(image_url).hostname or "").lower()
+    if not (host == "fbcdn.net" or host.endswith(".fbcdn.net") or
+            host == "fbsbx.com" or host.endswith(".fbsbx.com")):
+        raise RuntimeError("URL ảnh Facebook không thuộc miền CDN được phép")
+    with requests.get(image_url, timeout=50, stream=True, allow_redirects=False) as response:
+        response.raise_for_status()
+        chunks, size = [], 0
+        for chunk in response.iter_content(128 * 1024):
+            size += len(chunk)
+            if size > WEB_IMAGE_MAX_BYTES:
+                raise RuntimeError("Ảnh Facebook vượt giới hạn 15MB")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return raw, "image/png", "png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return raw, "image/jpeg", "jpg"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return raw, "image/webp", "webp"
+    raise RuntimeError("Không nhận diện được ảnh PNG/JPEG/WebP từ Facebook")
+
+
+def _web_upload_featured_image(session, post_id, page_token):
+    image_url = _facebook_original_image(post_id, page_token)
+    if not image_url:
+        if WEB_ALLOW_IMAGE_FALLBACK and WEB_POST_IMAGE_URL.startswith("https://"):
+            return WEB_POST_IMAGE_URL
+        raise RuntimeError("Không lấy được ảnh gốc Facebook; dừng đăng web")
+    raw, content_type, ext = _download_facebook_image(image_url)
+    payload = {"fileName": f"fb_{post_id.replace('_', '-')}.{ext}",
+               "contentType": content_type, "size": len(raw),
+               "auditContext": {"record_type": "Post", "action_label": "upload_featured_image"}}
+    resp = session.post(WEB_BASE_URL + "/admin/api/v1/uploads/presigned-image-url",
+        json=payload, headers={"Origin": WEB_BASE_URL,
+                               "Referer": WEB_BASE_URL + "/admin/posts/new"}, timeout=40)
+    resp.raise_for_status()
+    data = (resp.json().get("data") or {})
+    upload = data.get("upload") or {}
+    signed_url, public_url = upload.get("url"), data.get("fileUrl")
+    if upload.get("method") != "PUT" or not signed_url or not public_url:
+        raise RuntimeError("API cấp URL upload thiếu upload.url/fileUrl")
+    signed_host = (urlparse(signed_url).hostname or "").lower()
+    public_host = (urlparse(public_url).hostname or "").lower()
+    if not (signed_host.endswith(".r2.cloudflarestorage.com") and
+            public_host == "blog.igallery.blog" and
+            urlparse(signed_url).scheme == urlparse(public_url).scheme == "https"):
+        raise RuntimeError("API trả URL ảnh ngoài domain lưu trữ dự kiến")
+    headers = dict(upload.get("headers") or {})
+    headers["Content-Type"] = content_type
+    # requests tự xác định Content-Length khớp bytes; không chuyển Cookie admin lên R2.
+    headers.pop("Content-Length", None)
+    put = requests.put(signed_url, data=raw, headers=headers, timeout=100)
+    if put.status_code not in (200, 201, 204):
+        raise RuntimeError(f"R2 upload ảnh thất bại HTTP {put.status_code}")
+    return public_url
+
+
+def _web_create_post(session, title, body_html, image_url, slug=""):
+    payload = {
+        "title": title, "slug": slug, "description": body_html,
+        "image": image_url, "is_active": WEB_POSTS_PUBLIC,
+        "is_home": False, "is_top": False, "next_chapter": "", "prev_chapter": "",
+        "selected_categories": [], "selected_tags": [],
+        "seo_description": "", "seo_keywords": "", "seo_title": "", "series_id": None,
+    }
+    response = session.post(WEB_BASE_URL + "/admin/api/v1/posts", json=payload, timeout=45,
+                            headers={"Origin": WEB_BASE_URL, "Referer": WEB_BASE_URL + "/admin/posts/new"})
+    if response.status_code != 201:
+        raise RuntimeError(f"Website HTTP {response.status_code}: {response.text[:250]}")
+    data = response.json()
+    if data.get("ok") is not True:
+        raise RuntimeError("Website không xác nhận ok=true")
+    record = data.get("data") or {}
+    link = record.get("public_url") or record.get("permalink")
+    parsed = urlparse(link or "")
+    if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
+        raise RuntimeError("Website trả về public_url không hợp lệ")
+    return {"url": link, "id": record.get("id"), "slug": record.get("slug")}
+
+
+def _fb_post_comment(post_id, page_token, text):
+    # KHÔNG dùng HTTP_SESSION: session toàn cục retry POST có thể tạo comment trùng.
+    response = requests.post(f"{GRAPH_URL}/{post_id}/comments", data={"message": text, "access_token": page_token}, timeout=40)
+    data = response.json()
+    if response.status_code != 200 or not data.get("id"):
+        raise RuntimeError("Facebook comment thất bại: " + str(data.get("error", {}).get("message", response.status_code)))
+    return str(data["id"])
+
+
+def _intro_lines(part2, count=6):
+    body = _story_body(part2, 2)
+    return [line.strip() for line in body.splitlines() if line.strip()][:count]
+
+
+def _web_update_chapter(session, post_record, title, description, image_url, prev_slug="", next_slug=""):
+    """PUT đúng payload đã quan sát trong DevTools, với slug chương liền kề."""
+    post_id = post_record.get("id")
+    if not post_id or not post_record.get("slug"):
+        raise RuntimeError("Thiếu id/slug của bài web")
+    payload = {"title": title, "slug": post_record["slug"], "description": description,
+               "is_active": WEB_POSTS_PUBLIC, "is_home": False, "is_top": False,
+               "image": image_url, "selected_categories": [], "selected_tags": [],
+               "seo_description": None, "seo_keywords": None, "seo_title": None, "series_id": None,
+               "next_chapter": next_slug, "prev_chapter": prev_slug, "version": "1"}
+    response = session.put(f"{WEB_BASE_URL}/admin/api/v1/posts/{post_id}", json=payload,
+        headers={"Origin": WEB_BASE_URL, "Referer": f"{WEB_BASE_URL}/admin/posts/{post_id}/edit"}, timeout=45)
+    if response.status_code != 200:
+        raise RuntimeError(f"Không cập nhật được liên kết chương: HTTP {response.status_code}: {response.text[:200]}")
+    result = response.json()
+    if result.get("ok") is not True:
+        raise RuntimeError("API sửa bài không xác nhận ok=true")
+
+
+def publish_approved_story(post_id):
+    post_id = str(post_id).strip()
+    if not re.fullmatch(r"\d+_\d+", post_id):
+        raise ValueError("POST_ID phải có dạng PAGEID_POSTID")
+    if post_id.split("_", 1)[0] != PUBLISH_TEST_PAGE_ID:
+        raise ValueError("TEST chỉ cho phép Page đặc biệt")
+    state = _load_progress(post_id)
+    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
+        raise RuntimeError("Chưa đủ 3 TXT gửi Telegram; không xuất bản")
+    if not ENABLE_WEB_PUBLISH_TEST:
+        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false; không có bài nào được đăng")
+    web = state.setdefault("web_posts", {})
+    parts = state["parts"]
+    base_title = _story_title(parts["2"])
+    # Xuất bản theo thứ tự ngược: Part 4 -> 3 -> 2 để next-link luôn tồn tại.
+    # Link quay lại phần trước cần API edit; khi chưa xác minh API edit,
+    # không tạo liên kết giả. Telegram sẽ cảnh báo để cập nhật thủ công.
+    session = _web_login()
+    image_url = state.get("web_featured_image")
+    if web and not image_url:
+        raise RuntimeError("Checkpoint web cũ thiếu ảnh gốc; không tiếp tục để tránh sai ảnh")
+    if not image_url:
+        pages = get_managed_pages()
+        page = next((p for p in pages if str(p.get("id")) == PUBLISH_TEST_PAGE_ID), None)
+        if not page or not page.get("access_token"):
+            raise RuntimeError("Không có Page token để lấy ảnh Facebook gốc")
+        image_url = _web_upload_featured_image(session, post_id, page["access_token"])
+        state["web_featured_image"] = image_url
+        _save_progress(post_id, state)
+        send_telegram_message("🖼 Đã upload ảnh gốc Facebook lên website; dùng chung cho Part 2/3/4.")
+    for n in (4, 3, 2):
+        key = str(n)
+        if web.get(key, {}).get("url"):
+            continue
+        nav = [(f"READ PART {n+1}", web[str(n+1)]["url"])] if n < 4 and web.get(str(n+1), {}).get("url") else []
+        title = _web_part_title(base_title, n)
+        body = _to_html(_story_body(parts[key], n), nav)
+        result = _web_create_post(session, title, body, image_url)
+        web[key] = result
+        _save_progress(post_id, state)
+        send_telegram_message(f"🌐 Đã đăng Part {n}: {result['url']}")
+    # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4.
+    # Không đăng bình luận Facebook nếu API sửa bài chưa được xác nhận thành công.
+    linked = state.setdefault("web_linked", [])
+    for n in (2, 3, 4):
+        if n in linked:
+            continue
+        nav = []
+        if n > 2:
+            nav.append((f"PREVIOUS: PART {n-1}", web[str(n-1)]["url"]))
+        if n < 4:
+            nav.append((f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
+        _web_update_chapter(session, web[str(n)], _web_part_title(base_title, n),
+                            _to_html(_story_body(parts[str(n)], n), nav), image_url,
+                            prev_slug=web[str(n-1)]["slug"] if n > 2 else "",
+                            next_slug=web[str(n+1)]["slug"] if n < 4 else "")
+        linked.append(n)
+        _save_progress(post_id, state)
+    if not ENABLE_FB_COMMENT_TEST:
+        send_telegram_message("⚠️ Chưa bình luận Facebook: ENABLE_FB_COMMENT_TEST=false. Web đã đăng và nối Part 2/3/4.")
+        return
+    pages = get_managed_pages()
+    page = next((p for p in pages if str(p.get("id")) == PUBLISH_TEST_PAGE_ID), None)
+    if not page or not page.get("access_token"):
+        raise RuntimeError("Không lấy được Page access token để bình luận")
+    comments = state.setdefault("fb_comments", {})
+    messages = {
+        "2": "PART 2:\n" + "\n".join(_intro_lines(parts["2"])) + "\n\nREAD FULL PART 2: " + web["2"]["url"],
+        "3": "READ FULL PART 3: " + web["3"]["url"],
+    }
+    for n in ("2", "3"):
+        if comments.get(n) == "attempted":
+            raise RuntimeError(f"Comment PART {n} chưa rõ kết quả; kiểm tra Facebook trước khi thử lại")
+        if comments.get(n):
+            continue
+        # Nếu mạng mất ngay sau khi Facebook đã tạo comment nhưng trước checkpoint,
+        # không tự retry; kiểm tra comment Page thủ công trước khi gửi lại lệnh.
+        comments[n] = "attempted"
+        _save_progress(post_id, state)
+        comment_id = _fb_post_comment(post_id, page["access_token"], messages[n])
+        comments[n] = comment_id
+        _save_progress(post_id, state)
+        send_telegram_message(f"💬 Đã bình luận PART {n} vào Facebook: {comment_id}")
+
+
+def publish_command_worker():
+    """Chỉ nhận /publish PAGEID_POSTID từ TELEGRAM_CHAT_ID; không tự đăng khi tạo TXT."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    offset = None
+    while True:
+        try:
+            args = {"timeout": 20, "allowed_updates": json.dumps(["message"])}
+            if offset is not None:
+                args["offset"] = offset
+            response = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=args, timeout=30)
+            data = response.json()
+            if not data.get("ok"):
+                raise RuntimeError(str(data.get("description", "Telegram getUpdates failed")))
+            for update in data.get("result", []):
+                offset = int(update["update_id"]) + 1
+                msg = update.get("message") or {}
+                if str((msg.get("chat") or {}).get("id")) != str(TELEGRAM_CHAT_ID):
+                    continue
+                content = (msg.get("text") or "").strip()
+                match = re.fullmatch(r"/publish(?:@\w+)?\s+(\d+_\d+)", content, re.I)
+                if match:
+                    pid = match.group(1)
+                    try:
+                        publish_approved_story(pid)
+                        send_telegram_message(f"✅ Đã hoàn thành lệnh /publish {pid} (xem trạng thái web/FB ở trên).")
+                    except Exception as exc:
+                        send_telegram_message(f"⚠️ /publish {pid} chưa hoàn tất: {str(exc)[:700]}")
+        except Exception as exc:
+            print(f"[PUBLISH-TEST] Telegram polling: {exc}")
+            time.sleep(PUBLISH_APPROVAL_POLL_SECONDS)
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
     if not ENABLE_STORY_CONTINUATION or not ENABLE_PAID_GENERATION or not caption.strip():
@@ -1665,6 +2039,8 @@ def check_all_pages():
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
     threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
+    if ENABLE_WEB_PUBLISH_TEST:
+        threading.Thread(target=publish_command_worker, name="publish-approval", daemon=True).start()
     while True:
         scan_started = time.monotonic()
         try:
