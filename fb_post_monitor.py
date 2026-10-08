@@ -1160,11 +1160,37 @@ def publish_approved_story(post_id):
         send_telegram_message(f"💬 Đã bình luận PART {n} vào Facebook: {comment_id}")
 
 
+def _prepare_telegram_publish_polling():
+    """Switch this bot from webhook to polling without discarding pending commands."""
+    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    response = requests.get(base + "/getWebhookInfo", timeout=20)
+    response.raise_for_status()
+    info = response.json()
+    if not info.get("ok"):
+        raise RuntimeError("Không kiểm tra được Telegram webhook")
+    if (info.get("result") or {}).get("url"):
+        print("[PUBLISH-TEST] Telegram webhook đang bật; chuyển sang polling, giữ các update đang chờ.")
+        result = requests.post(base + "/deleteWebhook", data={"drop_pending_updates": "false"}, timeout=25)
+        result.raise_for_status()
+        if not result.json().get("ok"):
+            raise RuntimeError("Telegram không xác nhận deleteWebhook")
+    print("[PUBLISH-TEST] Telegram polling sẵn sàng nhận /publish.")
+
+
 def publish_command_worker():
     """Chỉ nhận /publish PAGEID_POSTID từ TELEGRAM_CHAT_ID; không tự đăng khi tạo TXT."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     offset = None
+    # Chỉ chuyển webhook khi tính năng publish test được bật; không xóa update cũ.
+    # Nếu bot token còn được dùng bởi dịch vụ khác, cần chuyển dịch vụ đó sang polling chung.
+    while True:
+        try:
+            _prepare_telegram_publish_polling()
+            break
+        except Exception as exc:
+            print(f"[PUBLISH-TEST] Chưa thể khởi tạo polling: {exc}")
+            time.sleep(30)
     while True:
         try:
             args = {"timeout": 20, "allowed_updates": json.dumps(["message"])}
