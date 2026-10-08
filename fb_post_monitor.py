@@ -167,7 +167,36 @@ THRESHOLD_RULES = [
 COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
-ONLY_POSTS_NEWER_THAN_HOURS = 72
+ONLY_POSTS_NEWER_THAN_HOURS = 72  # Giới hạn phụ để giảm số lần gọi API
+# Mốc kích hoạt chung: chỉ xét bài được đăng SAU lần bật tính năng này.
+# Bắt buộc gắn Railway Volume vào /data để không reset khi redeploy.
+NEW_POST_CUTOFF_FILE = "/data/new_posts_since_utc.json"
+
+
+def _load_or_create_new_post_cutoff():
+    from pathlib import Path
+    path = Path(NEW_POST_CUTOFF_FILE)
+    if path.exists():
+        with path.open(encoding="utf-8") as f:
+            payload = json.load(f)
+        stamp = datetime.fromisoformat(payload["since_utc"].replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError("Mốc lọc bài mới phải có timezone UTC")
+        return stamp.astimezone(timezone.utc)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc)
+    temp = path.with_name(path.name + ".tmp")
+    with temp.open("w", encoding="utf-8") as f:
+        json.dump({"since_utc": stamp.isoformat()}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+    print(f"[NEW-POSTS] Đã thiết lập mốc bắt đầu: {stamp.isoformat()}; bỏ qua bài đăng trước mốc.")
+    return stamp
+
+
+NEW_POSTS_SINCE_UTC = _load_or_create_new_post_cutoff()
+
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
 # Railway Variable: ENABLE_SPIKE_ALERT=true để BẬT, false để TẮT.
@@ -1520,7 +1549,7 @@ def get_recent_post_ids(page_id: str, page_token: str):
     """Đọc nhiều trang /posts thay vì chỉ 25 bài đầu; không đánh dấu thiếu dữ liệu là đã xử lý."""
     url = f"{GRAPH_URL}/{page_id}/posts"
     params = {"fields": "id,created_time", "limit": POSTS_PAGE_LIMIT, "access_token": page_token}
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)
+    cutoff = max(NEW_POSTS_SINCE_UTC, datetime.now(timezone.utc) - timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS))
     found, seen = [], set()
     for page_no in range(POSTS_MAX_PAGES):
         try:
@@ -1860,8 +1889,8 @@ def story_worker():
                     verify = api_get(f"{GRAPH_URL}/{post_id}", params={"fields": "created_time", "access_token": page_token}).json()
                     published = datetime.strptime(verify["created_time"], "%Y-%m-%dT%H:%M:%S%z")
                     age = datetime.now(timezone.utc) - published
-                    if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
-                        print(f"[COST GUARD] {post_id}: ngoài giới hạn {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
+                    if not (published >= NEW_POSTS_SINCE_UTC and timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
+                        print(f"[COST GUARD] {post_id}: bài cũ hơn mốc khởi động hoặc ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
                         continue
                 except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
