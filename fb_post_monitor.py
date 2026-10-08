@@ -132,13 +132,14 @@ def _page_number(page_name, page_id):
 
 
 # --- Page đặc biệt ---
-# US Stories 2: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng views/comments.
-SPECIAL_INSTANT_PAGE_IDS = {"1142075882324270"}
+# Little Girl (bản code ổn định): bài MỚI được tạo TXT ngay, không cần đạt ngưỡng.
+SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
 # Website: /publish cho 15 Page có mã. Mặc định tắt mọi thao tác ghi bên ngoài.
-PUBLISH_TEST_PAGE_ID = "1142075882324270"  # Chỉ dùng cho thông báo Page đặc biệt; không giới hạn /publish
-ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "false").lower() == "true"
+PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
+ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
+ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
 WEB_BASE_URL = "https://puretales.idolsgift.com"
 WEB_ADMIN_EMAIL = os.getenv("WEB_ADMIN_EMAIL", "")
 WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "")
@@ -166,36 +167,11 @@ THRESHOLD_RULES = [
 ]
 COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, không cần xét views
 
-# Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
-ONLY_POSTS_NEWER_THAN_HOURS = 72  # Giới hạn phụ để giảm số lần gọi API
-# Mốc kích hoạt chung: chỉ xét bài được đăng SAU lần bật tính năng này.
-# Bắt buộc gắn Railway Volume vào /data để không reset khi redeploy.
-NEW_POST_CUTOFF_FILE = "/data/new_posts_since_utc.json"
-
-
-def _load_or_create_new_post_cutoff():
-    from pathlib import Path
-    path = Path(NEW_POST_CUTOFF_FILE)
-    if path.exists():
-        with path.open(encoding="utf-8") as f:
-            payload = json.load(f)
-        stamp = datetime.fromisoformat(payload["since_utc"].replace("Z", "+00:00"))
-        if stamp.tzinfo is None:
-            raise ValueError("Mốc lọc bài mới phải có timezone UTC")
-        return stamp.astimezone(timezone.utc)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc)
-    temp = path.with_name(path.name + ".tmp")
-    with temp.open("w", encoding="utf-8") as f:
-        json.dump({"since_utc": stamp.isoformat()}, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp, path)
-    print(f"[NEW-POSTS] Đã thiết lập mốc bắt đầu: {stamp.isoformat()}; bỏ qua bài đăng trước mốc.")
-    return stamp
-
-
-NEW_POSTS_SINCE_UTC = _load_or_create_new_post_cutoff()
+# Theo dõi MỌI bài trong cửa sổ N giờ tính từ thời điểm quét.
+# Không dùng mốc khởi động/redeploy: bài đăng trước lúc bật bot vẫn được xét.
+ONLY_POSTS_NEWER_THAN_HOURS = int(os.getenv("ONLY_POSTS_NEWER_THAN_HOURS", "72"))
+if ONLY_POSTS_NEWER_THAN_HOURS <= 0:
+    raise ValueError("ONLY_POSTS_NEWER_THAN_HOURS phải lớn hơn 0")
 
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
@@ -872,7 +848,7 @@ def _normalized_caption(caption):
 
 
 def _cache_key(caption):
-    return hashlib.sha256(_normalized_caption(caption).encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps({"caption": _normalized_caption(caption), "model": OPENAI_MODEL, "rules": STORY_WRITING_RULES, "v": 2}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _cache_path(caption):
@@ -984,13 +960,10 @@ def _resume_story(page_name, post_id, caption):
         finally:
             if os.path.exists(path):
                 os.remove(path)
-    if not state.get("approval_notice_sent"):
-        send_telegram_message(
-            f"📚 Đã đủ TXT Part 2/3/4 cho bài {post_id}.\n"
-            f"Để xuất bản website, gửi:\n/publish {post_id}"
-        )
-        state["approval_notice_sent"] = True
-        _save_progress(post_id, state)
+    # Chỉ những bài được worker xác nhận mới sau mốc kích hoạt mới tự xuất bản.
+    # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
+    if state.get("auto_publish_eligible") and ENABLE_AUTO_WEB_PUBLISH:
+        _auto_publish_with_retry(post_id)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
     print(f"[OPENAI] Bài {post_id}: đã gửi đủ Part 2/3/4, không tạo lại.")
@@ -1279,6 +1252,60 @@ def publish_approved_story(post_id):
     send_telegram_message("✅ Website đã đăng và liên kết Part 2/3/4. Không bình luận Facebook.")
 
 
+
+AUTO_PUBLISH_RETRY_SECONDS = int(os.getenv("AUTO_PUBLISH_RETRY_SECONDS", "300"))
+_AUTO_PUBLISH_LOCK = threading.RLock()
+
+
+def _auto_publish_with_retry(post_id):
+    """Publish after 3 TXT; retry later from persistent state, never recreate saved chapters."""
+    if not (ENABLE_AUTO_WEB_PUBLISH and ENABLE_WEB_PUBLISH_TEST):
+        return False
+    with _AUTO_PUBLISH_LOCK:
+        state = _load_progress(post_id)
+        if not state.get("auto_publish_eligible"):
+            return False
+        if state.get("web_publish_complete"):
+            return True
+        if time.time() < float(state.get("web_retry_after", 0)):
+            return False
+        if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)):
+            return False
+        if not all(n in state.get("sent", []) for n in (2, 3, 4)):
+            return False
+        try:
+            publish_approved_story(post_id)
+            state = _load_progress(post_id)
+            state["web_publish_complete"] = True
+            state.pop("web_retry_after", None)
+            _save_progress(post_id, state)
+            return True
+        except Exception as exc:
+            state = _load_progress(post_id)
+            state["web_retry_after"] = time.time() + AUTO_PUBLISH_RETRY_SECONDS
+            state["web_last_error"] = str(exc)[:800]
+            _save_progress(post_id, state)
+            print(f"[AUTO-WEB] {post_id}: {exc}; retry in {AUTO_PUBLISH_RETRY_SECONDS}s")
+            send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; các Part đã đăng được lưu checkpoint.")
+            return False
+
+
+def auto_publish_recovery_worker():
+    """Only recover explicitly eligible NEW posts; old stories never auto-publish."""
+    while True:
+        try:
+            if ENABLE_AUTO_WEB_PUBLISH and ENABLE_WEB_PUBLISH_TEST and os.path.isdir(STORY_PROGRESS_DIR):
+                for filename in os.listdir(STORY_PROGRESS_DIR):
+                    if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
+                        continue
+                    post_id = filename[:-5]
+                    state = _load_progress(post_id)
+                    if state.get("auto_publish_eligible") and not state.get("web_publish_complete"):
+                        _auto_publish_with_retry(post_id)
+        except Exception as exc:
+            print(f"[AUTO-WEB-RECOVERY] {exc}")
+        time.sleep(60)
+
 def _prepare_telegram_publish_polling():
     """Switch this bot from webhook to polling without discarding pending commands."""
     base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -1549,7 +1576,7 @@ def get_recent_post_ids(page_id: str, page_token: str):
     """Đọc nhiều trang /posts thay vì chỉ 25 bài đầu; không đánh dấu thiếu dữ liệu là đã xử lý."""
     url = f"{GRAPH_URL}/{page_id}/posts"
     params = {"fields": "id,created_time", "limit": POSTS_PAGE_LIMIT, "access_token": page_token}
-    cutoff = max(NEW_POSTS_SINCE_UTC, datetime.now(timezone.utc) - timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)
     found, seen = [], set()
     for page_no in range(POSTS_MAX_PAGES):
         try:
@@ -1889,12 +1916,19 @@ def story_worker():
                     verify = api_get(f"{GRAPH_URL}/{post_id}", params={"fields": "created_time", "access_token": page_token}).json()
                     published = datetime.strptime(verify["created_time"], "%Y-%m-%dT%H:%M:%S%z")
                     age = datetime.now(timezone.utc) - published
-                    if not (published >= NEW_POSTS_SINCE_UTC and timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
-                        print(f"[COST GUARD] {post_id}: bài cũ hơn mốc khởi động hoặc ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
+                    if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
+                        print(f"[COST GUARD] {post_id}: bài nằm ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ gần nhất; bỏ qua.")
                         continue
                 except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
                     continue
+                # Đã xác nhận bài mới theo thời gian Facebook: đánh dấu đủ điều kiện auto-web.
+                # Lưu trước khi gọi OpenAI để retry/redeploy không mất quyền xử lý.
+                state = _load_progress(post_id)
+                if not state.get("auto_publish_eligible"):
+                    state["auto_publish_eligible"] = True
+                    state["page_name"] = page_name
+                    _save_progress(post_id, state)
                 if notified_key not in already_notified:
                     print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN.")
                     send_telegram_message(alert_text)
@@ -1939,7 +1973,7 @@ def check_all_pages():
         page_token = page["access_token"]
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
-        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS
+        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS or str(page_name).strip().casefold() == "little girl"
 
         # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
         # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
@@ -2058,7 +2092,7 @@ def check_all_pages():
             if not is_special_page and not meets_threshold(views or 0, comments):
                 continue
 
-            # Riêng US Stories 2: bài mới đi tiếp ngay, không xét views/comments.
+            # Riêng Little Girl: bài trong cửa sổ thời gian đi tiếp ngay, không xét views/comments.
             qualified_reasons = []
             if is_special_page:
                 qualified_reasons.append("SPECIAL_PAGE_NEW_POST")
@@ -2184,8 +2218,8 @@ def check_all_pages():
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
     threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
-    if ENABLE_WEB_PUBLISH_TEST:
-        threading.Thread(target=publish_command_worker, name="publish-approval", daemon=True).start()
+    if ENABLE_WEB_PUBLISH_TEST and ENABLE_AUTO_WEB_PUBLISH:
+        threading.Thread(target=auto_publish_recovery_worker, name="auto-web-recovery", daemon=True).start()
     while True:
         scan_started = time.monotonic()
         try:
