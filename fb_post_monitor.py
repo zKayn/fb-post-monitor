@@ -89,15 +89,56 @@ PART_ENDINGS = {
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
 
+# Mã Page do chủ Page quy định (KHÔNG phải Facebook Page ID).
+PAGE_NUMBER_BY_NAME = {
+    "Story Vault": 1,
+    "Warm Stories": 2,
+    "Echo Stories": 3,
+    "Stories Universe": 4,
+    "Next Story": 5,
+    "Epic Stories": 6,
+    "Heartbreak Diaries": 7,
+    "US Stories 2": 8,
+    "Rainy Stories": 9,
+    "Velvet Dynasty": 10,
+    "Little Boy": 11,
+    "Soul Garden": 12,
+    "True Fireside": 13,
+    "Dena Hartmanext": 14,
+    "Little Girl": 15,
+}
+PAGE_NUMBER_BY_PROFILE_ID = {
+    "61590490184233": 1, "61590431019513": 2,
+    "61589838020143": 3, "61589076507357": 4,
+    "61591856275808": 5, "61590840651745": 6,
+    "61589209621700": 7, "61590495543078": 8,
+    "61589897181314": 9, "61589270882934": 10,
+    "61592823142405": 11, "61592934357052": 12,
+    "61592776354916": 13, "61593873274389": 14,
+    "61591782185355": 15,
+}
+
+
+def _page_number(page_name, page_id):
+    # Graph API Page ID có thể khác profile.php?id=... trong trình duyệt.
+    normalized = re.sub(r"\s+", " ", str(page_name or "")).strip().casefold()
+    for name, number in PAGE_NUMBER_BY_NAME.items():
+        if name.casefold() == normalized:
+            return number
+    number = PAGE_NUMBER_BY_PROFILE_ID.get(str(page_id))
+    if number:
+        return number
+    raise ValueError(f"Chưa gán mã số cho Page {page_name!r} ({page_id}); không đăng sai tiêu đề")
+
+
 # --- Page đặc biệt ---
-# Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng views/comments.
-SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}
+# US Stories 2: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng views/comments.
+SPECIAL_INSTANT_PAGE_IDS = {"1142075882324270"}
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
-# TEST xuất bản: CHỈ Page đặc biệt. Mặc định tắt mọi thao tác ghi bên ngoài.
-PUBLISH_TEST_PAGE_ID = "1285539704638198"
+# Website: /publish cho 15 Page có mã. Mặc định tắt mọi thao tác ghi bên ngoài.
+PUBLISH_TEST_PAGE_ID = "1142075882324270"  # Chỉ dùng cho thông báo Page đặc biệt; không giới hạn /publish
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "false").lower() == "true"
-ENABLE_FB_COMMENT_TEST = os.getenv("ENABLE_FB_COMMENT_TEST", "false").lower() == "true"
 WEB_BASE_URL = "https://puretales.idolsgift.com"
 WEB_ADMIN_EMAIL = os.getenv("WEB_ADMIN_EMAIL", "")
 WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "")
@@ -114,6 +155,8 @@ AUTHOR_CODE = os.getenv("AUTHOR_CODE", "026").strip()
 if not re.fullmatch(r"[0-9A-Za-z_-]{1,16}", AUTHOR_CODE):
     raise ValueError("AUTHOR_CODE không hợp lệ")
 PUBLISH_APPROVAL_POLL_SECONDS = 8
+ENABLE_STORY_CACHE = os.getenv("ENABLE_STORY_CACHE", "true").lower() == "true"
+STORY_CACHE_DIR = "/data/story_cache"
 
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
@@ -793,6 +836,68 @@ def _retry_due(post_id):
     return time.time() >= float(state.get("retry_after", 0))
 
 
+def _normalized_caption(caption):
+    """Chỉ loại khác biệt Unicode và khoảng trắng; không ghép truyện gần giống."""
+    import unicodedata
+    return " ".join(unicodedata.normalize("NFC", caption).split())
+
+
+def _cache_key(caption):
+    return hashlib.sha256(_normalized_caption(caption).encode("utf-8")).hexdigest()
+
+
+def _cache_path(caption):
+    return os.path.join(STORY_CACHE_DIR, _cache_key(caption) + ".json")
+
+
+def _valid_cached_parts(parts):
+    return isinstance(parts, dict) and all(
+        isinstance(parts.get(str(n)), str) and _validate_part(parts[str(n)], n)[0]
+        for n in (2, 3, 4)
+    )
+
+
+def _cache_read(caption):
+    if not ENABLE_STORY_CACHE:
+        return None
+    path = _cache_path(caption)
+    try:
+        with open(path, encoding="utf-8") as f:
+            entry = json.load(f)
+        if entry.get("caption_normalized") == _normalized_caption(caption) and _valid_cached_parts(entry.get("parts")):
+            return dict(entry["parts"])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    # Tận dụng checkpoint cũ đã hoàn thành (không mua lại API).
+    if os.path.isdir(STORY_PROGRESS_DIR):
+        for filename in os.listdir(STORY_PROGRESS_DIR):
+            if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
+                continue
+            try:
+                with open(os.path.join(STORY_PROGRESS_DIR, filename), encoding="utf-8") as f:
+                    state = json.load(f)
+                if (_normalized_caption(state.get("caption", "")) == _normalized_caption(caption)
+                        and _valid_cached_parts(state.get("parts"))):
+                    _cache_write(caption, state["parts"])
+                    return dict(state["parts"])
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+    return None
+
+
+def _cache_write(caption, parts):
+    if not ENABLE_STORY_CACHE or not _valid_cached_parts(parts):
+        return
+    os.makedirs(STORY_CACHE_DIR, exist_ok=True)
+    path = _cache_path(caption)
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump({"caption_normalized": _normalized_caption(caption), "parts": parts}, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+
+
 def _resume_story(page_name, post_id, caption):
     """Persist each successful part; only generate missing parts. Never re-buy saved parts."""
     state = _load_progress(post_id)
@@ -803,7 +908,18 @@ def _resume_story(page_name, post_id, caption):
     if not state:
         state = {"caption": caption, "parts": {}, "sent": [], "retry_after": 0}
         _save_progress(post_id, state)  # fail closed before any paid request
+    if not state.get("page_name"):
+        state["page_name"] = page_name
+        _save_progress(post_id, state)
     parts = state.setdefault("parts", {})
+    # Chỉ áp dụng cache nếu bài hiện tại chưa sinh phần nào.
+    if not parts:
+        cached = _cache_read(caption)
+        if cached:
+            parts.update(cached)
+            state["cache_reused"] = True
+            _save_progress(post_id, state)
+            send_telegram_message(f"♻️ Bài {post_id}: tái sử dụng Part 2/3/4 từ kho truyện; không gọi OpenAI.")
     for n in (2, 3, 4):
         key = str(n)
         if key in parts:
@@ -819,6 +935,7 @@ def _resume_story(page_name, post_id, caption):
         parts[key] = result
         _save_progress(post_id, state)  # atomic checkpoint immediately after success
 
+    _cache_write(caption, parts)
     story = "\n\n".join((
         ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n**" + PART_ENDINGS[n] + "**"
         for n in (2, 3, 4)
@@ -838,10 +955,10 @@ def _resume_story(page_name, post_id, caption):
         finally:
             if os.path.exists(path):
                 os.remove(path)
-    if str(post_id).split("_", 1)[0] == PUBLISH_TEST_PAGE_ID and not state.get("approval_notice_sent"):
+    if not state.get("approval_notice_sent"):
         send_telegram_message(
-            f"🧪 TEST Page đặc biệt: đủ TXT Part 2/3/4 cho bài {post_id}.\n"
-            f"Để xuất bản web và (nếu đã bật) bình luận Facebook, gửi:\n/publish {post_id}"
+            f"📚 Đã đủ TXT Part 2/3/4 cho bài {post_id}.\n"
+            f"Để xuất bản website, gửi:\n/publish {post_id}"
         )
         state["approval_notice_sent"] = True
         _save_progress(post_id, state)
@@ -852,9 +969,9 @@ def _resume_story(page_name, post_id, caption):
 
 
 
-# ==================== TEST WEBSITE + FACEBOOK ====================
+# ==================== WEBSITE PUBLISH ====================
 # Chỉ sau khi 3 TXT đã hoàn tất, Telegram /publish POST_ID mới cho phép xuất bản.
-# Dùng checkpoint hiện tại: web_posts + fb_comments tách biệt với story_completed.
+# Dùng checkpoint web_posts riêng. Tuyệt đối không gửi POST bình luận Facebook.
 
 def _story_title(part2):
     for line in part2.splitlines():
@@ -864,12 +981,20 @@ def _story_title(part2):
     return "Story continuation"
 
 
-def _web_part_title(base_title, n):
-    # Không lặp mã định danh ở cuối tiêu đề.
-    title = re.sub(r"\s+" + re.escape(AUTHOR_CODE) + r"$", "", base_title.strip(), flags=re.I)
+def _web_part_title(base_title, n, page_number):
+    """Ví dụ: PART 2: The Lifeboat Key6 026."""
+    page_number = int(page_number)
+    if page_number not in PAGE_NUMBER_BY_NAME.values():
+        raise ValueError("Mã số Page chưa được gán")
+    title = base_title.strip()
     title = re.sub(r"(?i)^PART\s*[234](?:\s*\(THE END\))?\s*[:\-–—]?\s*", "", title).strip()
+    # Xóa hậu tố từ các bản code cũ (FB Page ID dài hoặc mã số ngắn).
+    title = re.sub(r"\s*\d{1,20}\s+" + re.escape(AUTHOR_CODE) + r"$", "", title, flags=re.I).strip()
+    title = re.sub(r"\s+" + re.escape(AUTHOR_CODE) + r"$", "", title, flags=re.I).strip()
+    # Gỡ mã Page cũ dính sát chữ cuối nếu tiêu đề đã được chuẩn hóa trước đó.
+    title = re.sub(r"(?<=\D)(?:" + "|".join(map(str, sorted(PAGE_NUMBER_BY_NAME.values(), key=lambda x: -len(str(x))))) + r")$", "", title).strip() if re.search(r"\d$", title) and re.search(r"\s+" + re.escape(AUTHOR_CODE) + r"$", base_title.strip(), flags=re.I) else title
     prefix = "PART 4 (THE END): " if n == 4 else f"PART {n}: "
-    return f"{prefix}{title} {AUTHOR_CODE}"
+    return f"{prefix}{title}{page_number} {AUTHOR_CODE}"
 
 
 def _story_body(raw, part):
@@ -1042,20 +1167,6 @@ def _web_create_post(session, title, body_html, image_url, slug=""):
     return {"url": link, "id": record.get("id"), "slug": record.get("slug")}
 
 
-def _fb_post_comment(post_id, page_token, text):
-    # KHÔNG dùng HTTP_SESSION: session toàn cục retry POST có thể tạo comment trùng.
-    response = requests.post(f"{GRAPH_URL}/{post_id}/comments", data={"message": text, "access_token": page_token}, timeout=40)
-    data = response.json()
-    if response.status_code != 200 or not data.get("id"):
-        raise RuntimeError("Facebook comment thất bại: " + str(data.get("error", {}).get("message", response.status_code)))
-    return str(data["id"])
-
-
-def _intro_lines(part2, count=6):
-    body = _story_body(part2, 2)
-    return [line.strip() for line in body.splitlines() if line.strip()][:count]
-
-
 def _web_update_chapter(session, post_record, title, description, image_url, prev_slug="", next_slug=""):
     """PUT đúng payload đã quan sát trong DevTools, với slug chương liền kề."""
     post_id = post_record.get("id")
@@ -1079,8 +1190,6 @@ def publish_approved_story(post_id):
     post_id = str(post_id).strip()
     if not re.fullmatch(r"\d+_\d+", post_id):
         raise ValueError("POST_ID phải có dạng PAGEID_POSTID")
-    if post_id.split("_", 1)[0] != PUBLISH_TEST_PAGE_ID:
-        raise ValueError("TEST chỉ cho phép Page đặc biệt")
     state = _load_progress(post_id)
     if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
         raise RuntimeError("Chưa đủ 3 TXT gửi Telegram; không xuất bản")
@@ -1089,6 +1198,12 @@ def publish_approved_story(post_id):
     web = state.setdefault("web_posts", {})
     parts = state["parts"]
     base_title = _story_title(parts["2"])
+    page_id = post_id.split("_", 1)[0]
+    page_name = state.get("page_name")
+    if not page_name:
+        page_record = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+        page_name = (page_record or {}).get("name")
+    title_page_number = _page_number(page_name, page_id)  # Fail closed với Page chưa có mã
     # Xuất bản theo thứ tự ngược: Part 4 -> 3 -> 2 để next-link luôn tồn tại.
     # Link quay lại phần trước cần API edit; khi chưa xác minh API edit,
     # không tạo liên kết giả. Telegram sẽ cảnh báo để cập nhật thủ công.
@@ -1098,7 +1213,7 @@ def publish_approved_story(post_id):
         raise RuntimeError("Checkpoint web cũ thiếu ảnh gốc; không tiếp tục để tránh sai ảnh")
     if not image_url:
         pages = get_managed_pages()
-        page = next((p for p in pages if str(p.get("id")) == PUBLISH_TEST_PAGE_ID), None)
+        page = next((p for p in pages if str(p.get("id")) == page_id), None)
         if not page or not page.get("access_token"):
             raise RuntimeError("Không có Page token để lấy ảnh Facebook gốc")
         image_url = _web_upload_featured_image(session, post_id, page["access_token"])
@@ -1110,14 +1225,13 @@ def publish_approved_story(post_id):
         if web.get(key, {}).get("url"):
             continue
         nav = [(f"READ PART {n+1}", web[str(n+1)]["url"])] if n < 4 and web.get(str(n+1), {}).get("url") else []
-        title = _web_part_title(base_title, n)
+        title = _web_part_title(base_title, n, title_page_number)
         body = _to_html(_story_body(parts[key], n), nav)
         result = _web_create_post(session, title, body, image_url)
         web[key] = result
         _save_progress(post_id, state)
         send_telegram_message(f"🌐 Đã đăng Part {n}: {result['url']}")
     # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4.
-    # Không đăng bình luận Facebook nếu API sửa bài chưa được xác nhận thành công.
     linked = state.setdefault("web_linked", [])
     for n in (2, 3, 4):
         if n in linked:
@@ -1127,37 +1241,13 @@ def publish_approved_story(post_id):
             nav.append((f"PREVIOUS: PART {n-1}", web[str(n-1)]["url"]))
         if n < 4:
             nav.append((f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
-        _web_update_chapter(session, web[str(n)], _web_part_title(base_title, n),
+        _web_update_chapter(session, web[str(n)], _web_part_title(base_title, n, title_page_number),
                             _to_html(_story_body(parts[str(n)], n), nav), image_url,
                             prev_slug=web[str(n-1)]["slug"] if n > 2 else "",
                             next_slug=web[str(n+1)]["slug"] if n < 4 else "")
         linked.append(n)
         _save_progress(post_id, state)
-    if not ENABLE_FB_COMMENT_TEST:
-        send_telegram_message("⚠️ Chưa bình luận Facebook: ENABLE_FB_COMMENT_TEST=false. Web đã đăng và nối Part 2/3/4.")
-        return
-    pages = get_managed_pages()
-    page = next((p for p in pages if str(p.get("id")) == PUBLISH_TEST_PAGE_ID), None)
-    if not page or not page.get("access_token"):
-        raise RuntimeError("Không lấy được Page access token để bình luận")
-    comments = state.setdefault("fb_comments", {})
-    messages = {
-        "2": "PART 2:\n" + "\n".join(_intro_lines(parts["2"])) + "\n\nREAD FULL PART 2: " + web["2"]["url"],
-        "3": "READ FULL PART 3: " + web["3"]["url"],
-    }
-    for n in ("2", "3"):
-        if comments.get(n) == "attempted":
-            raise RuntimeError(f"Comment PART {n} chưa rõ kết quả; kiểm tra Facebook trước khi thử lại")
-        if comments.get(n):
-            continue
-        # Nếu mạng mất ngay sau khi Facebook đã tạo comment nhưng trước checkpoint,
-        # không tự retry; kiểm tra comment Page thủ công trước khi gửi lại lệnh.
-        comments[n] = "attempted"
-        _save_progress(post_id, state)
-        comment_id = _fb_post_comment(post_id, page["access_token"], messages[n])
-        comments[n] = comment_id
-        _save_progress(post_id, state)
-        send_telegram_message(f"💬 Đã bình luận PART {n} vào Facebook: {comment_id}")
+    send_telegram_message("✅ Website đã đăng và liên kết Part 2/3/4. Không bình luận Facebook.")
 
 
 def _prepare_telegram_publish_polling():
@@ -1211,7 +1301,7 @@ def publish_command_worker():
                     pid = match.group(1)
                     try:
                         publish_approved_story(pid)
-                        send_telegram_message(f"✅ Đã hoàn thành lệnh /publish {pid} (xem trạng thái web/FB ở trên).")
+                        send_telegram_message(f"✅ Đã hoàn thành lệnh /publish {pid} (xem trạng thái website ở trên).")
                     except Exception as exc:
                         send_telegram_message(f"⚠️ /publish {pid} chưa hoàn tất: {str(exc)[:700]}")
         except Exception as exc:
@@ -1939,7 +2029,7 @@ def check_all_pages():
             if not is_special_page and not meets_threshold(views or 0, comments):
                 continue
 
-            # Riêng Little Girl: bài mới đi tiếp ngay, không xét views/comments.
+            # Riêng US Stories 2: bài mới đi tiếp ngay, không xét views/comments.
             qualified_reasons = []
             if is_special_page:
                 qualified_reasons.append("SPECIAL_PAGE_NEW_POST")
