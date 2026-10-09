@@ -23,7 +23,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # Domain link bài đọc. Có thể ghi nhiều domain trong Railway Variable ARTICLE_LINK_DOMAINS, cách nhau bằng dấu phẩy.
 ARTICLE_LINK_DOMAINS = [
     d.strip().lower()
-    for d in os.getenv("ARTICLE_LINK_DOMAINS", "puretales.cafex.biz").split(",")
+    for d in os.getenv("ARTICLE_LINK_DOMAINS").split(",")
     if d.strip()
 ]
 COMMENT_LINK_MAX_PAGES = 5  # quét tối đa 5 trang x 100 comments trước khi báo / gọi OpenAI
@@ -112,14 +112,21 @@ def _page_number(page_name, page_id):
 
 # --- Page đặc biệt ---
 # Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng.
-SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}
+SPECIAL_INSTANT_PAGE_IDS = set()  # Không có Page đặc biệt
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
 # Website: 
 PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
-WEB_BASE_URL = "https://puretales.idolsgift.com"
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
+PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
+if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
+    raise ValueError("PUBLISH_PLATFORM phải là bioblog hoặc wordpress")
+WP_BASE_URL = os.getenv("WP_BASE_URL", "https://storyly.chosouthrussianovcharka.com").rstrip("/")
+WP_USERNAME = os.getenv("WP_USERNAME", "")
+WP_APPLICATION_PASSWORD = os.getenv("WP_APPLICATION_PASSWORD", "")
+WP_POSTS_PUBLIC = os.getenv("WP_POSTS_PUBLIC", "false").lower() == "true"
 WEB_ADMIN_EMAIL = os.getenv("WEB_ADMIN_EMAIL", "")
 WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "")
 # Đường dẫn login tùy cấu hình website; cần xác minh trước khi bật publish.
@@ -131,7 +138,7 @@ WEB_ALLOW_IMAGE_FALLBACK = os.getenv("WEB_ALLOW_IMAGE_FALLBACK", "false").lower(
 WEB_IMAGE_MAX_BYTES = 15 * 1024 * 1024
 WEB_POSTS_PUBLIC = os.getenv("WEB_POSTS_PUBLIC", "true").lower() == "true"
 WEB_UPDATE_METHOD = "PUT"
-AUTHOR_CODE = os.getenv("AUTHOR_CODE").strip()
+AUTHOR_CODE = os.getenv("AUTHOR_CODE", "").strip()
 if not re.fullmatch(r"[0-9A-Za-z_-]{1,16}", AUTHOR_CODE):
     raise ValueError("AUTHOR_CODE không hợp lệ")
 PUBLISH_APPROVAL_POLL_SECONDS = 8
@@ -1191,7 +1198,112 @@ def _web_update_chapter(session, post_record, title, description, image_url, pre
         raise RuntimeError("API sửa bài không xác nhận ok=true")
 
 
+def _wp_request(method, path, **kwargs):
+    if not WP_USERNAME or not WP_APPLICATION_PASSWORD:
+        raise RuntimeError("Thiếu WP_USERNAME hoặc WP_APPLICATION_PASSWORD")
+    response = requests.request(method, WP_BASE_URL + path,
+        auth=(WP_USERNAME, WP_APPLICATION_PASSWORD), timeout=65, **kwargs)
+    if response.status_code >= 400:
+        raise RuntimeError(f"WordPress {method} {path}: HTTP {response.status_code}: {response.text[:350]}")
+    return response.json()
+
+
+def _wp_upload_featured_image(post_id, page_token):
+    source = _facebook_original_image(post_id, page_token)
+    if not source:
+        raise RuntimeError("Không có ảnh Facebook gốc để đăng WordPress")
+    raw, mime, ext = _download_facebook_image(source)
+    filename = f"fb_{post_id.replace('_', '-')}.{ext}"
+    response = _wp_request("POST", "/wp-json/wp/v2/media", data=raw,
+        headers={"Content-Type": mime, "Content-Disposition": f'attachment; filename="{filename}"'})
+    if not response.get("id"):
+        raise RuntimeError("WordPress không trả media ID")
+    return int(response["id"])
+
+
+def _wp_create_post(title, body_html, media_id):
+    record = _wp_request("POST", "/wp-json/wp/v2/posts", json={
+        "title": title, "content": body_html,
+        "status": "publish" if WP_POSTS_PUBLIC else "draft", "featured_media": media_id})
+    if not record.get("id"):
+        raise RuntimeError("WordPress không trả post ID")
+    return {"id": record["id"], "url": record.get("link", ""), "slug": record.get("slug", "")}
+
+
+def _wp_update_post(post_record, body_html):
+    return _wp_request("POST", f"/wp-json/wp/v2/posts/{int(post_record['id'])}", json={"content": body_html})
+
+
+def publish_wordpress_story(post_id):
+    post_id = str(post_id).strip()
+    if not re.fullmatch(r"\d+_\d+", post_id):
+        raise ValueError("POST_ID không hợp lệ")
+    state = _load_progress(post_id)
+    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
+        raise RuntimeError("Chưa gửi đủ ba TXT")
+    if not ENABLE_WEB_PUBLISH_TEST:
+        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false")
+    target = WP_BASE_URL
+    if state.get("publish_target") and state["publish_target"] != target:
+        raise RuntimeError("Checkpoint thuộc website khác; không tự chuyển bài đã đăng dở")
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
+    state["publish_target"] = target
+    state["publish_platform"] = "wordpress"
+    _save_progress(post_id, state)
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
+    records = state.setdefault("web_posts", {})
+    parts = state["parts"]
+    base_title = _story_title(parts["2"])
+    page_id = post_id.split("_", 1)[0]
+    page_name = state.get("page_name")
+    if not page_name:
+        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+        page_name = (page or {}).get("name")
+    page_number = _page_number(page_name, page_id)
+    media_id = state.get("wp_media_id")
+    if not media_id:
+        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+        if not page or not page.get("access_token"):
+            raise RuntimeError("Thiếu Facebook Page token để lấy ảnh")
+        media_id = _wp_upload_featured_image(post_id, page["access_token"])
+        state["wp_media_id"] = media_id
+        _save_progress(post_id, state)
+    for n in (4, 3, 2):
+        key = str(n)
+        if records.get(key, {}).get("id"):
+            continue
+        nav = [(f"READ PART {n+1}", records[str(n+1)]["url"])] if n < 4 and records.get(str(n+1), {}).get("url") else []
+        title = _web_part_title(base_title, n, page_number)
+        records[key] = _wp_create_post(title, _to_html(_story_body(parts[key], n), nav), media_id)
+        _save_progress(post_id, state)
+        print(f"[WORDPRESS] {post_id}: created Part {n}, ID={records[key]['id']}")
+    linked = state.setdefault("web_linked", [])
+    for n in (2, 3, 4):
+        if n in linked:
+            continue
+        nav = []
+        if n > 2:
+            nav.append((f"PREVIOUS: PART {n-1}", records[str(n-1)]["url"]))
+        if n < 4:
+            nav.append((f"NEXT: PART {n+1}", records[str(n+1)]["url"]))
+        _wp_update_post(records[str(n)], _to_html(_story_body(parts[str(n)], n), nav))
+        linked.append(n)
+        _save_progress(post_id, state)
+    if not state.get("web_links_telegram_sent"):
+        message = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in (2, 3, 4))
+        if not all(records[str(n)].get("url") for n in (2, 3, 4)):
+            raise RuntimeError("WordPress thiếu link chương")
+        if not send_telegram_message(message):
+            raise RuntimeError("Telegram chưa xác nhận thông báo ba link")
+        state["web_links_telegram_sent"] = True
+        _save_progress(post_id, state)
+
+
 def publish_approved_story(post_id):
+    if PUBLISH_PLATFORM == "wordpress":
+        return publish_wordpress_story(post_id)
     post_id = str(post_id).strip()
     if not re.fullmatch(r"\d+_\d+", post_id):
         raise ValueError("POST_ID phải có dạng PAGEID_POSTID")
@@ -1200,6 +1312,15 @@ def publish_approved_story(post_id):
         raise RuntimeError("Chưa đủ 3 TXT gửi Telegram; không xuất bản")
     if not ENABLE_WEB_PUBLISH_TEST:
         raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false; không có bài nào được đăng")
+    if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
+        raise RuntimeError("Checkpoint thuộc website khác; không tự chuyển bài đã đăng dở")
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
+    state["publish_target"] = WEB_BASE_URL
+    state["publish_platform"] = "bioblog"
+    _save_progress(post_id, state)
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
     web = state.setdefault("web_posts", {})
     parts = state["parts"]
     base_title = _story_title(parts["2"])
@@ -1569,19 +1690,6 @@ def get_managed_pages():
         pname = p.get("name") or "(không tên)"
         marker = "  <<< SPECIAL-INSTANT" if pid in SPECIAL_INSTANT_PAGE_IDS else ""
         print(f"[PAGE] {pname} | ID={pid}{marker}")
-
-    special_found = [p for p in pages if str(p.get("id") or "") in SPECIAL_INSTANT_PAGE_IDS]
-    if special_found:
-        print(
-            "[SPECIAL-PAGE] OK: USER_ACCESS_TOKEN nhìn thấy "
-            + ", ".join(f"{p.get('name')} ({p.get('id')})" for p in special_found)
-        )
-    else:
-        print(
-            "[SPECIAL-PAGE] CẢNH BÁO: USER_ACCESS_TOKEN KHÔNG trả về Page "
-            + ", ".join(sorted(SPECIAL_INSTANT_PAGE_IDS))
-            + " qua /me/accounts. Bot chưa thể phát hiện bài mới của Page này."
-        )
 
     return pages
 
@@ -1986,7 +2094,7 @@ def check_all_pages():
         page_token = page["access_token"]
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
-        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS or str(page_name).strip().casefold() == "little girl"
+        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS 
 
         # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
         # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
@@ -2020,7 +2128,7 @@ def check_all_pages():
             views, comments, link, message = stats.get(post_id, (None, None, None, ""))
 
             if comments is None or (
-                not is_special_page and views is None and comments <= COMMENT_ONLY_THRESHOLD
+                views is None and comments <= COMMENT_ONLY_THRESHOLD
             ):
                 print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
                 # Dữ liệu lỗi: thử lại ngay vòng 60 giây kế tiếp, không cache kết quả lỗi lâu.
@@ -2032,7 +2140,7 @@ def check_all_pages():
             # Khi pagination hoàn tất, biến comments được thay bằng TOP_LEVEL; vì vậy cả threshold
             # VÀ dòng "Comments:" trong Telegram đều dùng cùng một số top_level sát Facebook.
             summary_comments = int(comments or 0)
-            if not is_special_page and should_deep_count_comments(views or 0, summary_comments):
+            if should_deep_count_comments(views or 0, summary_comments):
                 effective_comments, comment_debug = get_comment_count_fallback(
                     post_id, page_token, summary_comments
                 )
@@ -2102,13 +2210,11 @@ def check_all_pages():
 
                     changed = True
 
-            if not is_special_page and not meets_threshold(views or 0, comments):
+            if not meets_threshold(views or 0, comments):
                 continue
 
             # Riêng US Stories 2: bài mới đi tiếp ngay, không xét views/comments.
             qualified_reasons = []
-            if is_special_page:
-                qualified_reasons.append("SPECIAL_PAGE_NEW_POST")
             if comments > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
             for rule in THRESHOLD_RULES:
