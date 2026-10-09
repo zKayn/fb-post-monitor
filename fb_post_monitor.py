@@ -1237,6 +1237,63 @@ def _wp_update_post(post_record, body_html):
     return _wp_request("POST", f"/wp-json/wp/v2/posts/{int(post_record['id'])}", json={"content": body_html})
 
 
+# WordPress: ending khớp nguyên văn TXT, các liên kết chương là thẻ <a> bấm được.
+def _wp_chapter_html(parts, n, records):
+    content = _to_html(_story_body(parts[str(n)], n))
+    content += "\n" + _to_html(PART_ENDINGS[n])
+    links = []
+    if n > 2:
+        url = records.get(str(n-1), {}).get("url")
+        if not url:
+            raise RuntimeError(f"Thiếu URL Part {n-1} để tạo liên kết chương")
+        links.append((f"← PREVIOUS: PART {n-1}", url))
+    if n < 4:
+        url = records.get(str(n+1), {}).get("url")
+        if not url:
+            raise RuntimeError(f"Thiếu URL Part {n+1} để tạo liên kết chương")
+        links.append((f"NEXT: PART {n+1} →", url))
+    if links:
+        content += '\n<nav aria-label="Story chapter links" class="story-chapter-links">'
+        for label, url in links:
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.netloc != urlparse(WP_BASE_URL).netloc:
+                raise RuntimeError("URL chương WordPress không thuộc website đang chọn")
+            content += '<p><a href="%s"><strong>%s</strong></a></p>' % (
+                html.escape(url, quote=True), html.escape(label))
+        content += '</nav>'
+    return content
+
+
+def repair_existing_wordpress_links(post_id):
+    """Chỉ cập nhật 3 bài WordPress đã tồn tại; KHÔNG tạo bài, ảnh hay gọi OpenAI."""
+    state = _load_progress(post_id)
+    if state.get("publish_platform") != "wordpress" or state.get("publish_target") != WP_BASE_URL:
+        raise RuntimeError("Checkpoint không thuộc WordPress đang chọn")
+    records = state.get("web_posts") or {}
+    parts = state.get("parts") or {}
+    if not all(records.get(str(n), {}).get("id") and records[str(n)].get("url")
+               and parts.get(str(n)) for n in (2, 3, 4)):
+        raise RuntimeError("Checkpoint chưa đủ 3 chương WordPress; không sửa để tránh sai bài")
+    for n in (2, 3, 4):
+        _wp_update_post(records[str(n)], _wp_chapter_html(parts, n, records))
+        print(f"[WP-REPAIR] {post_id}: updated Part {n}")
+    state["wp_chapter_format_version"] = 2
+    _save_progress(post_id, state)
+
+
+def _wp_repair_requested_once():
+    post_id = os.getenv("WP_REPAIR_EXISTING_POST_ID", "").strip()
+    if not post_id:
+        return
+    if not re.fullmatch(r"\d+_\d+", post_id):
+        print("[WP-REPAIR] WP_REPAIR_EXISTING_POST_ID không hợp lệ")
+        return
+    try:
+        repair_existing_wordpress_links(post_id)
+    except Exception as exc:
+        print(f"[WP-REPAIR] {post_id}: lỗi: {exc}")
+
+
 def publish_wordpress_story(post_id):
     post_id = str(post_id).strip()
     if not re.fullmatch(r"\d+_\d+", post_id):
@@ -1279,20 +1336,16 @@ def publish_wordpress_story(post_id):
             continue
         nav = [(f"READ PART {n+1}", records[str(n+1)]["url"])] if n < 4 and records.get(str(n+1), {}).get("url") else []
         title = _web_part_title(base_title, n, page_number)
-        records[key] = _wp_create_post(title, _to_html(_story_body(parts[key], n), nav), media_id)
+        records[key] = _wp_create_post(title, _to_html(_story_body(parts[key], n)) + "\n" + _to_html(PART_ENDINGS[n]), media_id)
         _save_progress(post_id, state)
         print(f"[WORDPRESS] {post_id}: created Part {n}, ID={records[key]['id']}")
-    linked = state.setdefault("web_linked", [])
-    for n in (2, 3, 4):
-        if n in linked:
-            continue
-        nav = []
-        if n > 2:
-            nav.append((f"PREVIOUS: PART {n-1}", records[str(n-1)]["url"]))
-        if n < 4:
-            nav.append((f"NEXT: PART {n+1}", records[str(n+1)]["url"]))
-        _wp_update_post(records[str(n)], _to_html(_story_body(parts[str(n)], n), nav))
-        linked.append(n)
+    # Version 2: ghi lại tất cả chương kể cả checkpoint cũ đã đánh dấu linked.
+    if state.get("wp_chapter_format_version") != 2:
+        for n in (2, 3, 4):
+            _wp_update_post(records[str(n)], _wp_chapter_html(parts, n, records))
+            _save_progress(post_id, state)
+        state["wp_chapter_format_version"] = 2
+        state["web_linked"] = [2, 3, 4]
         _save_progress(post_id, state)
     if not state.get("web_links_telegram_sent"):
         message = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in (2, 3, 4))
@@ -2340,6 +2393,8 @@ def check_all_pages():
 
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
+    if PUBLISH_PLATFORM == "wordpress":
+        threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
     threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
     if ENABLE_WEB_PUBLISH_TEST and ENABLE_AUTO_WEB_PUBLISH:
         threading.Thread(target=auto_publish_recovery_worker, name="auto-web-recovery", daemon=True).start()
