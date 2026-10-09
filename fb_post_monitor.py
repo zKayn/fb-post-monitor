@@ -1,24 +1,3 @@
-"""
-FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN + AUTO PART 2/3)
-=================================================================
-Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi thông báo
-Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
-tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
-Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
-Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API viết tiếp
-Part 2 + Part 3 + Part 4 dựa trên caption gốc, xuất ra file TXT UTF-8, gửi kèm
-thông báo Telegram.
-
-YÊU CẦU
---------
-1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
-   pages_read_engagement, pages_read_user_content, read_insights
-2. Telegram Bot Token + Chat ID
-3. OpenAI API Key (lấy tại platform.openai.com/api-keys, cần nạp tiền
-   riêng, khác với ChatGPT Plus)
-4. Cài thư viện: pip install requests
-"""
-
 import json
 import os
 import re
@@ -132,11 +111,11 @@ def _page_number(page_name, page_id):
 
 
 # --- Page đặc biệt ---
-# Little Girl (bản code ổn định): bài MỚI được tạo TXT ngay, không cần đạt ngưỡng.
+# Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng.
 SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
-# Website: /publish cho 15 Page có mã. Mặc định tắt mọi thao tác ghi bên ngoài.
+# Website: 
 PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
@@ -152,7 +131,7 @@ WEB_ALLOW_IMAGE_FALLBACK = os.getenv("WEB_ALLOW_IMAGE_FALLBACK", "false").lower(
 WEB_IMAGE_MAX_BYTES = 15 * 1024 * 1024
 WEB_POSTS_PUBLIC = os.getenv("WEB_POSTS_PUBLIC", "true").lower() == "true"
 WEB_UPDATE_METHOD = "PUT"
-AUTHOR_CODE = os.getenv("AUTHOR_CODE", "026").strip()
+AUTHOR_CODE = os.getenv("AUTHOR_CODE").strip()
 if not re.fullmatch(r"[0-9A-Za-z_-]{1,16}", AUTHOR_CODE):
     raise ValueError("AUTHOR_CODE không hợp lệ")
 PUBLISH_APPROVAL_POLL_SECONDS = 8
@@ -167,11 +146,35 @@ THRESHOLD_RULES = [
 ]
 COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, không cần xét views
 
-# Theo dõi MỌI bài trong cửa sổ N giờ tính từ thời điểm quét.
-# Không dùng mốc khởi động/redeploy: bài đăng trước lúc bật bot vẫn được xét.
-ONLY_POSTS_NEWER_THAN_HOURS = int(os.getenv("ONLY_POSTS_NEWER_THAN_HOURS", "72"))
-if ONLY_POSTS_NEWER_THAN_HOURS <= 0:
-    raise ValueError("ONLY_POSTS_NEWER_THAN_HOURS phải lớn hơn 0")
+# Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
+ONLY_POSTS_NEWER_THAN_HOURS = 72  # Giới hạn phụ để giảm số lần gọi API
+# Bắt buộc gắn Railway Volume vào /data để không reset khi redeploy.
+NEW_POST_CUTOFF_FILE = "/data/new_posts_since_utc.json"
+
+
+def _load_or_create_new_post_cutoff():
+    from pathlib import Path
+    path = Path(NEW_POST_CUTOFF_FILE)
+    if path.exists():
+        with path.open(encoding="utf-8") as f:
+            payload = json.load(f)
+        stamp = datetime.fromisoformat(payload["since_utc"].replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError("Mốc lọc bài mới phải có timezone UTC")
+        return stamp.astimezone(timezone.utc)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc)
+    temp = path.with_name(path.name + ".tmp")
+    with temp.open("w", encoding="utf-8") as f:
+        json.dump({"since_utc": stamp.isoformat()}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+    print(f"[NEW-POSTS] Đã thiết lập mốc bắt đầu: {stamp.isoformat()}; bỏ qua bài đăng trước mốc.")
+    return stamp
+
+
+NEW_POSTS_SINCE_UTC = _load_or_create_new_post_cutoff()
 
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
@@ -415,7 +418,7 @@ def record_and_check_spike(post_id: str, current_views: int, now: datetime):
 
 
 # -------------------- Telegram --------------------
-TELEGRAM_GROUP_LOCK = threading.RLock()  # Giữ nguyên yêu cầu: không cho tin khác chen giữa thông báo và các TXT của chính bài đó.
+TELEGRAM_GROUP_LOCK = threading.RLock() 
 
 def _send_telegram_message_unlocked(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -423,8 +426,11 @@ def _send_telegram_message_unlocked(text: str):
         resp = api_post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
         if resp.status_code != 200:
             print(f"[LỖI] Gửi Telegram thất bại: {resp.text}")
+            return False
+        return bool(resp.json().get("ok"))
     except Exception as e:
         print(f"[LỖI] Gửi Telegram thất bại (mạng): {e}")
+        return False
 
 
 def send_telegram_message(text: str):
@@ -753,8 +759,6 @@ def call_openai_story(caption: str):
         return None
 
     # Ending chỉ chèn sau khi cả content của part đó đã hoàn chỉnh.
-    # Chỉ kẻ 1 đường phân cách PHÍA TRÊN Part 3 và Part 4 để dễ copy từ TXT.
-    # Không có đường kẻ phía dưới tiêu đề Part.
     separator = "=" * 60
     part2 = f"{p2_raw}\n\n**{PART_ENDINGS[2]}**"
     part3 = f"{separator}\n\n{p3_raw}\n\n**{PART_ENDINGS[3]}**"
@@ -973,7 +977,6 @@ def _resume_story(page_name, post_id, caption):
 
 # ==================== WEBSITE PUBLISH ====================
 # Chỉ sau khi 3 TXT đã hoàn tất, Telegram /publish POST_ID mới cho phép xuất bản.
-# Dùng checkpoint web_posts riêng. Tuyệt đối không gửi POST bình luận Facebook.
 
 def _story_title(part2):
     for line in part2.splitlines():
@@ -1221,7 +1224,7 @@ def publish_approved_story(post_id):
         image_url = _web_upload_featured_image(session, post_id, page["access_token"])
         state["web_featured_image"] = image_url
         _save_progress(post_id, state)
-        send_telegram_message("🖼 Đã upload ảnh gốc Facebook lên website; dùng chung cho Part 2/3/4.")
+        print(f"[AUTO-WEB] {post_id}: đã upload ảnh dùng chung cho Part 2/3/4")
     for n in (4, 3, 2):
         key = str(n)
         if web.get(key, {}).get("url"):
@@ -1232,7 +1235,7 @@ def publish_approved_story(post_id):
         result = _web_create_post(session, title, body, image_url)
         web[key] = result
         _save_progress(post_id, state)
-        send_telegram_message(f"🌐 Đã đăng Part {n}: {result['url']}")
+        print(f"[AUTO-WEB] {post_id}: đã đăng Part {n}: {result['url']}")
     # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4.
     linked = state.setdefault("web_linked", [])
     for n in (2, 3, 4):
@@ -1249,7 +1252,17 @@ def publish_approved_story(post_id):
                             next_slug=web[str(n+1)]["slug"] if n < 4 else "")
         linked.append(n)
         _save_progress(post_id, state)
-    send_telegram_message("✅ Website đã đăng và liên kết Part 2/3/4. Không bình luận Facebook.")
+    # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và liên kết hoàn tất.
+    # Lưu checkpoint để các lần retry/redeploy không gửi lại thông báo.
+    if not state.get("web_links_telegram_sent"):
+        urls = [web[str(n)].get("url") for n in (2, 3, 4)]
+        if not all(urls):
+            raise RuntimeError("Chưa có đủ 3 URL công khai để gửi Telegram")
+        message = "\n".join(f"PART {n}: {web[str(n)]['url']}" for n in (2, 3, 4))
+        if send_telegram_message(message) is False:
+            raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
+        state["web_links_telegram_sent"] = True
+        _save_progress(post_id, state)
 
 
 
@@ -1917,7 +1930,7 @@ def story_worker():
                     published = datetime.strptime(verify["created_time"], "%Y-%m-%dT%H:%M:%S%z")
                     age = datetime.now(timezone.utc) - published
                     if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
-                        print(f"[COST GUARD] {post_id}: bài nằm ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ gần nhất; bỏ qua.")
+                        print(f"[COST GUARD] {post_id}: bài ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
                         continue
                 except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
@@ -2092,7 +2105,7 @@ def check_all_pages():
             if not is_special_page and not meets_threshold(views or 0, comments):
                 continue
 
-            # Riêng Little Girl: bài trong cửa sổ thời gian đi tiếp ngay, không xét views/comments.
+            # Riêng US Stories 2: bài mới đi tiếp ngay, không xét views/comments.
             qualified_reasons = []
             if is_special_page:
                 qualified_reasons.append("SPECIAL_PAGE_NEW_POST")
