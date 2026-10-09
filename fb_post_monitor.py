@@ -23,7 +23,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # Domain link bài đọc. Có thể ghi nhiều domain trong Railway Variable ARTICLE_LINK_DOMAINS, cách nhau bằng dấu phẩy.
 ARTICLE_LINK_DOMAINS = [
     d.strip().lower()
-    for d in os.getenv("ARTICLE_LINK_DOMAINS").split(",")
+    for d in os.getenv(
+        "ARTICLE_LINK_DOMAINS",
+        "puretales.idolsgift.com,storyly.chosouthrussianovcharka.com"
+    ).split(",")
     if d.strip()
 ]
 COMMENT_LINK_MAX_PAGES = 5  # quét tối đa 5 trang x 100 comments trước khi báo / gọi OpenAI
@@ -112,7 +115,7 @@ def _page_number(page_name, page_id):
 
 # --- Page đặc biệt ---
 # Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng.
-SPECIAL_INSTANT_PAGE_IDS = set()  # Không có Page đặc biệt
+SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}  # Chỉ Little Girl; Page khác vẫn theo ngưỡng
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
 # Website: 
@@ -2127,9 +2130,9 @@ def check_all_pages():
             key = f"{page_id}_{post_id}"
             views, comments, link, message = stats.get(post_id, (None, None, None, ""))
 
-            if comments is None or (
+            if not is_special_page and (comments is None or (
                 views is None and comments <= COMMENT_ONLY_THRESHOLD
-            ):
+            )):
                 print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
                 # Dữ liệu lỗi: thử lại ngay vòng 60 giây kế tiếp, không cache kết quả lỗi lâu.
                 _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
@@ -2140,7 +2143,7 @@ def check_all_pages():
             # Khi pagination hoàn tất, biến comments được thay bằng TOP_LEVEL; vì vậy cả threshold
             # VÀ dòng "Comments:" trong Telegram đều dùng cùng một số top_level sát Facebook.
             summary_comments = int(comments or 0)
-            if should_deep_count_comments(views or 0, summary_comments):
+            if not is_special_page and should_deep_count_comments(views or 0, summary_comments):
                 effective_comments, comment_debug = get_comment_count_fallback(
                     post_id, page_token, summary_comments
                 )
@@ -2210,11 +2213,12 @@ def check_all_pages():
 
                     changed = True
 
-            if not meets_threshold(views or 0, comments):
+            # Little Girl: bài xuất hiện sau baseline được xử lý ngay, kể cả 0 views/comments.
+            # Những Page còn lại vẫn phải đạt ngưỡng tương tác.
+            if not is_special_page and not meets_threshold(views or 0, comments):
                 continue
 
-            # Riêng US Stories 2: bài mới đi tiếp ngay, không xét views/comments.
-            qualified_reasons = []
+            qualified_reasons = ["Little Girl: bài mới, không cần ngưỡng"] if is_special_page else []
             if comments > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
             for rule in THRESHOLD_RULES:
