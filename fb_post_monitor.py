@@ -191,7 +191,7 @@ NEW_POSTS_SINCE_UTC = _load_or_create_new_post_cutoff()
 # Railway Variable: ENABLE_SPIKE_ALERT=true để BẬT, false để TẮT.
 # Mặc định false để không tự phát sinh cảnh báo ngoài ý muốn sau khi deploy.
 ENABLE_SPIKE_ALERT = os.getenv("ENABLE_SPIKE_ALERT", "false").strip().lower() in ("1", "true", "yes", "on")
-SPIKE_LOOKBACK_MINUTES = 30
+SPIKE_LOOKBACK_MINUTES = 30  # mốc tham chiếu; baseline thực tế chỉ lấy trong 15–40 phút
 SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
 SPIKE_MIN_VIEWS_TO_CHECK = 2000
@@ -403,28 +403,91 @@ def save_view_history(history: dict):
 view_history = load_view_history()
 
 
-def record_and_check_spike(post_id: str, current_views: int, now: datetime):
-    points = view_history.get(post_id, [])
-    cutoff = now - timedelta(minutes=SPIKE_LOOKBACK_MINUTES)
-    baseline_views = None
-    for ts_str, v in points:
-        ts = datetime.fromisoformat(ts_str)
-        if ts <= cutoff:
-            baseline_views = v
-        else:
-            break
+# Thông tin lần đo gần nhất, chỉ dùng để giải thích cảnh báo; không ảnh hưởng checkpoint.
+spike_evidence = {}
 
-    points.append([now.isoformat(), current_views])
-    view_history[post_id] = points[-200:]
+
+def record_and_check_spike(post_id: str, current_views: int, now: datetime):
+    """Phát hiện tăng views nhanh trong cửa sổ THỰC 15–40 phút.
+
+    Chế độ cân bằng: kết hợp tăng tuyệt đối, tỷ lệ và tốc độ/phút; nếu có
+    lịch sử giai đoạn trước thì yêu cầu tăng tốc để giảm cảnh báo sai.
+    Không so sánh với mẫu cũ hàng giờ như thuật toán trước.
+    """
+    post_id = str(post_id)
+    current_views = int(current_views)
+    spike_evidence.pop(post_id, None)
+    raw = view_history.get(post_id, [])
+    samples = []
+    for entry in raw:
+        try:
+            stamp = datetime.fromisoformat(entry[0])
+            if stamp.tzinfo is None and now.tzinfo is not None:
+                stamp = stamp.replace(tzinfo=now.tzinfo)
+            if stamp.tzinfo is not None and now.tzinfo is None:
+                stamp = stamp.replace(tzinfo=None)
+            value = int(entry[1])
+            age = (now - stamp).total_seconds() / 60
+            if 0 <= age <= 90 and value >= 0:
+                samples.append((stamp, value, age))
+        except (ValueError, TypeError, IndexError, OverflowError):
+            continue
+    samples.sort(key=lambda item: item[0])
+
+    # Luôn ghi mẫu mới kể cả khi cảnh báo tắt, để có baseline khi bật lại.
+    samples.append((now, current_views, 0.0))
+    view_history[post_id] = [[stamp.isoformat(), value] for stamp, value, _ in samples[-200:]]
 
     if current_views < SPIKE_MIN_VIEWS_TO_CHECK:
         return False
-    if baseline_views is None:
+
+    # Chọn mẫu gần mốc 25 phút nhất, nhưng tuyệt đối không cũ hơn 40 phút.
+    candidates = [sample for sample in samples[:-1] if 15 <= sample[2] <= 40]
+    if not candidates:
+        return False
+    base_time, base_views, minutes = min(candidates, key=lambda sample: abs(sample[2] - 25))
+    increase = current_views - base_views
+    if increase <= 0:
+        return False
+    pct = (100.0 * increase / base_views) if base_views > 0 else 0.0
+    rate = increase / minutes
+
+    # Hai nhánh: tăng tương đối rõ rệt, hoặc tăng tuyệt đối rất mạnh.
+    strong_relative = increase >= 1200 and pct >= 65 and rate >= 40
+    strong_absolute = increase >= 2500 and rate >= 55
+    if not (strong_relative or strong_absolute):
         return False
 
-    increase = current_views - baseline_views
-    percent_increase = (increase / baseline_views * 100) if baseline_views > 0 else 0
-    return increase >= SPIKE_MIN_VIEW_INCREASE or percent_increase >= SPIKE_MIN_PERCENT_INCREASE
+    # Có dữ liệu giai đoạn trước: yêu cầu tốc độ hiện tại cao hơn ít nhất 20%.
+    # Không bắt buộc khi mới bắt đầu thu thập, để vẫn phát hiện sớm.
+    earlier = [sample for sample in samples[:-1]
+               if 15 <= (base_time - sample[0]).total_seconds() / 60 <= 40]
+    if earlier:
+        old_time, old_views, _ = min(
+            earlier, key=lambda sample: abs((base_time - sample[0]).total_seconds() / 60 - 25)
+        )
+        previous_minutes = (base_time - old_time).total_seconds() / 60
+        previous_rate = max(0.0, (base_views - old_views) / previous_minutes)
+        if previous_rate > 0 and rate < previous_rate * 1.20:
+            return False
+
+    # Nếu có mẫu rất gần đây, tránh báo khi views đã chững lại.
+    recent = [sample for sample in samples[:-1] if 4 <= sample[2] <= 12]
+    if recent:
+        _, recent_views, recent_minutes = min(recent, key=lambda sample: abs(sample[2] - 8))
+        recent_rate = (current_views - recent_views) / recent_minutes
+        if recent_rate < max(20.0, rate * 0.45):
+            return False
+
+    spike_evidence[post_id] = {
+        "baseline_views": base_views,
+        "current_views": current_views,
+        "minutes": round(minutes, 1),
+        "increase": increase,
+        "percent": round(pct, 1),
+        "rate": round(rate, 1),
+    }
+    return True
 
 
 # -------------------- Telegram --------------------
@@ -2240,31 +2303,29 @@ def check_all_pages():
 
                 else:
 
+                    evidence = spike_evidence.get(str(post_id), {})
                     spike_msg = (
-
                         f"🚀 BÀI ĐANG DỰNG ĐỨNG! (Page: {page_name})\n"
-
                         f"Views: {views}\n"
-
                         f"Comments: {comments}\n"
-
                         + (f"Link: {link}\n" if link else "")
-
-                        + f"Tăng mạnh trong khoảng {SPIKE_LOOKBACK_MINUTES} phút.\n"
-
+                        + f"Đo thực tế: {evidence.get('baseline_views', '?'):,} → {views:,} views "
+                          f"trong {evidence.get('minutes', '?')} phút.\n"
+                        + f"Tăng: +{evidence.get('increase', '?'):,} "
+                          f"({evidence.get('percent', '?')}%), "
+                          f"{evidence.get('rate', '?')} views/phút.\n"
                         + "=> Kiểm tra bài ngay!"
-
                     )
 
                     print(f"[SPIKE] [{page_name}] {post_id}: dựng đứng + CHƯA có link -> gửi Telegram.")
 
-                    send_telegram_message(spike_msg)
-
-                    already_notified.add(spike_key)
-
-                    save_notified(already_notified)
-
-                    changed = True
+                    if send_telegram_message(spike_msg):
+                        already_notified.add(spike_key)
+                        save_notified(already_notified)
+                        changed = True
+                    else:
+                        print(f"[SPIKE-TELEGRAM-FAILED] [{page_name}] {post_id}: chưa đánh dấu đã báo; sẽ thử lại.")
+                        _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
 
             # Little Girl: bài xuất hiện sau baseline được xử lý ngay, kể cả 0 views/comments.
             # Những Page còn lại vẫn phải đạt ngưỡng tương tác.
