@@ -1489,7 +1489,7 @@ def publish_approved_story(post_id):
         if n > 2:
             nav.append((f"PREVIOUS: PART {n-1}", web[str(n-1)]["url"]))
         if n < 4:
-            nav.append((f"NEXT: PART 4(THE END):" if n + 1 == 4 else f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
+            nav.append((f"NEXT: PART 4(THE END)" if n + 1 == 4 else f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
         _web_update_chapter(session, web[str(n)], _web_part_title(base_title, n, title_page_number),
                             _to_html(_story_body(parts[str(n)], n), nav), image_url,
                             prev_slug=web[str(n-1)]["slug"] if n > 2 else "",
