@@ -1090,7 +1090,10 @@ def _to_html(body, navigation=None):
     content = "\n".join("<p>" + html.escape(p).replace("\n", "<br>") + "</p>" for p in paragraphs if p.strip())
     if navigation:
         content += '<hr><nav aria-label="Story chapters">' + " | ".join(
-            '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
+            '<a href="%s">%s</a>' % (
+    html.escape(url, quote=True),
+    html.escape("PART 4(THE END):" if label == "NEXT: PART 4" else label)
+)
             for label, url in navigation
         ) + '</nav>'
     return content
