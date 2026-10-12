@@ -122,6 +122,7 @@ SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
+SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT_TELEGRAM", "false").strip().lower() in ("1", "true", "yes", "on")
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
@@ -1022,28 +1023,31 @@ def _resume_story(page_name, post_id, caption):
         ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n**" + PART_ENDINGS[n] + "**"
         for n in (2, 3, 4)
     ))
+    # Vẫn kiểm tra nội dung 3 phần trước khi xuất bản web.
     outputs = split_story_into_parts(story)
     sent = state.setdefault("sent", [])
     for n in (2, 3, 4):
         if n in sent:
             continue
-        path = f"/tmp/story_{re.sub(r'[^a-zA-Z0-9_]', '_', str(post_id))}_PART_{n}.txt"
-        try:
-            create_part_txt(outputs[n], n, path)
-            if not send_telegram_document(path, caption=f"📄 PART {n} — Page: {page_name}"):
-                return False
-            sent.append(n)
-            _save_progress(post_id, state)
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
+        if SEND_STORY_TXT_TELEGRAM:
+            path = f"/tmp/story_{re.sub(r'[^a-zA-Z0-9_]', '_', str(post_id))}_PART_{n}.txt"
+            try:
+                create_part_txt(outputs[n], n, path)
+                if not send_telegram_document(path, caption=f"📄 PART {n} — Page: {page_name}"):
+                    return False
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
+        # 'sent' là checkpoint đã xử lý phần, để web publishing không bị chặn.
+        sent.append(n)
+        _save_progress(post_id, state)
     # Chỉ những bài được worker xác nhận mới sau mốc kích hoạt mới tự xuất bản.
     # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
     if state.get("auto_publish_eligible") and ENABLE_AUTO_WEB_PUBLISH:
         _auto_publish_with_retry(post_id)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
-    print(f"[OPENAI] Bài {post_id}: đã gửi đủ Part 2/3/4, không tạo lại.")
+    print(f"[OPENAI] Bài {post_id}: đã hoàn tất Part 2/3/4, không tạo lại.")
     return True
 
 
@@ -1090,10 +1094,7 @@ def _to_html(body, navigation=None):
     content = "\n".join("<p>" + html.escape(p).replace("\n", "<br>") + "</p>" for p in paragraphs if p.strip())
     if navigation:
         content += '<hr><nav aria-label="Story chapters">' + " | ".join(
-            '<a href="%s">%s</a>' % (
-    html.escape(url, quote=True),
-    html.escape("PART 4(THE END):" if label == "NEXT: PART 4" else label)
-)
+            '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
             for label, url in navigation
         ) + '</nav>'
     return content
@@ -1488,7 +1489,7 @@ def publish_approved_story(post_id):
         if n > 2:
             nav.append((f"PREVIOUS: PART {n-1}", web[str(n-1)]["url"]))
         if n < 4:
-            nav.append((f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
+            nav.append((f"NEXT: PART 4(THE END):" if n + 1 == 4 else f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
         _web_update_chapter(session, web[str(n)], _web_part_title(base_title, n, title_page_number),
                             _to_html(_story_body(parts[str(n)], n), nav), image_url,
                             prev_slug=web[str(n-1)]["slug"] if n > 2 else "",
