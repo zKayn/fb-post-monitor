@@ -1459,9 +1459,9 @@ def _bioblog_api_create(title, content, feature_image, permalink):
         "feature_image": feature_image,
         "mode": "normal",
     }
-    # author dùng để tạo slug theo API docs; cột AUTHOR trong Admin phụ thuộc backend.
-    # Official docs use `author` to construct slug; omitting prevents forced -phi suffix.
-    # Bearer identity determines account; WEB_AUTHOR is only an expected verification value.
+    # API BioBlog yêu cầu author là username chính xác. Không suy luận ownership
+    # từ Bearer token dùng chung cho cả domain.
+    payload["author"] = _bioblog_expected_author()
     url = WEB_BASE_URL + "/api/posts"
     try:
         # Không retry POST mơ hồ vì có nguy cơ đăng bài trùng.
@@ -1496,13 +1496,15 @@ def _bioblog_api_create(title, content, feature_image, permalink):
     if not slug:
         raise RuntimeError("POST thành công nhưng response thiếu slug/link; kiểm tra Admin, KHÔNG tự đăng lại")
     if not link:
-        link = WEB_BASE_URL + "/blog/" + str(slug)
+        # Slug của BioBlog có thể bị biến đổi bởi author; không đoán URL.
+        raise RuntimeError("POST thành công nhưng thiếu URL công khai; kiểm tra Admin, không POST lại")
     if isinstance(link, str) and link.startswith("/"):
         link = WEB_BASE_URL + link
     parsed = urlparse(str(link))
     if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
         raise RuntimeError("POST thành công nhưng link không thuộc website; kiểm tra Admin trước khi thử lại")
-    return {"id": record.get("id"), "slug": str(slug), "url": str(link)}
+    return {"id": record.get("id"), "slug": str(slug), "url": str(link),
+            "api_author": response_author, "author_requested": _bioblog_expected_author()}
 
 
 def _bioblog_expected_author():
@@ -1534,13 +1536,46 @@ def _bioblog_author_from_record(obj):
 
 
 def _bioblog_verify_post_owner(record):
-    """Verify against official GET /api/posts/{slug}; no undocumented admin endpoints."""
+    """Chỉ xác minh AUTHOR khi API thực sự trả danh tính.
+
+    Không đồng nhất trường AUTHOR với quyền quản lý (Created by).
+    Không dùng GET thiếu author để kết luận POST thất bại.
+    """
     expected = _bioblog_expected_author()
+    found = record.get("api_author")
+    if found:
+        if found.casefold() != expected.casefold():
+            raise RuntimeError(f"[WEB-AUTHOR-MISMATCH] POST ghi '{found}', cần '{expected}'")
+        return True
     slug = str(record.get("slug") or "").strip()
     if not slug:
-        raise RuntimeError("[WEB-AUTHOR] Thiếu slug để xác minh")
+        raise RuntimeError("[WEB-AUTHOR] Thiếu slug, cần kiểm tra Admin")
+    token = _bioblog_token()
+    from urllib.parse import quote
+    try:
+        response = requests.get(WEB_BASE_URL + "/api/posts/" + quote(slug, safe=""),
+            headers={"Authorization": "Bearer " + token, "Accept": "application/json"}, timeout=(10, 30))
+    except requests.RequestException as exc:
+        raise RuntimeError("[WEB-AUTHOR] GET lỗi mạng; không POST lại: " + str(exc)) from exc
+    if response.status_code != 200:
+        raise RuntimeError(f"[WEB-AUTHOR] GET HTTP {response.status_code}; không POST lại")
+    try:
+        found = _bioblog_author_from_record(response.json())
+    except ValueError as exc:
+        raise RuntimeError("[WEB-AUTHOR] GET không trả JSON") from exc
+    if not found:
+        # Không đánh đồng thiếu field với author sai. Bắt buộc xác nhận ngoài API.
+        raise RuntimeError("[WEB-AUTHOR-UNVERIFIABLE] API không trả AUTHOR. "
+                           "Bài đã có checkpoint; cần xác nhận trong tài khoản Phi. Không POST lại")
+    if found.casefold() != expected.casefold():
+        raise RuntimeError(f"[WEB-AUTHOR-MISMATCH] API ghi '{found}', cần '{expected}'")
+    record["api_author"] = found
+    return True
+
+
+def _bioblog_token():
     host = (urlparse(WEB_BASE_URL).hostname or "").lower()
-    token_map = {
+    mapping = {
         "puretales.cafex.biz": "PURETALES_CAFEX_TOKEN",
         "twisttales.idolsgift.com": "TWISTTALES_TOKEN",
         "storynests.idolsgift.com": "STORYNESTS_TOKEN",
@@ -1549,27 +1584,12 @@ def _bioblog_verify_post_owner(record):
         "echoesofstories.feji.io": "ECHOES_FEJI_TOKEN",
         "echoesofstories.idolsgift.com": "ECHOES_TOKEN",
     }
-    token = os.getenv(token_map.get(host, ""), "").strip() or os.getenv("BIOBLOG_API_TOKEN", "").strip() or os.getenv("WEB_API_TOKEN", "").strip()
+    token = (os.getenv(mapping.get(host, ""), "").strip() or
+             os.getenv("BIOBLOG_API_TOKEN", "").strip() or
+             os.getenv("WEB_API_TOKEN", "").strip())
     if not token:
-        raise RuntimeError("[WEB-AUTHOR] Thiếu token để xác minh")
-    from urllib.parse import quote
-    try:
-        response = requests.get(WEB_BASE_URL + "/api/posts/" + quote(slug, safe=""),
-            headers={"Authorization": "Bearer " + token, "Accept": "application/json"}, timeout=(10, 30))
-    except requests.RequestException as exc:
-        raise RuntimeError("[WEB-AUTHOR] Không thể xác minh bài; giữ checkpoint, không POST lại: " + str(exc)) from exc
-    if response.status_code != 200:
-        raise RuntimeError(f"[WEB-AUTHOR] GET xác minh HTTP {response.status_code}; giữ checkpoint, không POST lại")
-    try:
-        obj = response.json()
-    except ValueError as exc:
-        raise RuntimeError("[WEB-AUTHOR] GET không trả JSON; giữ checkpoint") from exc
-    found = _bioblog_author_from_record(obj)
-    if not found:
-        raise RuntimeError("[WEB-AUTHOR] API GET không trả thông tin người viết; chưa thể xác minh quyền quản lý. Không gửi link hoặc POST lại")
-    if found.casefold() != expected.casefold():
-        raise RuntimeError(f"[WEB-AUTHOR-MISMATCH] API ghi tác giả '{found}', cần '{expected}'. Không gửi link")
-    return True
+        raise RuntimeError("Thiếu BioBlog API token cho " + host)
+    return token
 
 
 def publish_approved_story(post_id):
@@ -1589,11 +1609,19 @@ def publish_approved_story(post_id):
     existing = state.get("web_posts") or {}
     old_platform = state.get("publish_platform") not in ("bioblog_official_verified",)
     if old_platform and (existing or state.get("web_links_telegram_sent") or state.get("web_publish_complete")):
-        raise RuntimeError(
-            "[WEB-AUTHOR-LEGACY] Bài đã được đăng bằng cơ chế cũ, "
-            "chưa xác minh thuộc WEB_AUTHOR. Không đăng lại và không gán link cũ. "
-            "Hãy chuyển quyền tác giả trên BioBlog và xác minh rồi khôi phục thủ công."
-        )
+        # Có bài cũ: giữ nguyên và thử xác minh từng URL bằng GET, không POST lại.
+        # Nếu API không cung cấp AUTHOR, dừng và yêu cầu kiểm tra thủ công.
+        if not existing:
+            raise RuntimeError("[WEB-AUTHOR-LEGACY] Đã gửi link nhưng không có bản ghi; kiểm tra Admin")
+        for old_key, old_rec in existing.items():
+            if old_rec.get("url"):
+                if not old_rec.get("slug"):
+                    old_rec["slug"] = urlparse(old_rec["url"]).path.rstrip("/").split("/")[-1]
+                _bioblog_verify_post_owner(old_rec)
+        state["web_posts"] = existing
+        state["publish_platform"] = "bioblog_official_verified"
+        state["publish_author"] = _bioblog_expected_author()
+        _save_progress(post_id, state)
     if old_platform and state.get("web_post_uncertain"):
         raise RuntimeError("[WEB-AUTHOR-LEGACY] POST cũ chưa rõ kết quả; kiểm tra Admin trước khi tiếp tục")
     valid = {}
