@@ -120,9 +120,9 @@ SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
 # Website: 
 PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
-ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
-ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
-SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT_TELEGRAM", "false").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_WEB_PUBLISH_TEST = False  # TAM DUNG: khong nhan lenh /publish
+ENABLE_AUTO_WEB_PUBLISH = False  # TAM DUNG: khong POST website, ke ca ENV=true
+SEND_STORY_TXT_TELEGRAM = True  # Luon gui 3 TXT Part 2/3/4
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
@@ -521,6 +521,7 @@ def _send_telegram_document_unlocked(file_path: str, caption: str = ""):
             with open(file_path, "rb") as f:
                 resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}, files={"document": f}, timeout=180)
             if resp.status_code == 200:
+                resolve_error_alert("telegram_document_failed", "Telegram đã gửi file TXT thành công.")
                 return True
             last_error = f"HTTP {resp.status_code}: {resp.text[:1000]}"
         except Exception as e:
@@ -1016,7 +1017,10 @@ def _resume_story(page_name, post_id, caption):
         if not result:
             return False
         parts[key] = result
-        _save_progress(post_id, state)  # atomic checkpoint immediately after success
+        _save_progress(post_id, state)
+        resolve_error_alert(f"openai_api_part_{n}_failed", f"OpenAI đã tạo lại thành công Part {n}.")
+        resolve_error_alert(f"openai_part_{n}_generation_failed", f"Đã tạo được Part {n}.")
+        resolve_error_alert(f"openai_part_{n}_validation_failed", f"Part {n} đã đạt điều kiện nội dung.")  # atomic checkpoint immediately after success
 
     _cache_write(caption, parts)
     story = "\n\n".join((
@@ -1045,6 +1049,8 @@ def _resume_story(page_name, post_id, caption):
     # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
     if state.get("auto_publish_eligible") and ENABLE_AUTO_WEB_PUBLISH:
         _auto_publish_with_retry(post_id)
+    resolve_error_alert("story_resume_" + str(post_id), f"Bài {post_id} đã xử lý xong và gửi TXT.")
+    resolve_error_alert(f"worker_{post_id}", f"Bài {post_id} đã xử lý thành công.")
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
     print(f"[OPENAI] Bài {post_id}: đã hoàn tất Part 2/3/4, không tạo lại.")
@@ -1652,6 +1658,7 @@ def _bioblog_legacy_reconcile(post_id, state):
 
 
 def publish_approved_story(post_id):
+    raise RuntimeError("[WEB-PAUSED] Chuc nang tao link website dang tam tat; chi gui TXT.")
     if PUBLISH_PLATFORM == "wordpress":
         return publish_wordpress_story(post_id)
     post_id = str(post_id).strip()
@@ -1917,26 +1924,56 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
                 print(f"[STORY] Không lưu được lịch thử lại {post_id}: {exc}")
 
 
-ERROR_COOLDOWN_MINUTES = 30
-_last_error_sent_at = {}
+# Trang thai loi/khac phuc luu ben vung tren Railway Volume.
+# Moi error_key: chi 1 thong bao loi trong mot dot, va 1 thong bao khac phuc
+# khi co bang chung hoat dong thanh cong. Loi xuat hien lai sau khi phuc hoi
+# duoc coi la dot loi moi.
+ERROR_STATUS_FILE = "/data/error_status_v2.json"
+_ERROR_STATUS_LOCK = threading.RLock()
 
+def _read_error_status():
+    try:
+        with open(ERROR_STATUS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+_error_status = _read_error_status()
+
+def _save_error_status():
+    os.makedirs(os.path.dirname(ERROR_STATUS_FILE), exist_ok=True)
+    tmp = ERROR_STATUS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_error_status, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, ERROR_STATUS_FILE)
+
+def _error_key(error_key):
+    return re.sub(r"\b\d{10,}_\d{10,}\b", "POST_ID", str(error_key))
 
 def send_error_alert(error_key: str, text: str):
-    now = datetime.now()
-    # Chỉ gửi một lần cho mỗi loại lỗi, kể cả sau khi restart.
-    error_key = re.sub(r"\b\d{10,}_\d{10,}\b", "POST_ID", error_key)
-    if error_key in error_once_keys:
-        return
-    last_sent = _last_error_sent_at.get(error_key)
-    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
-        return
-    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
-    _last_error_sent_at[error_key] = now
-    error_once_keys.add(error_key)
-    try:
-        _save_keys(ERROR_ONCE_FILE, error_once_keys)
-    except OSError as exc:
-        print(f"[CẢNH BÁO] Không lưu được error-once: {exc}")
+    key = _error_key(error_key)
+    with _ERROR_STATUS_LOCK:
+        if _error_status.get(key) == "active":
+            return False
+        # Ghi trang thai truoc khi gui de retry/redeploy khong spam.
+        _error_status[key] = "active"
+        _save_error_status()
+        now = datetime.now()
+        return send_telegram_message(
+            f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}"
+        )
+
+def resolve_error_alert(error_key: str, description: str):
+    key = _error_key(error_key)
+    with _ERROR_STATUS_LOCK:
+        if _error_status.get(key) != "active":
+            return False
+        _error_status[key] = "resolved"
+        _save_error_status()
+        return send_telegram_message(f"✅ ĐÃ KHẮC PHỤC: {description}")
 
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
@@ -1991,22 +2028,13 @@ def note_fb_network_failure(error_key: str, text: str):
         _fb_network_alerted.add(error_key)
 
 def note_fb_network_success(error_key: str):
-    """Reset bộ đếm khi request Facebook thành công."""
+    """Chi bao phuc hoi neu loi do da tung duoc bao va API thuc su thanh cong."""
     had_failures = _fb_network_failures.get(error_key, 0)
-    was_alerted = error_key in _fb_network_alerted
     _fb_network_failures[error_key] = 0
     _fb_network_alerted.discard(error_key)
-    if was_alerted:
-        recovery_key = f"recovered_{error_key}"
-        if recovery_key not in error_once_keys:
-            send_telegram_message("✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
-            error_once_keys.add(recovery_key)
-            try:
-                _save_keys(ERROR_ONCE_FILE, error_once_keys)
-            except OSError as exc:
-                print(f"[CẢNH BÁO] Không lưu được recovery-once: {exc}")
-    elif had_failures:
-        print(f"[FACEBOOK NETWORK] {error_key}: kết nối đã phục hồi sau {had_failures} lần lỗi.")
+    resolve_error_alert(error_key, f"Facebook API đã kết nối lại ({error_key}).")
+    if had_failures:
+        print(f"[FACEBOOK NETWORK] {error_key}: ket noi phuc hoi sau {had_failures} lan loi.")
 
 # -------------------- Facebook API --------------------
 _managed_pages_cache = {"at": 0.0, "pages": []}
@@ -2181,6 +2209,7 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             send_error_alert("batch_request_error", f"Batch request thất bại: {err}")
             continue
 
+        resolve_error_alert("batch_request_error", "Facebook Batch API đã trả dữ liệu hợp lệ.")
         n_metrics = len(METRIC_FALLBACKS)
         items_per_post = n_metrics + 1  # 2 insights + 1 fields
 
@@ -2729,6 +2758,7 @@ def check_all_pages():
 
 
 def main():
+    print("[WEB-PAUSED] Tam tat toan bo tao link web, giu checkpoint cu; chi gui TXT 2/3/4.")
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
     if PUBLISH_PLATFORM == "wordpress":
         threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
@@ -2739,6 +2769,7 @@ def main():
         scan_started = time.monotonic()
         try:
             check_all_pages()
+            resolve_error_alert("main_loop_exception", "Vòng quét Facebook đã chạy thành công.")
         except Exception as e:
             print(f"[LỖI] Lỗi không xác định trong vòng quét: {e}")
             send_error_alert("main_loop_exception", f"Lỗi không xác định trong vòng quét:\n{e}")
