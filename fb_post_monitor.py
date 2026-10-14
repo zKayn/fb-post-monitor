@@ -1583,6 +1583,74 @@ def _bioblog_token():
     return token
 
 
+def _bioblog_legacy_reconcile(post_id, state):
+    """One-time, explicitly authorized migration of legacy records.
+
+    Railway WEB_LEGACY_RECONCILE_JSON example:
+    {"PAGEID_POSTID":{"author":"Phi","existing":{"4":"https://host/blog/slug"},
+      "not_created":["2","3"]}}
+    `existing` URLs must have been checked by a human in the editor's Posts UI.
+    `not_created` must have been checked by a human in Admin; otherwise never POST.
+    """
+    raw = os.getenv("WEB_LEGACY_RECONCILE_JSON", "").strip()
+    if not raw:
+        return False
+    try:
+        instructions = json.loads(raw)
+        item = instructions.get(post_id) if isinstance(instructions, dict) else None
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("WEB_LEGACY_RECONCILE_JSON không phải JSON hợp lệ") from exc
+    if item is None:
+        return False
+    author = _bioblog_expected_author()
+    if not isinstance(item, dict) or str(item.get("author", "")).casefold() != author.casefold():
+        raise RuntimeError("[WEB-RECOVERY] Xác nhận author trong JSON không khớp WEB_AUTHOR")
+    existing = item.get("existing") or {}
+    absent = {str(n) for n in (item.get("not_created") or [])}
+    if not isinstance(existing, dict) or not absent.issubset({"2", "3", "4"}):
+        raise RuntimeError("[WEB-RECOVERY] Cấu trúc existing/not_created không hợp lệ")
+    web = state.setdefault("web_posts", {})
+    uncertain = state.setdefault("web_post_uncertain", {})
+    for n in (2, 3, 4):
+        key = str(n)
+        url = existing.get(key)
+        if url:
+            parsed = urlparse(str(url))
+            if (parsed.scheme != "https" or parsed.netloc.lower() !=
+                    urlparse(WEB_BASE_URL).netloc.lower() or not parsed.path.rstrip("/").split("/")[-1]):
+                raise RuntimeError(f"[WEB-RECOVERY] URL Part {n} không hợp lệ/khác website")
+            slug = parsed.path.rstrip("/").split("/")[-1]
+            # The documented GET endpoint establishes existence, not account ownership.
+            try:
+                r = requests.get(WEB_BASE_URL + "/api/posts/" + slug,
+                                 headers={"Authorization": "Bearer " + _bioblog_token(),
+                                          "Accept": "application/json"}, timeout=(10, 30))
+            except requests.RequestException as exc:
+                raise RuntimeError(f"[WEB-RECOVERY] Không kiểm tra được Part {n}: {exc}") from exc
+            if r.status_code != 200:
+                raise RuntimeError(f"[WEB-RECOVERY] GET Part {n} trả HTTP {r.status_code}; không nhận link")
+            old = web.get(key) or {}
+            if old.get("url") and old["url"].rstrip("/") != str(url).rstrip("/"):
+                raise RuntimeError(f"[WEB-RECOVERY] Part {n} URL checkpoint khác URL đã duyệt")
+            web[key] = {**old, "slug": slug, "url": str(url),
+                        "author_requested": author, "recovery_manual_confirmed": True,
+                        "ownership_verified": False}
+            uncertain.pop(key, None)
+        elif key in absent:
+            if (web.get(key) or {}).get("url"):
+                raise RuntimeError(f"[WEB-RECOVERY] Part {n} có URL cũ; không được khai báo not_created")
+            uncertain.pop(key, None)
+        elif (web.get(key) or {}).get("url") or uncertain.get(key):
+            raise RuntimeError(f"[WEB-RECOVERY] Part {n} chưa được đối chiếu: existing hoặc not_created")
+    state["publish_platform"] = "bioblog_official_checkpointed"
+    state["publish_target"] = WEB_BASE_URL
+    state["publish_author"] = author
+    state["web_legacy_reconciled"] = True
+    _save_progress(post_id, state)
+    print(f"[WEB-RECOVERY] {post_id}: checkpoint reconciled after explicit manual confirmation")
+    return True
+
+
 def publish_approved_story(post_id):
     if PUBLISH_PLATFORM == "wordpress":
         return publish_wordpress_story(post_id)
@@ -1596,7 +1664,8 @@ def publish_approved_story(post_id):
         raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false")
     if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
         raise RuntimeError("Checkpoint thuộc website khác")
-    # Legacy records are NOT proof of ownership. Do not silently attach them to Phi.
+    # Reconcile only when the operator explicitly confirmed actual posts in BioBlog.
+    _bioblog_legacy_reconcile(post_id, state)
     existing = state.get("web_posts") or {}
     old_platform = state.get("publish_platform") not in ("bioblog_official_checkpointed",)
     if old_platform and (existing or state.get("web_links_telegram_sent") or state.get("web_publish_complete")):
@@ -1622,7 +1691,7 @@ def publish_approved_story(post_id):
             valid[str(n)] = rec
     # A manually provided URL alone is never proof of ownership.
     if os.getenv("WEB_RECOVERY_LINKS_JSON", "").strip():
-        raise RuntimeError("[WEB-AUTHOR] Tắt WEB_RECOVERY_LINKS_JSON: URL không xác minh được quyền tác giả")
+        raise RuntimeError("[WEB-RECOVERY] Dùng WEB_LEGACY_RECONCILE_JSON có xác nhận thay vì WEB_RECOVERY_LINKS_JSON")
     state["web_posts"] = valid
     current_author = os.getenv("WEB_AUTHOR", "").strip()
     if not current_author:
@@ -1741,7 +1810,12 @@ def _auto_publish_with_retry(post_id):
             state["web_last_error"] = str(exc)[:800]
             _save_progress(post_id, state)
             print(f"[AUTO-WEB] {post_id}: {exc}; retry in {AUTO_PUBLISH_RETRY_SECONDS}s")
-            send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; các Part đã đăng được lưu checkpoint.")
+            # Avoid repeated Telegram warnings for the same unchanged checkpoint.
+            signature = str(exc)[:500]
+            if state.get("web_last_alert_signature") != signature:
+                state["web_last_alert_signature"] = signature
+                _save_progress(post_id, state)
+                send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {signature}\nCheckpoint được giữ nguyên, không tự POST lại phần chưa rõ kết quả.")
             return False
 
 
