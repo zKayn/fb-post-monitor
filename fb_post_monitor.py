@@ -51,7 +51,7 @@ COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comme
 
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
-OPENAI_MODEL = "gpt-5.6-luna"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 OPENAI_MAX_OUTPUT_TOKENS = 5000  # cost-control: mục tiêu 2500-3000 từ/Part
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
@@ -1297,7 +1297,7 @@ def post_already_has_link(post_id: str, page_id: str, page_token: str, post_mess
 
 
 # ==================== WEBSITE PUBLISH ====================
-# Chỉ tự đăng sau khi gửi đủ ba TXT; áp dụng mọi Page đạt ngưỡng thông thường.
+# Đăng sau khi đủ 3 Part trong checkpoint; không gửi TXT theo cấu hình bản nguồn.
 
 def _story_title(part2):
     for line in part2.splitlines():
@@ -1739,6 +1739,29 @@ def _bioblog_api_create(title, content, feature_image, permalink):
     return {"id": record.get("id"), "slug": str(slug), "url": str(link)}
 
 
+def _recovery_links_for_post(post_id):
+    """WEB_RECOVERY_LINKS_JSON={"PAGEID_POSTID":{"2":"https://.../blog/...",...}}.
+    Chỉ dùng URL thật do người dùng lấy từ Admin, không suy đoán permalink.
+    """
+    raw = os.getenv("WEB_RECOVERY_LINKS_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("WEB_RECOVERY_LINKS_JSON không phải JSON hợp lệ") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("WEB_RECOVERY_LINKS_JSON phải là object")
+    item = data.get(str(post_id), {})
+    if not isinstance(item, dict):
+        raise RuntimeError("WEB_RECOVERY_LINKS_JSON[post_id] phải là object")
+    for n, link in item.items():
+        parsed = urlparse(str(link))
+        if str(n) not in ("2", "3", "4") or parsed.scheme != "https" or parsed.netloc.lower() != urlparse(WEB_BASE_URL).netloc.lower() or not parsed.path.startswith("/blog/"):
+            raise RuntimeError("Link khôi phục không thuộc /blog/ của WEB_BASE_URL")
+    return item
+
+
 def publish_approved_story(post_id):
     if PUBLISH_PLATFORM == "wordpress":
         return publish_wordpress_story(post_id)
@@ -1752,10 +1775,44 @@ def publish_approved_story(post_id):
         raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false")
     if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
         raise RuntimeError("Checkpoint thuộc website khác")
-    if state.get("web_posts") and state.get("publish_platform") not in (None, "bioblog_official"):
-        raise RuntimeError("Checkpoint từ API Admin cũ: cần kiểm tra thủ công để tránh đăng trùng")
-    if state.get("web_posts") and not state.get("publish_target"):
-        raise RuntimeError("Checkpoint web cũ chưa xác định domain")
+    # Giữ nguyên URL đã đăng bằng API Admin cũ; KHÔNG đăng lại các phần thiếu
+    # khi checkpoint không đủ bằng chứng. Có thể khôi phục thủ công qua JSON ENV.
+    existing = state.get("web_posts") or {}
+    old_platform = state.get("publish_platform") not in (None, "bioblog_official")
+    recovery = _recovery_links_for_post(post_id)
+    if recovery:
+        existing = dict(existing)
+        for n, url in recovery.items():
+            if str(n) not in ("2", "3", "4"):
+                continue
+            current = existing.get(str(n)) or {}
+            if current.get("url") and current["url"] != url:
+                raise RuntimeError(f"Part {n}: URL checkpoint khác URL khôi phục; cần kiểm tra thủ công")
+            existing[str(n)] = {"url": url, "slug": urlparse(url).path.rstrip("/").split("/")[-1]}
+    valid = {}
+    for n in (2, 3, 4):
+        rec = existing.get(str(n)) or {}
+        link = str(rec.get("url") or "").strip()
+        parsed = urlparse(link)
+        if parsed.scheme == "https" and parsed.netloc.lower() == urlparse(WEB_BASE_URL).netloc.lower() and parsed.path.startswith("/blog/") and parsed.path.rstrip("/").split("/")[-1]:
+            valid[str(n)] = {"url": link, "slug": rec.get("slug") or parsed.path.rstrip("/").split("/")[-1], "id": rec.get("id")}
+    if old_platform or (existing and not state.get("publish_target")):
+        if len(valid) != 3:
+            missing = [str(n) for n in (2, 3, 4) if str(n) not in valid]
+            raise RuntimeError(f"[WEB-MIGRATE] Đã có {len(valid)}/3 URL cũ, thiếu Part {', '.join(missing)}. "
+                               "Không đăng lại để tránh trùng. Khai báo WEB_RECOVERY_LINKS_JSON với link thật trong Admin")
+        state["web_migrated_from_admin_api"] = True
+        print(f"[WEB-MIGRATE] {post_id}: đã phục hồi đủ 3 URL, không POST lại")
+    elif recovery:
+        # Nếu có phần đã đăng mà không có URL, tuyệt đối không đoán.
+        print(f"[WEB-RECOVERY] {post_id}: đã nhập {len(valid)} URL thủ công")
+    state["web_posts"] = valid
+    current_author = os.getenv("WEB_AUTHOR", "").strip() or os.getenv("BIOBLOG_API_AUTHOR", "").strip() or os.getenv("WEB_ADMIN_EMAIL", "").strip()
+    if not current_author:
+        raise RuntimeError("Thiếu WEB_AUTHOR: không thể xác định người viết BioBlog")
+    if state.get("publish_author") and state["publish_author"].casefold() != current_author.casefold():
+        raise RuntimeError("Checkpoint thuộc AUTHOR khác; không thể chuyển bài giữa các tài khoản")
+    state["publish_author"] = current_author
     state["publish_target"] = WEB_BASE_URL
     state["publish_platform"] = "bioblog_official"
     _save_progress(post_id, state)
@@ -1765,7 +1822,7 @@ def publish_approved_story(post_id):
     page_id = post_id.split("_", 1)[0]
     # API công khai nhận URL ảnh, không dùng endpoint upload nội bộ /admin/api/v1.
     image_url = state.get("web_featured_image")
-    if not image_url:
+    if not image_url and not all(web.get(str(n), {}).get("url") for n in (2, 3, 4)):
         page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
         if not page or not page.get("access_token"):
             raise RuntimeError("Thiếu Page token để lấy ảnh gốc")
@@ -1839,7 +1896,11 @@ def _auto_publish_with_retry(post_id):
             state["web_last_error"] = str(exc)[:800]
             _save_progress(post_id, state)
             print(f"[AUTO-WEB] {post_id}: {exc}; retry in {AUTO_PUBLISH_RETRY_SECONDS}s")
-            send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; các Part đã đăng được lưu checkpoint.")
+            alert_key = "web_error_notified_" + hashlib.sha256(str(exc).encode()).hexdigest()[:12]
+            if not state.get(alert_key):
+                send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nCác Part đã đăng được giữ nguyên. Nếu thiếu URL checkpoint, cần khôi phục link thật từ Admin.")
+                state[alert_key] = True
+                _save_progress(post_id, state)
             return False
 
 
