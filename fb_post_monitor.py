@@ -120,9 +120,9 @@ SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
 # Website: 
 PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
-ENABLE_WEB_PUBLISH_TEST = False  # TAM DUNG: khong nhan lenh /publish
-ENABLE_AUTO_WEB_PUBLISH = False  # TAM DUNG: khong POST website, ke ca ENV=true
-SEND_STORY_TXT_TELEGRAM = True  # Luon gui 3 TXT Part 2/3/4
+ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
+ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
+SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT_TELEGRAM", "false").strip().lower() in ("1", "true", "yes", "on")
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
@@ -521,7 +521,6 @@ def _send_telegram_document_unlocked(file_path: str, caption: str = ""):
             with open(file_path, "rb") as f:
                 resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}, files={"document": f}, timeout=180)
             if resp.status_code == 200:
-                resolve_error_alert("telegram_document_failed", "Telegram đã gửi file TXT thành công.")
                 return True
             last_error = f"HTTP {resp.status_code}: {resp.text[:1000]}"
         except Exception as e:
@@ -1017,10 +1016,7 @@ def _resume_story(page_name, post_id, caption):
         if not result:
             return False
         parts[key] = result
-        _save_progress(post_id, state)
-        resolve_error_alert(f"openai_api_part_{n}_failed", f"OpenAI đã tạo lại thành công Part {n}.")
-        resolve_error_alert(f"openai_part_{n}_generation_failed", f"Đã tạo được Part {n}.")
-        resolve_error_alert(f"openai_part_{n}_validation_failed", f"Part {n} đã đạt điều kiện nội dung.")  # atomic checkpoint immediately after success
+        _save_progress(post_id, state)  # atomic checkpoint immediately after success
 
     _cache_write(caption, parts)
     story = "\n\n".join((
@@ -1049,8 +1045,6 @@ def _resume_story(page_name, post_id, caption):
     # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
     if state.get("auto_publish_eligible") and ENABLE_AUTO_WEB_PUBLISH:
         _auto_publish_with_retry(post_id)
-    resolve_error_alert("story_resume_" + str(post_id), f"Bài {post_id} đã xử lý xong và gửi TXT.")
-    resolve_error_alert(f"worker_{post_id}", f"Bài {post_id} đã xử lý thành công.")
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
     print(f"[OPENAI] Bài {post_id}: đã hoàn tất Part 2/3/4, không tạo lại.")
@@ -1430,235 +1424,7 @@ def publish_wordpress_story(post_id):
         _save_progress(post_id, state)
 
 
-def _bioblog_slug(value):
-    """Nguồn permalink: giữ kiểu slug từ tiêu đề, không tự nối tên author."""
-    import unicodedata
-    value = unicodedata.normalize("NFKD", value)
-    value = "".join(c for c in value if not unicodedata.combining(c))
-    value = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    return value[:180].rstrip("-")
-
-
-def _bioblog_api_create(title, content, feature_image, permalink):
-    """Chỉ sử dụng POST /api/posts trong tài liệu chính thức."""
-    # Chọn Bearer token đúng website từ các Railway Variables đã có sẵn.
-    token_env_by_host = {
-        "puretales.cafex.biz": "PURETALES_CAFEX_TOKEN",
-        "twisttales.idolsgift.com": "TWISTTALES_TOKEN",
-        "storynests.idolsgift.com": "STORYNESTS_TOKEN",
-        "storyviral.idolsgift.com": "STORYVIRAL_TOKEN",
-        "puretales.idolsgift.com": "PURETALES_TOKEN",
-        "echoesofstories.feji.io": "ECHOES_FEJI_TOKEN",
-        "echoesofstories.idolsgift.com": "ECHOES_TOKEN",
-    }
-    host = (urlparse(WEB_BASE_URL).hostname or "").lower()
-    token_key = token_env_by_host.get(host)
-    token = (os.getenv(token_key, "").strip() if token_key else "")
-    if not token:
-        token = os.getenv("BIOBLOG_API_TOKEN", "").strip() or os.getenv("WEB_API_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError(f"Thiếu Bearer token BioBlog cho {host}: {token_key or 'BIOBLOG_API_TOKEN'}")
-    payload = {
-        "title": title,
-        "content": content,
-        "permalink": permalink,
-        "feature_image": feature_image,
-        "mode": "normal",
-    }
-    # Theo tài liệu, author được dùng để xây dựng final slug.
-    # Không suy luận quyền quản lý/Created by từ giá trị này.
-    payload["author"] = _bioblog_expected_author()
-    url = WEB_BASE_URL + "/api/posts"
-    try:
-        # Không retry POST mơ hồ vì có nguy cơ đăng bài trùng.
-        response = requests.post(url, json=payload, headers={
-            "Authorization": "Bearer " + token,
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }, timeout=(15, 90))
-    except requests.RequestException as exc:
-        raise RuntimeError("POST /api/posts chưa rõ thành công hay chưa; "
-                           "dừng để kiểm tra Admin trước khi thử lại, tránh đăng trùng: " + str(exc))
-    if response.status_code not in (200, 201):
-        raise RuntimeError(f"BioBlog POST /api/posts HTTP {response.status_code}: {response.text[:350]}")
-    try:
-        obj = response.json()
-    except ValueError:
-        raise RuntimeError("BioBlog đã trả thành công nhưng JSON không đọc được; kiểm tra Admin tránh đăng trùng")
-    # API documentation promises ID, slug, frontend link, not ownership metadata.
-    # `author` in POST is explicitly described as a slug source.
-    response_author = None
-    record = obj.get("data", obj) if isinstance(obj, dict) else {}
-    if isinstance(record, dict) and isinstance(record.get("post"), dict):
-        record = record["post"]
-    if isinstance(record, list):
-        record = record[0] if record else {}
-    if not isinstance(record, dict):
-        record = {}
-    # API docs: trả ID, slug, frontend link; không giả định tên khóa cố định.
-    slug = record.get("slug") or record.get("post_slug")
-    link = (record.get("frontend_link") or record.get("frontend_url") or
-            record.get("frontendLink") or record.get("public_url") or
-            record.get("url") or record.get("link"))
-    if not slug and isinstance(link, str):
-        slug = urlparse(link).path.rstrip("/").split("/")[-1]
-    if not slug:
-        raise RuntimeError("POST thành công nhưng response thiếu slug/link; kiểm tra Admin, KHÔNG tự đăng lại")
-    if not link:
-        # Slug của BioBlog có thể bị biến đổi bởi author; không đoán URL.
-        raise RuntimeError("POST thành công nhưng thiếu URL công khai; kiểm tra Admin, không POST lại")
-    if isinstance(link, str) and link.startswith("/"):
-        link = WEB_BASE_URL + link
-    parsed = urlparse(str(link))
-    if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
-        raise RuntimeError("POST thành công nhưng link không thuộc website; kiểm tra Admin trước khi thử lại")
-    return {"id": record.get("id"), "slug": str(slug), "url": str(link),
-            "api_author": response_author, "author_requested": _bioblog_expected_author()}
-
-
-def _bioblog_expected_author():
-    author = os.getenv("WEB_AUTHOR", "").strip()
-    if not author:
-        raise RuntimeError("Thiếu WEB_AUTHOR; không được mặc định dùng Admin")
-    return author
-
-
-def _bioblog_author_from_record(obj):
-    """Metadata only. The documented `author` parameter is a slug source.
-
-    Do not confuse `created_by` (account ownership) with `author` (slug input).
-    """
-    if not isinstance(obj, dict):
-        return None
-    value = obj.get("author")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, dict):
-        for key in ("username", "name"):
-            if isinstance(value.get(key), str) and value[key].strip():
-                return value[key].strip()
-    for key in ("data", "post"):
-        if isinstance(obj.get(key), dict):
-            return _bioblog_author_from_record(obj[key])
-    return None
-
-
-def _bioblog_verify_post_owner(record):
-    """Verify the *documented* POST acknowledgement, not unsupported ownership.
-
-    BioBlog documentation: POST returns id, slug and frontend link; `author`
-    is used for slug generation. GET does not promise author or created_by.
-    Ownership must be confirmed in BioBlog UI or by the backend provider.
-    """
-    if not isinstance(record, dict):
-        raise RuntimeError("[WEB-POST] Checkpoint không hợp lệ")
-    expected = _bioblog_expected_author()
-    requested = str(record.get("author_requested") or "").strip()
-    if requested.casefold() != expected.casefold():
-        raise RuntimeError("[WEB-LEGACY] Bài cũ không có dấu vết POST với "
-                           "WEB_AUTHOR hiện tại; cần đối chiếu thủ công, không POST lại")
-    url = str(record.get("url") or "").strip()
-    slug = str(record.get("slug") or "").strip()
-    if not slug or not url:
-        raise RuntimeError("[WEB-POST] Thiếu slug hoặc frontend link trong phản hồi POST")
-    parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.netloc.lower() != urlparse(WEB_BASE_URL).netloc.lower():
-        raise RuntimeError("[WEB-POST] URL không thuộc website BioBlog đã cấu hình")
-    if parsed.path.rstrip("/").split("/")[-1] != slug:
-        raise RuntimeError("[WEB-POST] Slug không khớp frontend link")
-    record["post_acknowledged"] = True
-    record["ownership_verified"] = False  # Not supported by the documented API.
-    return True
-
-def _bioblog_token():
-    host = (urlparse(WEB_BASE_URL).hostname or "").lower()
-    mapping = {
-        "puretales.cafex.biz": "PURETALES_CAFEX_TOKEN",
-        "twisttales.idolsgift.com": "TWISTTALES_TOKEN",
-        "storynests.idolsgift.com": "STORYNESTS_TOKEN",
-        "storyviral.idolsgift.com": "STORYVIRAL_TOKEN",
-        "puretales.idolsgift.com": "PURETALES_TOKEN",
-        "echoesofstories.feji.io": "ECHOES_FEJI_TOKEN",
-        "echoesofstories.idolsgift.com": "ECHOES_TOKEN",
-    }
-    token = (os.getenv(mapping.get(host, ""), "").strip() or
-             os.getenv("BIOBLOG_API_TOKEN", "").strip() or
-             os.getenv("WEB_API_TOKEN", "").strip())
-    if not token:
-        raise RuntimeError("Thiếu BioBlog API token cho " + host)
-    return token
-
-
-def _bioblog_legacy_reconcile(post_id, state):
-    """One-time, explicitly authorized migration of legacy records.
-
-    Railway WEB_LEGACY_RECONCILE_JSON example:
-    {"PAGEID_POSTID":{"author":"Phi","existing":{"4":"https://host/blog/slug"},
-      "not_created":["2","3"]}}
-    `existing` URLs must have been checked by a human in the editor's Posts UI.
-    `not_created` must have been checked by a human in Admin; otherwise never POST.
-    """
-    raw = os.getenv("WEB_LEGACY_RECONCILE_JSON", "").strip()
-    if not raw:
-        return False
-    try:
-        instructions = json.loads(raw)
-        item = instructions.get(post_id) if isinstance(instructions, dict) else None
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError("WEB_LEGACY_RECONCILE_JSON không phải JSON hợp lệ") from exc
-    if item is None:
-        return False
-    author = _bioblog_expected_author()
-    if not isinstance(item, dict) or str(item.get("author", "")).casefold() != author.casefold():
-        raise RuntimeError("[WEB-RECOVERY] Xác nhận author trong JSON không khớp WEB_AUTHOR")
-    existing = item.get("existing") or {}
-    absent = {str(n) for n in (item.get("not_created") or [])}
-    if not isinstance(existing, dict) or not absent.issubset({"2", "3", "4"}):
-        raise RuntimeError("[WEB-RECOVERY] Cấu trúc existing/not_created không hợp lệ")
-    web = state.setdefault("web_posts", {})
-    uncertain = state.setdefault("web_post_uncertain", {})
-    for n in (2, 3, 4):
-        key = str(n)
-        url = existing.get(key)
-        if url:
-            parsed = urlparse(str(url))
-            if (parsed.scheme != "https" or parsed.netloc.lower() !=
-                    urlparse(WEB_BASE_URL).netloc.lower() or not parsed.path.rstrip("/").split("/")[-1]):
-                raise RuntimeError(f"[WEB-RECOVERY] URL Part {n} không hợp lệ/khác website")
-            slug = parsed.path.rstrip("/").split("/")[-1]
-            # The documented GET endpoint establishes existence, not account ownership.
-            try:
-                r = requests.get(WEB_BASE_URL + "/api/posts/" + slug,
-                                 headers={"Authorization": "Bearer " + _bioblog_token(),
-                                          "Accept": "application/json"}, timeout=(10, 30))
-            except requests.RequestException as exc:
-                raise RuntimeError(f"[WEB-RECOVERY] Không kiểm tra được Part {n}: {exc}") from exc
-            if r.status_code != 200:
-                raise RuntimeError(f"[WEB-RECOVERY] GET Part {n} trả HTTP {r.status_code}; không nhận link")
-            old = web.get(key) or {}
-            if old.get("url") and old["url"].rstrip("/") != str(url).rstrip("/"):
-                raise RuntimeError(f"[WEB-RECOVERY] Part {n} URL checkpoint khác URL đã duyệt")
-            web[key] = {**old, "slug": slug, "url": str(url),
-                        "author_requested": author, "recovery_manual_confirmed": True,
-                        "ownership_verified": False}
-            uncertain.pop(key, None)
-        elif key in absent:
-            if (web.get(key) or {}).get("url"):
-                raise RuntimeError(f"[WEB-RECOVERY] Part {n} có URL cũ; không được khai báo not_created")
-            uncertain.pop(key, None)
-        elif (web.get(key) or {}).get("url") or uncertain.get(key):
-            raise RuntimeError(f"[WEB-RECOVERY] Part {n} chưa được đối chiếu: existing hoặc not_created")
-    state["publish_platform"] = "bioblog_official_checkpointed"
-    state["publish_target"] = WEB_BASE_URL
-    state["publish_author"] = author
-    state["web_legacy_reconciled"] = True
-    _save_progress(post_id, state)
-    print(f"[WEB-RECOVERY] {post_id}: checkpoint reconciled after explicit manual confirmation")
-    return True
-
-
 def publish_approved_story(post_id):
-    raise RuntimeError("[WEB-PAUSED] Chuc nang tao link website dang tam tat; chi gui TXT.")
     if PUBLISH_PLATFORM == "wordpress":
         return publish_wordpress_story(post_id)
     post_id = str(post_id).strip()
@@ -1666,57 +1432,19 @@ def publish_approved_story(post_id):
         raise ValueError("POST_ID phải có dạng PAGEID_POSTID")
     state = _load_progress(post_id)
     if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
-        raise RuntimeError("Chưa đủ Part 2/3/4")
+        raise RuntimeError("Chưa đủ 3 TXT gửi Telegram; không xuất bản")
     if not ENABLE_WEB_PUBLISH_TEST:
-        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false")
+        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false; không có bài nào được đăng")
     if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
-        raise RuntimeError("Checkpoint thuộc website khác")
-    # Reconcile only when the operator explicitly confirmed actual posts in BioBlog.
-    _bioblog_legacy_reconcile(post_id, state)
-    existing = state.get("web_posts") or {}
-    old_platform = state.get("publish_platform") not in ("bioblog_official_checkpointed",)
-    if old_platform and (existing or state.get("web_links_telegram_sent") or state.get("web_publish_complete")):
-        # Checkpoint cũ không có bằng chứng POST của phiên bản này:
-        # không thể suy ra ownership từ GET hoặc từ URL.
-        if not existing:
-            raise RuntimeError("[WEB-AUTHOR-LEGACY] Đã gửi link nhưng không có bản ghi; kiểm tra Admin")
-        for old_key, old_rec in existing.items():
-            if old_rec.get("url"):
-                if not old_rec.get("slug"):
-                    old_rec["slug"] = urlparse(old_rec["url"]).path.rstrip("/").split("/")[-1]
-                _bioblog_verify_post_owner(old_rec)
-        state["web_posts"] = existing
-        state["publish_platform"] = "bioblog_official_checkpointed"
-        state["publish_author"] = _bioblog_expected_author()
-        _save_progress(post_id, state)
-    if old_platform and state.get("web_post_uncertain"):
-        raise RuntimeError("[WEB-AUTHOR-LEGACY] POST cũ chưa rõ kết quả; kiểm tra Admin trước khi tiếp tục")
-    valid = {}
-    for n in (2, 3, 4):
-        rec = existing.get(str(n)) or {}
-        if rec.get("url"):
-            valid[str(n)] = rec
-    # A manually provided URL alone is never proof of ownership.
-    if os.getenv("WEB_RECOVERY_LINKS_JSON", "").strip():
-        raise RuntimeError("[WEB-RECOVERY] Dùng WEB_LEGACY_RECONCILE_JSON có xác nhận thay vì WEB_RECOVERY_LINKS_JSON")
-    state["web_posts"] = valid
-    current_author = os.getenv("WEB_AUTHOR", "").strip()
-    if not current_author:
-        raise RuntimeError("Thiếu WEB_AUTHOR: không thể xác định người viết BioBlog")
-    if state.get("publish_author") and state["publish_author"].casefold() != current_author.casefold():
-        raise RuntimeError("Checkpoint thuộc AUTHOR khác; không thể chuyển bài giữa các tài khoản")
-    state["publish_author"] = current_author
+        raise RuntimeError("Checkpoint thuộc website khác; không tự chuyển bài đã đăng dở")
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
     state["publish_target"] = WEB_BASE_URL
-    state["publish_platform"] = "bioblog_official_checkpointed"
+    state["publish_platform"] = "bioblog"
     _save_progress(post_id, state)
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
     web = state.setdefault("web_posts", {})
-    # Validate existing official records before creating any additional chapters.
-    for previous in (2, 3, 4):
-        rec = web.get(str(previous)) or {}
-        if rec.get("url"):
-            _bioblog_verify_post_owner(rec)
-            rec["author_requested_checked"] = current_author
-            _save_progress(post_id, state)
     parts = state["parts"]
     base_title = _story_title(parts["2"])
     page_id = post_id.split("_", 1)[0]
@@ -1724,63 +1452,61 @@ def publish_approved_story(post_id):
     if not page_name:
         page_record = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
         page_name = (page_record or {}).get("name")
-    title_page_number = _page_number(page_name, page_id)
-    # API công khai nhận URL ảnh, không dùng endpoint upload nội bộ /admin/api/v1.
+    title_page_number = _page_number(page_name, page_id)  # Fail closed với Page chưa có mã
+    # Xuất bản theo thứ tự ngược: Part 4 -> 3 -> 2 để next-link luôn tồn tại.
+    # Link quay lại phần trước cần API edit; khi chưa xác minh API edit,
+    # không tạo liên kết giả. Telegram sẽ cảnh báo để cập nhật thủ công.
+    session = _web_login()
     image_url = state.get("web_featured_image")
-    if not image_url and not all(web.get(str(n), {}).get("url") for n in (2, 3, 4)):
-        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+    if web and not image_url:
+        raise RuntimeError("Checkpoint web cũ thiếu ảnh gốc; không tiếp tục để tránh sai ảnh")
+    if not image_url:
+        pages = get_managed_pages()
+        page = next((p for p in pages if str(p.get("id")) == page_id), None)
         if not page or not page.get("access_token"):
-            raise RuntimeError("Thiếu Page token để lấy ảnh gốc")
-        image_url = _facebook_original_image(post_id, page["access_token"])
-        if not image_url and WEB_ALLOW_IMAGE_FALLBACK:
-            image_url = WEB_POST_IMAGE_URL
-        if not image_url:
-            raise RuntimeError("Không lấy được URL ảnh Facebook; API chính thức chỉ nhận feature_image URL")
+            raise RuntimeError("Không có Page token để lấy ảnh Facebook gốc")
+        image_url = _web_upload_featured_image(session, post_id, page["access_token"])
         state["web_featured_image"] = image_url
         _save_progress(post_id, state)
-    # Đăng 4 -> 3 -> 2: liên kết NEXT trong HTML luôn trỏ tới bài đã có thật.
-    # Tài liệu KHÔNG cung cấp API sửa bài, nên không giả định PUT /api/posts.
+        print(f"[AUTO-WEB] {post_id}: đã upload ảnh dùng chung cho Part 2/3/4")
     for n in (4, 3, 2):
         key = str(n)
         if web.get(key, {}).get("url"):
             continue
-        nav = [(f"NEXT: PART {n+1}", web[str(n+1)]["url"])] if n < 4 else []
+        nav = [(f"READ PART {n+1}", web[str(n+1)]["url"])] if n < 4 and web.get(str(n+1), {}).get("url") else []
         title = _web_part_title(base_title, n, title_page_number)
-        content = _to_html(_story_body(parts[key], n) + "\n\n" + PART_ENDINGS[n], nav)
-        permalink = _bioblog_slug(title)
-        # Dùng permalink theo title (bao gồm AUTHOR_CODE như code cũ);
-        # KHÔNG gắn tên Phi/Loan vào cuối slug.
-        # Ghi trạng thái trước POST: timeout/đứt mạng sẽ KHÔNG tự tạo bài trùng.
-        if state.get("web_post_uncertain", {}).get(key):
-            raise RuntimeError(f"Part {n} từng POST chưa rõ kết quả. Kiểm tra Admin trước khi tiếp tục")
-        state.setdefault("web_post_uncertain", {})[key] = True
-        _save_progress(post_id, state)
-        result = _bioblog_api_create(title, content, image_url, permalink)
+        body = _to_html(_story_body(parts[key], n), nav)
+        result = _web_create_post(session, title, body, image_url)
         web[key] = result
-        state["web_post_uncertain"].pop(key, None)
         _save_progress(post_id, state)
-        # Verify AFTER durable save: if verification fails, never create a duplicate.
-        _bioblog_verify_post_owner(result)
-        web[key]["author_requested_checked"] = current_author
-        _save_progress(post_id, state)
-        print(f"[AUTO-WEB] {post_id}: Part {n} POST confirmed; author slug input={current_author}; "
-              f"ownership NOT API-verifiable: {result['url']}")
-    # Confirm documented POST response for all three before sending links.
-    # This is NOT a check of account-level ownership.
+        print(f"[AUTO-WEB] {post_id}: đã đăng Part {n}: {result['url']}")
+    # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4.
+    linked = state.setdefault("web_linked", [])
     for n in (2, 3, 4):
-        rec = web.get(str(n)) or {}
-        if not rec.get("url"):
-            raise RuntimeError(f"[WEB-AUTHOR] Part {n} chưa có URL")
-        _bioblog_verify_post_owner(rec)
-        rec["author_requested_checked"] = current_author
+        if n in linked:
+            continue
+        nav = []
+        if n > 2:
+            nav.append((f"PREVIOUS: PART {n-1}", web[str(n-1)]["url"]))
+        if n < 4:
+            nav.append((f"NEXT: PART 4(THE END)" if n + 1 == 4 else f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
+        _web_update_chapter(session, web[str(n)], _web_part_title(base_title, n, title_page_number),
+                            _to_html(_story_body(parts[str(n)], n), nav), image_url,
+                            prev_slug=web[str(n-1)]["slug"] if n > 2 else "",
+                            next_slug=web[str(n+1)]["slug"] if n < 4 else "")
+        linked.append(n)
         _save_progress(post_id, state)
+    # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và liên kết hoàn tất.
+    # Lưu checkpoint để các lần retry/redeploy không gửi lại thông báo.
     if not state.get("web_links_telegram_sent"):
+        urls = [web[str(n)].get("url") for n in (2, 3, 4)]
+        if not all(urls):
+            raise RuntimeError("Chưa có đủ 3 URL công khai để gửi Telegram")
         message = "\n".join(f"PART {n}: {web[str(n)]['url']}" for n in (2, 3, 4))
-        if not send_telegram_message(message):
-            raise RuntimeError("Telegram chưa xác nhận gửi 3 link")
+        if send_telegram_message(message) is False:
+            raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
         state["web_links_telegram_sent"] = True
         _save_progress(post_id, state)
-
 
 
 
@@ -1817,12 +1543,7 @@ def _auto_publish_with_retry(post_id):
             state["web_last_error"] = str(exc)[:800]
             _save_progress(post_id, state)
             print(f"[AUTO-WEB] {post_id}: {exc}; retry in {AUTO_PUBLISH_RETRY_SECONDS}s")
-            # Avoid repeated Telegram warnings for the same unchanged checkpoint.
-            signature = str(exc)[:500]
-            if state.get("web_last_alert_signature") != signature:
-                state["web_last_alert_signature"] = signature
-                _save_progress(post_id, state)
-                send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {signature}\nCheckpoint được giữ nguyên, không tự POST lại phần chưa rõ kết quả.")
+            send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; các Part đã đăng được lưu checkpoint.")
             return False
 
 
@@ -1924,56 +1645,26 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
                 print(f"[STORY] Không lưu được lịch thử lại {post_id}: {exc}")
 
 
-# Trang thai loi/khac phuc luu ben vung tren Railway Volume.
-# Moi error_key: chi 1 thong bao loi trong mot dot, va 1 thong bao khac phuc
-# khi co bang chung hoat dong thanh cong. Loi xuat hien lai sau khi phuc hoi
-# duoc coi la dot loi moi.
-ERROR_STATUS_FILE = "/data/error_status_v2.json"
-_ERROR_STATUS_LOCK = threading.RLock()
+ERROR_COOLDOWN_MINUTES = 30
+_last_error_sent_at = {}
 
-def _read_error_status():
-    try:
-        with open(ERROR_STATUS_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
-
-_error_status = _read_error_status()
-
-def _save_error_status():
-    os.makedirs(os.path.dirname(ERROR_STATUS_FILE), exist_ok=True)
-    tmp = ERROR_STATUS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(_error_status, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, ERROR_STATUS_FILE)
-
-def _error_key(error_key):
-    return re.sub(r"\b\d{10,}_\d{10,}\b", "POST_ID", str(error_key))
 
 def send_error_alert(error_key: str, text: str):
-    key = _error_key(error_key)
-    with _ERROR_STATUS_LOCK:
-        if _error_status.get(key) == "active":
-            return False
-        # Ghi trang thai truoc khi gui de retry/redeploy khong spam.
-        _error_status[key] = "active"
-        _save_error_status()
-        now = datetime.now()
-        return send_telegram_message(
-            f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}"
-        )
-
-def resolve_error_alert(error_key: str, description: str):
-    key = _error_key(error_key)
-    with _ERROR_STATUS_LOCK:
-        if _error_status.get(key) != "active":
-            return False
-        _error_status[key] = "resolved"
-        _save_error_status()
-        return send_telegram_message(f"✅ ĐÃ KHẮC PHỤC: {description}")
+    now = datetime.now()
+    # Chỉ gửi một lần cho mỗi loại lỗi, kể cả sau khi restart.
+    error_key = re.sub(r"\b\d{10,}_\d{10,}\b", "POST_ID", error_key)
+    if error_key in error_once_keys:
+        return
+    last_sent = _last_error_sent_at.get(error_key)
+    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
+        return
+    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
+    _last_error_sent_at[error_key] = now
+    error_once_keys.add(error_key)
+    try:
+        _save_keys(ERROR_ONCE_FILE, error_once_keys)
+    except OSError as exc:
+        print(f"[CẢNH BÁO] Không lưu được error-once: {exc}")
 
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
@@ -2028,13 +1719,22 @@ def note_fb_network_failure(error_key: str, text: str):
         _fb_network_alerted.add(error_key)
 
 def note_fb_network_success(error_key: str):
-    """Chi bao phuc hoi neu loi do da tung duoc bao va API thuc su thanh cong."""
+    """Reset bộ đếm khi request Facebook thành công."""
     had_failures = _fb_network_failures.get(error_key, 0)
+    was_alerted = error_key in _fb_network_alerted
     _fb_network_failures[error_key] = 0
     _fb_network_alerted.discard(error_key)
-    resolve_error_alert(error_key, f"Facebook API đã kết nối lại ({error_key}).")
-    if had_failures:
-        print(f"[FACEBOOK NETWORK] {error_key}: ket noi phuc hoi sau {had_failures} lan loi.")
+    if was_alerted:
+        recovery_key = f"recovered_{error_key}"
+        if recovery_key not in error_once_keys:
+            send_telegram_message("✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
+            error_once_keys.add(recovery_key)
+            try:
+                _save_keys(ERROR_ONCE_FILE, error_once_keys)
+            except OSError as exc:
+                print(f"[CẢNH BÁO] Không lưu được recovery-once: {exc}")
+    elif had_failures:
+        print(f"[FACEBOOK NETWORK] {error_key}: kết nối đã phục hồi sau {had_failures} lần lỗi.")
 
 # -------------------- Facebook API --------------------
 _managed_pages_cache = {"at": 0.0, "pages": []}
@@ -2209,7 +1909,6 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             send_error_alert("batch_request_error", f"Batch request thất bại: {err}")
             continue
 
-        resolve_error_alert("batch_request_error", "Facebook Batch API đã trả dữ liệu hợp lệ.")
         n_metrics = len(METRIC_FALLBACKS)
         items_per_post = n_metrics + 1  # 2 insights + 1 fields
 
@@ -2758,7 +2457,6 @@ def check_all_pages():
 
 
 def main():
-    print("[WEB-PAUSED] Tam tat toan bo tao link web, giu checkpoint cu; chi gui TXT 2/3/4.")
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
     if PUBLISH_PLATFORM == "wordpress":
         threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
@@ -2769,7 +2467,6 @@ def main():
         scan_started = time.monotonic()
         try:
             check_all_pages()
-            resolve_error_alert("main_loop_exception", "Vòng quét Facebook đã chạy thành công.")
         except Exception as e:
             print(f"[LỖI] Lỗi không xác định trong vòng quét: {e}")
             send_error_alert("main_loop_exception", f"Lỗi không xác định trong vòng quét:\n{e}")
