@@ -1459,8 +1459,8 @@ def _bioblog_api_create(title, content, feature_image, permalink):
         "feature_image": feature_image,
         "mode": "normal",
     }
-    # API BioBlog yêu cầu author là username chính xác. Không suy luận ownership
-    # từ Bearer token dùng chung cho cả domain.
+    # Theo tài liệu, author được dùng để xây dựng final slug.
+    # Không suy luận quyền quản lý/Created by từ giá trị này.
     payload["author"] = _bioblog_expected_author()
     url = WEB_BASE_URL + "/api/posts"
     try:
@@ -1479,18 +1479,21 @@ def _bioblog_api_create(title, content, feature_image, permalink):
         obj = response.json()
     except ValueError:
         raise RuntimeError("BioBlog đã trả thành công nhưng JSON không đọc được; kiểm tra Admin tránh đăng trùng")
-    # If create response explicitly identifies an unexpected author, fail closed.
-    response_author = _bioblog_author_from_record(obj)
-    if response_author and response_author.casefold() != _bioblog_expected_author().casefold():
-        raise RuntimeError(f"[WEB-AUTHOR-MISMATCH] POST trả tác giả '{response_author}', cần '{_bioblog_expected_author()}'. Kiểm tra Admin, không POST lại")
+    # API documentation promises ID, slug, frontend link, not ownership metadata.
+    # `author` in POST is explicitly described as a slug source.
+    response_author = None
     record = obj.get("data", obj) if isinstance(obj, dict) else {}
+    if isinstance(record, dict) and isinstance(record.get("post"), dict):
+        record = record["post"]
     if isinstance(record, list):
         record = record[0] if record else {}
     if not isinstance(record, dict):
         record = {}
     # API docs: trả ID, slug, frontend link; không giả định tên khóa cố định.
     slug = record.get("slug") or record.get("post_slug")
-    link = record.get("frontend_link") or record.get("frontend_url") or record.get("public_url") or record.get("url") or record.get("link")
+    link = (record.get("frontend_link") or record.get("frontend_url") or
+            record.get("frontendLink") or record.get("public_url") or
+            record.get("url") or record.get("link"))
     if not slug and isinstance(link, str):
         slug = urlparse(link).path.rstrip("/").split("/")[-1]
     if not slug:
@@ -1515,63 +1518,51 @@ def _bioblog_expected_author():
 
 
 def _bioblog_author_from_record(obj):
-    """Extract only explicit author identity, never infer it from slug/title."""
+    """Metadata only. The documented `author` parameter is a slug source.
+
+    Do not confuse `created_by` (account ownership) with `author` (slug input).
+    """
     if not isinstance(obj, dict):
         return None
-    for key in ("author", "created_by", "creator"):
-        val = obj.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-        if isinstance(val, dict):
-            for field in ("username", "user_name", "name", "login"):
-                if isinstance(val.get(field), str) and val[field].strip():
-                    return val[field].strip()
+    value = obj.get("author")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("username", "name"):
+            if isinstance(value.get(key), str) and value[key].strip():
+                return value[key].strip()
     for key in ("data", "post"):
-        nested = obj.get(key)
-        if isinstance(nested, dict):
-            found = _bioblog_author_from_record(nested)
-            if found:
-                return found
+        if isinstance(obj.get(key), dict):
+            return _bioblog_author_from_record(obj[key])
     return None
 
 
 def _bioblog_verify_post_owner(record):
-    """Chỉ xác minh AUTHOR khi API thực sự trả danh tính.
+    """Verify the *documented* POST acknowledgement, not unsupported ownership.
 
-    Không đồng nhất trường AUTHOR với quyền quản lý (Created by).
-    Không dùng GET thiếu author để kết luận POST thất bại.
+    BioBlog documentation: POST returns id, slug and frontend link; `author`
+    is used for slug generation. GET does not promise author or created_by.
+    Ownership must be confirmed in BioBlog UI or by the backend provider.
     """
+    if not isinstance(record, dict):
+        raise RuntimeError("[WEB-POST] Checkpoint không hợp lệ")
     expected = _bioblog_expected_author()
-    found = record.get("api_author")
-    if found:
-        if found.casefold() != expected.casefold():
-            raise RuntimeError(f"[WEB-AUTHOR-MISMATCH] POST ghi '{found}', cần '{expected}'")
-        return True
+    requested = str(record.get("author_requested") or "").strip()
+    if requested.casefold() != expected.casefold():
+        raise RuntimeError("[WEB-LEGACY] Bài cũ không có dấu vết POST với "
+                           "WEB_AUTHOR hiện tại; cần đối chiếu thủ công, không POST lại")
+    url = str(record.get("url") or "").strip()
     slug = str(record.get("slug") or "").strip()
-    if not slug:
-        raise RuntimeError("[WEB-AUTHOR] Thiếu slug, cần kiểm tra Admin")
-    token = _bioblog_token()
-    from urllib.parse import quote
-    try:
-        response = requests.get(WEB_BASE_URL + "/api/posts/" + quote(slug, safe=""),
-            headers={"Authorization": "Bearer " + token, "Accept": "application/json"}, timeout=(10, 30))
-    except requests.RequestException as exc:
-        raise RuntimeError("[WEB-AUTHOR] GET lỗi mạng; không POST lại: " + str(exc)) from exc
-    if response.status_code != 200:
-        raise RuntimeError(f"[WEB-AUTHOR] GET HTTP {response.status_code}; không POST lại")
-    try:
-        found = _bioblog_author_from_record(response.json())
-    except ValueError as exc:
-        raise RuntimeError("[WEB-AUTHOR] GET không trả JSON") from exc
-    if not found:
-        # Không đánh đồng thiếu field với author sai. Bắt buộc xác nhận ngoài API.
-        raise RuntimeError("[WEB-AUTHOR-UNVERIFIABLE] API không trả AUTHOR. "
-                           "Bài đã có checkpoint; cần xác nhận trong tài khoản Phi. Không POST lại")
-    if found.casefold() != expected.casefold():
-        raise RuntimeError(f"[WEB-AUTHOR-MISMATCH] API ghi '{found}', cần '{expected}'")
-    record["api_author"] = found
+    if not slug or not url:
+        raise RuntimeError("[WEB-POST] Thiếu slug hoặc frontend link trong phản hồi POST")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc.lower() != urlparse(WEB_BASE_URL).netloc.lower():
+        raise RuntimeError("[WEB-POST] URL không thuộc website BioBlog đã cấu hình")
+    if parsed.path.rstrip("/").split("/")[-1] != slug:
+        raise RuntimeError("[WEB-POST] Slug không khớp frontend link")
+    record["post_acknowledged"] = True
+    record["ownership_verified"] = False  # Not supported by the documented API.
     return True
-
 
 def _bioblog_token():
     host = (urlparse(WEB_BASE_URL).hostname or "").lower()
@@ -1607,10 +1598,10 @@ def publish_approved_story(post_id):
         raise RuntimeError("Checkpoint thuộc website khác")
     # Legacy records are NOT proof of ownership. Do not silently attach them to Phi.
     existing = state.get("web_posts") or {}
-    old_platform = state.get("publish_platform") not in ("bioblog_official_verified",)
+    old_platform = state.get("publish_platform") not in ("bioblog_official_checkpointed",)
     if old_platform and (existing or state.get("web_links_telegram_sent") or state.get("web_publish_complete")):
-        # Có bài cũ: giữ nguyên và thử xác minh từng URL bằng GET, không POST lại.
-        # Nếu API không cung cấp AUTHOR, dừng và yêu cầu kiểm tra thủ công.
+        # Checkpoint cũ không có bằng chứng POST của phiên bản này:
+        # không thể suy ra ownership từ GET hoặc từ URL.
         if not existing:
             raise RuntimeError("[WEB-AUTHOR-LEGACY] Đã gửi link nhưng không có bản ghi; kiểm tra Admin")
         for old_key, old_rec in existing.items():
@@ -1619,7 +1610,7 @@ def publish_approved_story(post_id):
                     old_rec["slug"] = urlparse(old_rec["url"]).path.rstrip("/").split("/")[-1]
                 _bioblog_verify_post_owner(old_rec)
         state["web_posts"] = existing
-        state["publish_platform"] = "bioblog_official_verified"
+        state["publish_platform"] = "bioblog_official_checkpointed"
         state["publish_author"] = _bioblog_expected_author()
         _save_progress(post_id, state)
     if old_platform and state.get("web_post_uncertain"):
@@ -1640,7 +1631,7 @@ def publish_approved_story(post_id):
         raise RuntimeError("Checkpoint thuộc AUTHOR khác; không thể chuyển bài giữa các tài khoản")
     state["publish_author"] = current_author
     state["publish_target"] = WEB_BASE_URL
-    state["publish_platform"] = "bioblog_official_verified"
+    state["publish_platform"] = "bioblog_official_checkpointed"
     _save_progress(post_id, state)
     web = state.setdefault("web_posts", {})
     # Validate existing official records before creating any additional chapters.
@@ -1648,7 +1639,7 @@ def publish_approved_story(post_id):
         rec = web.get(str(previous)) or {}
         if rec.get("url"):
             _bioblog_verify_post_owner(rec)
-            rec["owner_verified"] = current_author
+            rec["author_requested_checked"] = current_author
             _save_progress(post_id, state)
     parts = state["parts"]
     base_title = _story_title(parts["2"])
@@ -1694,16 +1685,18 @@ def publish_approved_story(post_id):
         _save_progress(post_id, state)
         # Verify AFTER durable save: if verification fails, never create a duplicate.
         _bioblog_verify_post_owner(result)
-        web[key]["owner_verified"] = current_author
+        web[key]["author_requested_checked"] = current_author
         _save_progress(post_id, state)
-        print(f"[AUTO-WEB] {post_id}: Part {n} verified for {current_author}: {result['url']}")
-    # Existing records may predate this guard. Verify all 3 before sending links.
+        print(f"[AUTO-WEB] {post_id}: Part {n} POST confirmed; author slug input={current_author}; "
+              f"ownership NOT API-verifiable: {result['url']}")
+    # Confirm documented POST response for all three before sending links.
+    # This is NOT a check of account-level ownership.
     for n in (2, 3, 4):
         rec = web.get(str(n)) or {}
         if not rec.get("url"):
             raise RuntimeError(f"[WEB-AUTHOR] Part {n} chưa có URL")
         _bioblog_verify_post_owner(rec)
-        rec["owner_verified"] = current_author
+        rec["author_requested_checked"] = current_author
         _save_progress(post_id, state)
     if not state.get("web_links_telegram_sent"):
         message = "\n".join(f"PART {n}: {web[str(n)]['url']}" for n in (2, 3, 4))
