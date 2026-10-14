@@ -122,7 +122,7 @@ SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
-SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT_TELEGRAM", "false").strip().lower() in ("1", "true", "yes", "on")
+SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT_TELEGRAM", "true").strip().lower() in ("1", "true", "yes", "on")
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
 # One website selector: WEB_BASE_URL. Store each site's token in Railway as
 # PURETALES_TOKEN, TWISTTALES_TOKEN, ECHOES_TOKEN, etc.
@@ -157,8 +157,8 @@ BIOBLOG_API_BASE_URL = WEB_BASE_URL + "/api"
 if os.getenv("BIOBLOG_API_BASE_URL", "").rstrip("/") not in ("", BIOBLOG_API_BASE_URL):
     print("[BIOBLOG] Bỏ qua BIOBLOG_API_BASE_URL cũ; tự lấy WEB_BASE_URL + /api")
 # Auto-publish on all seven configured BioBlog hosts. The /blog/{slug} route is
-# confirmed only for puretales.idolsgift.com; for other hosts it is an explicit
-# operational assumption, checked against API-returned URLs/slugs after creation.
+# confirmed by the BioBlog developer for all configured websites.
+# Compare with API-returned URLs/slugs after creation.
 # An optional per-site override may be set using BIOBLOG_POST_URL_TEMPLATE.
 _BIOBLOG_DEFAULT_TEMPLATE = WEB_BASE_URL + "/blog/{slug}"
 _configured_url_template = os.getenv("BIOBLOG_POST_URL_TEMPLATE", "").strip()
@@ -166,8 +166,6 @@ BIOBLOG_POST_URL_TEMPLATE = _configured_url_template or _BIOBLOG_DEFAULT_TEMPLAT
 if _configured_url_template and urlparse(_configured_url_template).netloc != urlparse(WEB_BASE_URL).netloc:
     print("[BIOBLOG] Bỏ qua BIOBLOG_POST_URL_TEMPLATE của domain khác; dùng /blog/{slug} trên domain hiện tại")
     BIOBLOG_POST_URL_TEMPLATE = _BIOBLOG_DEFAULT_TEMPLATE
-if _bioblog_host != "puretales.idolsgift.com" and not _configured_url_template:
-    print("[BIOBLOG] Chưa xác minh đường dẫn public trên domain này; thử /blog/{slug}, kiểm tra URL do API trả về")
 BIOBLOG_API_TIMEOUT = int(os.getenv("BIOBLOG_API_TIMEOUT", "60"))
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
@@ -1074,21 +1072,24 @@ def _resume_story(page_name, post_id, caption):
     # Vẫn kiểm tra nội dung 3 phần trước khi xuất bản web.
     outputs = split_story_into_parts(story)
     sent = state.setdefault("sent", [])
+    txt_sent = state.setdefault("txt_sent", [])
     for n in (2, 3, 4):
-        if n in sent:
-            continue
-        if SEND_STORY_TXT_TELEGRAM:
+        # TXT has its own checkpoint; the web-publishing checkpoint must not
+        # prevent a missing Telegram document from being delivered.
+        if SEND_STORY_TXT_TELEGRAM and n not in txt_sent:
             path = f"/tmp/story_{re.sub(r'[^a-zA-Z0-9_]', '_', str(post_id))}_PART_{n}.txt"
             try:
                 create_part_txt(outputs[n], n, path)
                 if not send_telegram_document(path, caption=f"📄 PART {n} — Page: {page_name}"):
                     return False
+                txt_sent.append(n)
+                _save_progress(post_id, state)
             finally:
                 if os.path.exists(path):
                     os.remove(path)
-        # 'sent' là checkpoint đã xử lý phần, để web publishing không bị chặn.
-        sent.append(n)
-        _save_progress(post_id, state)
+        if n not in sent:
+            sent.append(n)
+            _save_progress(post_id, state)
     # Chỉ những bài được worker xác nhận mới sau mốc kích hoạt mới tự xuất bản.
     # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
     if state.get("auto_publish_eligible") and ENABLE_AUTO_WEB_PUBLISH:
@@ -1381,6 +1382,12 @@ def _bioblog_get_by_slug(slug):
     if status == 404:
         return None
     if status != 200:
+        if status == 403 and ("Just a moment" in detail or "cloudflare" in detail.lower()):
+            raise RuntimeError(
+                "BIOBLOG_CLOUDFLARE_403: Cloudflare chặn GET /api/posts/{slug}; "
+                "chưa thể xác định bài đã tồn tại. KHÔNG gửi POST để tránh đăng trùng. "
+                "Cần cho phép Railway truy cập /api/posts/* trong Cloudflare."
+            )
         raise RuntimeError(f"Không xác minh được slug {slug}: HTTP {status} {detail}")
     record = data.get("data", data) if isinstance(data, dict) else {}
     if not isinstance(record, dict):
@@ -1429,48 +1436,53 @@ def _bioblog_save_record(state, post_id, part, record, slug):
 
 
 def _bioblog_create_safely(post_id, state, part, payload):
+    """BioBlog create-only API: POST result is authoritative; never require GET.
+
+    Unknown outcomes are quarantined to avoid duplicate publications.
+    """
     slug = payload["permalink"]
-    # Preflight GET and reconcile before EVERY create. A failed GET is not proof of absence.
     if state.get("bioblog_uncertain_posts", {}).get(str(part)):
-        existing = _bioblog_get_by_slug(slug)
-        if existing is None:
-            raise RuntimeError(f"Part {part} từng timeout sau POST; chưa thấy trên GET, cần xác minh thủ công trước khi thử tạo lại")
-    else:
-        existing = _bioblog_get_by_slug(slug)
-    if existing is not None:
-        print(f"[BIOBLOG] {post_id}: Part {part} đã tồn tại; phục hồi checkpoint")
-        return _bioblog_save_record(state, post_id, part, existing, slug)
+        raise RuntimeError(
+            f"Part {part} có POST trước đó chưa xác nhận. "
+            "Cần kiểm tra bài trên BioBlog và đối chiếu checkpoint trước khi thử lại; "
+            "không tự POST lần hai để tránh đăng trùng."
+        )
     try:
         status, result, detail = _bioblog_api_request("POST", "/posts", payload=payload)
     except RuntimeError as exc:
-        # POST might have succeeded server-side despite read timeout.
-        for _ in range(3):
-            time.sleep(3)
-            try:
-                existing = _bioblog_get_by_slug(slug)
-            except RuntimeError:
-                continue
-            if existing is not None:
-                return _bioblog_save_record(state, post_id, part, existing, slug)
+        # A connection failure may happen after the server has created the post.
         state.setdefault("bioblog_uncertain_posts", {})[str(part)] = True
         _save_progress(post_id, state)
-        raise RuntimeError(f"POST chưa xác nhận, KHÔNG đăng lại tự động khi chưa kiểm tra chắc chắn: {exc}") from exc
+        raise RuntimeError(
+            f"Part {part}: POST không có phản hồi xác nhận; "
+            f"giữ checkpoint và chờ đối chiếu để tránh đăng trùng: {exc}"
+        ) from exc
     if status not in (200, 201):
+        # A 403/Cloudflare challenge is a definitive rejection response, not a success.
+        # Conflict is ambiguous: the post may already exist.
         if status in (409, 422):
-            existing = _bioblog_get_by_slug(slug)
-            if existing is not None:
-                return _bioblog_save_record(state, post_id, part, existing, slug)
+            state.setdefault("bioblog_uncertain_posts", {})[str(part)] = True
+            _save_progress(post_id, state)
+        if status == 403 and ("Just a moment" in detail or "cloudflare" in detail.lower()):
+            raise RuntimeError(
+                "BIOBLOG_CLOUDFLARE_403: Cloudflare chặn POST /api/posts. "
+                "Cần cấu hình Cloudflare cho phép API Bearer từ Railway."
+            )
         raise RuntimeError(f"BioBlog tạo Part {part}: HTTP {status}: {detail}")
     record = result.get("data", result) if isinstance(result, dict) else {}
     if isinstance(record, dict) and isinstance(record.get("post"), dict):
         record = record["post"]
     if not isinstance(record, dict):
         record = {}
-    # Some create APIs return only a partial record; GET confirms final slug/URL.
-    if not _bioblog_record_url(record) or not record.get("slug"):
-        fetched = _bioblog_get_by_slug(slug)
-        if fetched:
-            record = fetched
+    # The provider confirms POST returns slug or URL. Persist immediately,
+    # without making an undocumented GET request that Cloudflare may challenge.
+    if not (record.get("slug") or record.get("permalink_slug") or _bioblog_record_url(record)):
+        state.setdefault("bioblog_uncertain_posts", {})[str(part)] = True
+        _save_progress(post_id, state)
+        raise RuntimeError(
+            f"POST Part {part} thành công HTTP {status} nhưng không có slug/URL "
+            "trong JSON; cần đối chiếu phản hồi trước khi đăng tiếp."
+        )
     return _bioblog_save_record(state, post_id, part, record, slug)
 
 
@@ -1591,10 +1603,12 @@ def _auto_publish_with_retry(post_id):
             return True
         except Exception as exc:
             state = _load_progress(post_id)
-            state["web_retry_after"] = time.time() + AUTO_PUBLISH_RETRY_SECONDS
+            # Cloudflare challenge cannot be resolved by rapid retries. Keep checkpoint intact.
+            retry_seconds = max(AUTO_PUBLISH_RETRY_SECONDS, 1800) if "BIOBLOG_CLOUDFLARE_403" in str(exc) else AUTO_PUBLISH_RETRY_SECONDS
+            state["web_retry_after"] = time.time() + retry_seconds
             state["web_last_error"] = str(exc)[:800]
             _save_progress(post_id, state)
-            print(f"[AUTO-WEB] {post_id}: {exc}; retry in {AUTO_PUBLISH_RETRY_SECONDS}s")
+            print(f"[AUTO-WEB] {post_id}: {exc}; retry in {retry_seconds}s")
             send_error_alert("web_publish_failure", f"Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; checkpoint vẫn được giữ.")
             return False
 
