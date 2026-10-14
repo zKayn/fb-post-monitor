@@ -1,5 +1,25 @@
+"""
+FB POST MONITOR (RETRY + BATCH API + CẢNH BÁO TOKEN + AUTO PART 2/3)
+=================================================================
+Theo dõi tất cả (hoặc 1 phần) Page Facebook bạn quản lý. Gửi thông báo
+Telegram khi 1 bài đạt ngưỡng (OR nhiều điều kiện) HOẶC có dấu hiệu
+tăng đột biến ("dựng đứng"). Bỏ qua bài đã có link. Tự báo lỗi qua
+Telegram (token hỏng, mất mạng...). Tự cảnh báo trước khi token hết hạn.
+Khi 1 bài đạt ngưỡng và CHƯA có link, tự dùng OpenAI API viết tiếp
+Part 2 + Part 3 + Part 4 dựa trên caption gốc, xuất ra file TXT UTF-8, gửi kèm
+thông báo Telegram.
+
+YÊU CẦU
+--------
+1. USER ACCESS TOKEN (Long-Lived) với đủ 4 quyền: pages_show_list,
+   pages_read_engagement, pages_read_user_content, read_insights
+2. Telegram Bot Token + Chat ID
+3. OpenAI API Key (lấy tại platform.openai.com/api-keys, cần nạp tiền
+   riêng, khác với ChatGPT Plus)
+4. Cài thư viện: pip install requests
+"""
+
 import json
-import unicodedata
 import os
 import re
 import time
@@ -8,9 +28,7 @@ import threading
 import queue
 import hashlib
 import html
-from urllib.parse import urlparse, quote
-from io import BytesIO
-import mimetypes
+from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
@@ -24,10 +42,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # Domain link bài đọc. Có thể ghi nhiều domain trong Railway Variable ARTICLE_LINK_DOMAINS, cách nhau bằng dấu phẩy.
 ARTICLE_LINK_DOMAINS = [
     d.strip().lower()
-    for d in os.getenv(
-        "ARTICLE_LINK_DOMAINS",
-        "puretales.idolsgift.com,storyly.chosouthrussianovcharka.com"
-    ).split(",")
+    for d in os.getenv("ARTICLE_LINK_DOMAINS", "puretales.idolsgift.com").split(",")
     if d.strip()
 ]
 COMMENT_LINK_MAX_PAGES = 5  # quét tối đa 5 trang x 100 comments trước khi báo / gọi OpenAI
@@ -37,7 +52,7 @@ COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comme
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-luna"
-OPENAI_MAX_OUTPUT_TOKENS = 5000  # cost-control: reasoning=none, mục tiêu 2500-3000 từ/Part
+OPENAI_MAX_OUTPUT_TOKENS = 5000  # cost-control: mục tiêu 2500-3000 từ/Part
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
@@ -71,111 +86,12 @@ PART_ENDINGS = {
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
-# Loai Little Boy khoi danh sach quet, khong anh huong cac Page khac.
-EXCLUDE_PAGE_NAMES = {x.strip().casefold() for x in os.getenv("EXCLUDE_PAGE_NAMES", "Little Boy").split(",") if x.strip()}
-EXCLUDE_PAGE_IDS = {x.strip() for x in os.getenv("EXCLUDE_PAGE_IDS", "").split(",") if x.strip()}
-
-# Mã Page do chủ Page quy định (KHÔNG phải Facebook Page ID).
-PAGE_NUMBER_BY_NAME = {
-    "Story Vault": 1,
-    "Warm Stories": 2,
-    "Echo Stories": 3,
-    "Stories Universe": 4,
-    "Next Story": 5,
-    "Epic Stories": 6,
-    "Heartbreak Diaries": 7,
-    "US Stories 2": 8,
-    "Rainy Stories": 9,
-    "Velvet Dynasty": 10,
-    "Swisher Ryantnh": 11,
-    "Soul Garden": 12,
-    "True Fireside": 13,
-    "Dena Hartmanext": 14,
-    "Little Girl": 15,
-}
-PAGE_NUMBER_BY_PROFILE_ID = {
-    "61590490184233": 1, "61590431019513": 2,
-    "61589838020143": 3, "61589076507357": 4,
-    "61591856275808": 5, "61590840651745": 6,
-    "61589209621700": 7, "61590495543078": 8,
-    "61589897181314": 9, "61589270882934": 10,
-    "1386470377872868": 11, "61592934357052": 12,
-    "61592776354916": 13, "61593873274389": 14,
-    "61591782185355": 15,
-}
-
-
-def _page_number(page_name, page_id):
-    # Graph API Page ID có thể khác profile.php?id=... trong trình duyệt.
-    normalized = re.sub(r"\s+", " ", str(page_name or "")).strip().casefold()
-    for name, number in PAGE_NUMBER_BY_NAME.items():
-        if name.casefold() == normalized:
-            return number
-    number = PAGE_NUMBER_BY_PROFILE_ID.get(str(page_id))
-    if number:
-        return number
-    raise ValueError(f"Chưa gán mã số cho Page {page_name!r} ({page_id}); không đăng sai tiêu đề")
-
-
-# --- Page đặc biệt ---
-# Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng.
-SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}  # Chỉ Little Girl; Page khác vẫn theo ngưỡng
-SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
+EXCLUDE_PAGE_NAMES = [x.strip().casefold() for x in os.getenv("EXCLUDE_PAGE_NAMES", "Little Boy").split(",") if x.strip()]
 
 # Website: 
-PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
-SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT_TELEGRAM", "true").strip().lower() in ("1", "true", "yes", "on")
-# BioBlog documented POST /api/posts field: author (string, optional).
-# This is a slug-building field, NOT verified as the admin dashboard creator identity.
-WEB_AUTHOR = os.getenv("WEB_AUTHOR", "").strip()
-if len(WEB_AUTHOR) > 100 or any(ord(ch) < 32 for ch in WEB_AUTHOR):
-    raise ValueError("WEB_AUTHOR không hợp lệ (tối đa 100 ký tự, không chứa ký tự điều khiển)")
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
-# One website selector: WEB_BASE_URL. Store each site's token in Railway as
-# PURETALES_TOKEN, TWISTTALES_TOKEN, ECHOES_TOKEN, etc.
-# Optional BIOBLOG_TOKEN_MAP_JSON maps arbitrary hostnames to ENV VARIABLE NAMES,
-# never put actual secrets in the mapping.
-_DEFAULT_SITE_TOKEN_ENV = {
-    "puretales.idolsgift.com": "PURETALES_TOKEN",
-    "puretales.cafex.biz": "PURETALES_CAFEX_TOKEN",
-    "twisttales.idolsgift.com": "TWISTTALES_TOKEN",
-    "echoesofstories.idolsgift.com": "ECHOES_TOKEN",
-    "echoesofstories.feji.io": "ECHOES_FEJI_TOKEN",
-    "storyviral.idolsgift.com": "STORYVIRAL_TOKEN",
-    "storynests.idolsgift.com": "STORYNESTS_TOKEN",
-}
-try:
-    _custom_token_env = json.loads(os.getenv("BIOBLOG_TOKEN_MAP_JSON", "{}"))
-    if not isinstance(_custom_token_env, dict):
-        raise ValueError("must be a JSON object")
-except (ValueError, TypeError) as exc:
-    raise ValueError("BIOBLOG_TOKEN_MAP_JSON phải là JSON object: hostname -> Railway token variable name") from exc
-_SITE_TOKEN_ENV = dict(_DEFAULT_SITE_TOKEN_ENV)
-_SITE_TOKEN_ENV.update({str(k).lower().strip(): str(v).strip() for k, v in _custom_token_env.items()})
-_bioblog_host = (urlparse(WEB_BASE_URL).hostname or "").lower()
-if urlparse(WEB_BASE_URL).scheme != "https" or not _bioblog_host:
-    raise ValueError("WEB_BASE_URL phải là HTTPS URL hợp lệ")
-_selected_token_env = _SITE_TOKEN_ENV.get(_bioblog_host)
-# For mapped sites, never silently fall back to another site's BIOBLOG_API_TOKEN.
-BIOBLOG_API_TOKEN = (os.getenv(_selected_token_env, "").strip() if _selected_token_env
-                     else os.getenv("BIOBLOG_API_TOKEN", "").strip())
-BIOBLOG_API_BASE_URL = WEB_BASE_URL + "/api"
-# WEB_BASE_URL is authoritative; a stale variable must not send requests elsewhere.
-if os.getenv("BIOBLOG_API_BASE_URL", "").rstrip("/") not in ("", BIOBLOG_API_BASE_URL):
-    print("[BIOBLOG] Bỏ qua BIOBLOG_API_BASE_URL cũ; tự lấy WEB_BASE_URL + /api")
-# Auto-publish on all seven configured BioBlog hosts. The /blog/{slug} route is
-# confirmed by the BioBlog developer for all configured websites.
-# Compare with API-returned URLs/slugs after creation.
-# An optional per-site override may be set using BIOBLOG_POST_URL_TEMPLATE.
-_BIOBLOG_DEFAULT_TEMPLATE = WEB_BASE_URL + "/blog/{slug}"
-_configured_url_template = os.getenv("BIOBLOG_POST_URL_TEMPLATE", "").strip()
-BIOBLOG_POST_URL_TEMPLATE = _configured_url_template or _BIOBLOG_DEFAULT_TEMPLATE
-if _configured_url_template and urlparse(_configured_url_template).netloc != urlparse(WEB_BASE_URL).netloc:
-    print("[BIOBLOG] Bỏ qua BIOBLOG_POST_URL_TEMPLATE của domain khác; dùng /blog/{slug} trên domain hiện tại")
-    BIOBLOG_POST_URL_TEMPLATE = _BIOBLOG_DEFAULT_TEMPLATE
-BIOBLOG_API_TIMEOUT = int(os.getenv("BIOBLOG_API_TIMEOUT", "60"))
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
     raise ValueError("PUBLISH_PLATFORM phải là bioblog hoặc wordpress")
@@ -194,7 +110,7 @@ WEB_ALLOW_IMAGE_FALLBACK = os.getenv("WEB_ALLOW_IMAGE_FALLBACK", "false").lower(
 WEB_IMAGE_MAX_BYTES = 15 * 1024 * 1024
 WEB_POSTS_PUBLIC = os.getenv("WEB_POSTS_PUBLIC", "true").lower() == "true"
 WEB_UPDATE_METHOD = "PUT"
-AUTHOR_CODE = os.getenv("AUTHOR_CODE", "").strip()
+AUTHOR_CODE = os.getenv("AUTHOR_CODE", "026").strip()
 if not re.fullmatch(r"[0-9A-Za-z_-]{1,16}", AUTHOR_CODE):
     raise ValueError("AUTHOR_CODE không hợp lệ")
 PUBLISH_APPROVAL_POLL_SECONDS = 8
@@ -204,47 +120,16 @@ STORY_CACHE_DIR = "/data/story_cache"
 
 # Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
 THRESHOLD_RULES = [
-    {"min_views": 5000, "min_comments": 0},
-    {"min_views": 3500, "min_comments": 50},
+    {"min_views": 7000, "min_comments": 20},
+    {"min_views": 3000, "min_comments": 50},
 ]
-COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 160  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
-ONLY_POSTS_NEWER_THAN_HOURS = 72  # Giới hạn phụ để giảm số lần gọi API
-# Bắt buộc gắn Railway Volume vào /data để không reset khi redeploy.
-NEW_POST_CUTOFF_FILE = "/data/new_posts_since_utc.json"
-
-
-def _load_or_create_new_post_cutoff():
-    from pathlib import Path
-    path = Path(NEW_POST_CUTOFF_FILE)
-    if path.exists():
-        with path.open(encoding="utf-8") as f:
-            payload = json.load(f)
-        stamp = datetime.fromisoformat(payload["since_utc"].replace("Z", "+00:00"))
-        if stamp.tzinfo is None:
-            raise ValueError("Mốc lọc bài mới phải có timezone UTC")
-        return stamp.astimezone(timezone.utc)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc)
-    temp = path.with_name(path.name + ".tmp")
-    with temp.open("w", encoding="utf-8") as f:
-        json.dump({"since_utc": stamp.isoformat()}, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp, path)
-    print(f"[NEW-POSTS] Đã thiết lập mốc bắt đầu: {stamp.isoformat()}; bỏ qua bài đăng trước mốc.")
-    return stamp
-
-
-NEW_POSTS_SINCE_UTC = _load_or_create_new_post_cutoff()
-
+ONLY_POSTS_NEWER_THAN_HOURS = 72
 
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
-# Railway Variable: ENABLE_SPIKE_ALERT=true để BẬT, false để TẮT.
-# Mặc định false để không tự phát sinh cảnh báo ngoài ý muốn sau khi deploy.
-ENABLE_SPIKE_ALERT = os.getenv("ENABLE_SPIKE_ALERT", "false").strip().lower() in ("1", "true", "yes", "on")
-SPIKE_LOOKBACK_MINUTES = 30  # mốc tham chiếu; baseline thực tế chỉ lấy trong 15–40 phút
+SPIKE_LOOKBACK_MINUTES = 30
 SPIKE_MIN_VIEW_INCREASE = 3000
 SPIKE_MIN_PERCENT_INCREASE = 80
 SPIKE_MIN_VIEWS_TO_CHECK = 2000
@@ -252,7 +137,7 @@ VIEW_HISTORY_FILE = "/data/view_history.json"
 STORY_COMPLETED_FILE = "/data/story_completed_posts.json"
 STORY_CLAIMED_FILE = "/data/story_claimed_posts.json"
 STORY_PROGRESS_DIR = "/data/story_progress"
-STORY_RETRY_SECONDS = 60  # thử lại sau 60 giây để không phải chờ 15 phút
+STORY_RETRY_SECONDS = 60  # retry checkpoint nhanh, không regenerate Part đã lưu
 ERROR_ONCE_FILE = "/data/error_once_keys.json"
 ENABLE_PAID_GENERATION = True  # chỉ đánh dấu sau khi TXT đủ Part 2+3+4 đã gửi thành công
 
@@ -367,30 +252,6 @@ def save_notified(notified_set):
 
 already_notified = load_notified()
 
-def load_special_baseline():
-    if os.path.exists(SPECIAL_BASELINE_FILE):
-        try:
-            with open(SPECIAL_BASELINE_FILE, "r", encoding="utf-8") as f:
-                return set(str(x) for x in json.load(f))
-        except Exception:
-            return set()
-    return set()
-
-def save_special_baseline(items):
-    try:
-        os.makedirs(os.path.dirname(SPECIAL_BASELINE_FILE) or ".", exist_ok=True)
-        tmp = SPECIAL_BASELINE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(sorted(items), f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, SPECIAL_BASELINE_FILE)
-    except Exception as e:
-        print(f"[LỖI] Không lưu được {SPECIAL_BASELINE_FILE}: {e}")
-
-special_baseline_posts = load_special_baseline()
-_special_baseline_ready = bool(special_baseline_posts)
-
 def load_story_completed():
     if os.path.exists(STORY_COMPLETED_FILE):
         try:
@@ -456,95 +317,32 @@ def save_view_history(history: dict):
 view_history = load_view_history()
 
 
-# Thông tin lần đo gần nhất, chỉ dùng để giải thích cảnh báo; không ảnh hưởng checkpoint.
-spike_evidence = {}
-
-
 def record_and_check_spike(post_id: str, current_views: int, now: datetime):
-    """Phát hiện tăng views nhanh trong cửa sổ THỰC 15–40 phút.
+    points = view_history.get(post_id, [])
+    cutoff = now - timedelta(minutes=SPIKE_LOOKBACK_MINUTES)
+    baseline_views = None
+    for ts_str, v in points:
+        ts = datetime.fromisoformat(ts_str)
+        if ts <= cutoff:
+            baseline_views = v
+        else:
+            break
 
-    Chế độ cân bằng: kết hợp tăng tuyệt đối, tỷ lệ và tốc độ/phút; nếu có
-    lịch sử giai đoạn trước thì yêu cầu tăng tốc để giảm cảnh báo sai.
-    Không so sánh với mẫu cũ hàng giờ như thuật toán trước.
-    """
-    post_id = str(post_id)
-    current_views = int(current_views)
-    spike_evidence.pop(post_id, None)
-    raw = view_history.get(post_id, [])
-    samples = []
-    for entry in raw:
-        try:
-            stamp = datetime.fromisoformat(entry[0])
-            if stamp.tzinfo is None and now.tzinfo is not None:
-                stamp = stamp.replace(tzinfo=now.tzinfo)
-            if stamp.tzinfo is not None and now.tzinfo is None:
-                stamp = stamp.replace(tzinfo=None)
-            value = int(entry[1])
-            age = (now - stamp).total_seconds() / 60
-            if 0 <= age <= 90 and value >= 0:
-                samples.append((stamp, value, age))
-        except (ValueError, TypeError, IndexError, OverflowError):
-            continue
-    samples.sort(key=lambda item: item[0])
-
-    # Luôn ghi mẫu mới kể cả khi cảnh báo tắt, để có baseline khi bật lại.
-    samples.append((now, current_views, 0.0))
-    view_history[post_id] = [[stamp.isoformat(), value] for stamp, value, _ in samples[-200:]]
+    points.append([now.isoformat(), current_views])
+    view_history[post_id] = points[-200:]
 
     if current_views < SPIKE_MIN_VIEWS_TO_CHECK:
         return False
-
-    # Chọn mẫu gần mốc 25 phút nhất, nhưng tuyệt đối không cũ hơn 40 phút.
-    candidates = [sample for sample in samples[:-1] if 15 <= sample[2] <= 40]
-    if not candidates:
-        return False
-    base_time, base_views, minutes = min(candidates, key=lambda sample: abs(sample[2] - 25))
-    increase = current_views - base_views
-    if increase <= 0:
-        return False
-    pct = (100.0 * increase / base_views) if base_views > 0 else 0.0
-    rate = increase / minutes
-
-    # Hai nhánh: tăng tương đối rõ rệt, hoặc tăng tuyệt đối rất mạnh.
-    strong_relative = increase >= 1200 and pct >= 65 and rate >= 40
-    strong_absolute = increase >= 2500 and rate >= 55
-    if not (strong_relative or strong_absolute):
+    if baseline_views is None:
         return False
 
-    # Có dữ liệu giai đoạn trước: yêu cầu tốc độ hiện tại cao hơn ít nhất 20%.
-    # Không bắt buộc khi mới bắt đầu thu thập, để vẫn phát hiện sớm.
-    earlier = [sample for sample in samples[:-1]
-               if 15 <= (base_time - sample[0]).total_seconds() / 60 <= 40]
-    if earlier:
-        old_time, old_views, _ = min(
-            earlier, key=lambda sample: abs((base_time - sample[0]).total_seconds() / 60 - 25)
-        )
-        previous_minutes = (base_time - old_time).total_seconds() / 60
-        previous_rate = max(0.0, (base_views - old_views) / previous_minutes)
-        if previous_rate > 0 and rate < previous_rate * 1.20:
-            return False
-
-    # Nếu có mẫu rất gần đây, tránh báo khi views đã chững lại.
-    recent = [sample for sample in samples[:-1] if 4 <= sample[2] <= 12]
-    if recent:
-        _, recent_views, recent_minutes = min(recent, key=lambda sample: abs(sample[2] - 8))
-        recent_rate = (current_views - recent_views) / recent_minutes
-        if recent_rate < max(20.0, rate * 0.45):
-            return False
-
-    spike_evidence[post_id] = {
-        "baseline_views": base_views,
-        "current_views": current_views,
-        "minutes": round(minutes, 1),
-        "increase": increase,
-        "percent": round(pct, 1),
-        "rate": round(rate, 1),
-    }
-    return True
+    increase = current_views - baseline_views
+    percent_increase = (increase / baseline_views * 100) if baseline_views > 0 else 0
+    return increase >= SPIKE_MIN_VIEW_INCREASE or percent_increase >= SPIKE_MIN_PERCENT_INCREASE
 
 
 # -------------------- Telegram --------------------
-TELEGRAM_GROUP_LOCK = threading.RLock() 
+TELEGRAM_GROUP_LOCK = threading.RLock()  # Giữ nguyên yêu cầu: không cho tin khác chen giữa thông báo và các TXT của chính bài đó.
 
 def _send_telegram_message_unlocked(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -628,22 +426,20 @@ Do not rewrite earlier parts."""
 Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
 
     last_error = "unknown"
-    force_length_retry = False
-    total_attempts = OPENAI_PART_RETRIES + 1  # thêm 1 lượt CHỈ dành cho content rỗng + finish_reason=length
+    # Bình thường chỉ 6000 tokens. Chỉ cứu đúng trường hợp reasoning ăn hết budget
+    # làm content rỗng + finish_reason=length; không retry content đã trả về.
+    token_budget = OPENAI_MAX_OUTPUT_TOKENS
+    total_attempts = 2
     for attempt in range(1, total_attempts + 1):
         try:
-            # Bình thường dùng trần 6000 và reasoning=none để giảm chi phí/độ trễ.
-            # Chỉ nếu content rỗng + length mới cứu đúng request đó với 7000; checkpoint cũ vẫn giữ.
-            request_token_budget = 7000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
-            force_length_retry = False
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": full_prompt}],
+                    "max_completion_tokens": token_budget,
                     "reasoning_effort": "none",
-                    "max_completion_tokens": request_token_budget,
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
@@ -654,53 +450,49 @@ Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
 
             if resp.status_code != 200:
                 last_error = data.get("error", {}).get("message", resp.text[:1000])
-                print(f"[CẢNH BÁO] Part {part_number} HTTP {resp.status_code}, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
-            else:
-                choices = data.get("choices") or []
-                if choices:
-                    choice = choices[0] or {}
-                    msg = choice.get("message") or {}
-                    text = msg.get("content") or ""
-                    if isinstance(text, list):
-                        text = "".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in text)
-                    text = str(text).strip()
-                    finish_reason = choice.get("finish_reason")
-                    usage = data.get("usage", {})
-                    if text:
-                        print(f"[OPENAI] Part {part_number} OK | finish_reason={finish_reason} | usage={usage}")
-                        report_error_recovered(f"openai_api_part_{part_number}_failed", f"OpenAI Part {part_number} hoạt động lại")
-                        return text
-                    last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}"
-                    if finish_reason == "length" and attempt < total_attempts:
-                        force_length_retry = True
-                        print(
-                            f"[OPENAI] Part {part_number}: content rỗng + finish_reason=length "
-                            f"-> retry riêng với 7000 tokens."
-                        )
-                    elif attempt >= OPENAI_PART_RETRIES:
-                        # Không dùng lượt dự phòng cho các lỗi khác.
-                        break
-                else:
-                    last_error = f"không có choices; response={str(data)[:1200]}"
-                    if attempt >= OPENAI_PART_RETRIES:
-                        break
-                print(f"[CẢNH BÁO] Part {part_number} rỗng/lỗi, lần {attempt}/{total_attempts}: {last_error}")
-        except requests.exceptions.RequestException as e:
-            last_error = f"network/timeout: {e}"
-            print(f"[CẢNH BÁO] Part {part_number}, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
-        except Exception as e:
-            last_error = f"parse/process: {e}"
-            print(f"[CẢNH BÁO] Part {part_number}, lần {attempt}/{OPENAI_PART_RETRIES}: {last_error}")
+                print(f"[CẢNH BÁO] Part {part_number} HTTP {resp.status_code}: {last_error}")
+                break
 
-        if force_length_retry and attempt < total_attempts:
-            time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 20))
-            continue
-        if attempt < OPENAI_PART_RETRIES:
-            time.sleep(min(RETRY_BACKOFF_SECONDS * attempt, 20))
-        else:
+            choices = data.get("choices") or []
+            if not choices:
+                last_error = f"không có choices; response={str(data)[:1200]}"
+                break
+
+            choice = choices[0] or {}
+            msg = choice.get("message") or {}
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                content = "".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in content)
+            content = str(content).strip()
+            finish_reason = choice.get("finish_reason")
+            usage = data.get("usage", {})
+
+            if content:
+                print(f"[OPENAI] Part {part_number} OK | finish_reason={finish_reason} | usage={usage}")
+                return content
+
+            last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}"
+            print(f"[CẢNH BÁO] Part {part_number}: {last_error}")
+
+            if attempt == 1 and finish_reason == "length":
+                token_budget = 7000
+                print(f"[OPENAI] Part {part_number}: content rỗng do length -> cứu 1 lần với 7000 tokens.")
+                continue
             break
 
-    send_error_alert(f"openai_api_part_{part_number}_failed", f"Không tạo được Part {part_number}. Chi tiết cuối: {last_error}")
+        except requests.exceptions.RequestException as e:
+            last_error = f"network/timeout: {e}"
+            print(f"[CẢNH BÁO] Part {part_number}: {last_error}")
+            break
+        except Exception as e:
+            last_error = f"parse/process: {e}"
+            print(f"[CẢNH BÁO] Part {part_number}: {last_error}")
+            break
+
+    send_error_alert(
+        f"openai_api_part_{part_number}_failed",
+        f"Không tạo được Part {part_number}. Không regenerate content đã trả về. Chi tiết cuối: {last_error}",
+    )
     return None
 
 
@@ -739,8 +531,7 @@ def _validate_part(text: str, part_number: int):
     if not text or not text.strip():
         return False, "content rỗng"
     words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
-    # 2500-3000 là mục tiêu để kiểm soát chi phí. Chỉ <2500 mới là lỗi.
-    # Nếu model hiếm khi vượt mục tiêu, vẫn giữ và xuất TXT để không vứt nội dung đã trả tiền.
+    # Mỗi Part bắt buộc tối thiểu 2500 từ.
     if words < 2500:
         return False, f"quá ngắn ({words} từ; bắt buộc tối thiểu 2500 từ)"
     if part_number in (3, 4) and not re.search(rf"(?i)PART\s+{part_number}", text):
@@ -755,9 +546,9 @@ def _word_count(text: str) -> int:
 def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 2650):
     """Bổ sung phần còn thiếu thay vì vứt content đã trả tiền và generate lại từ đầu."""
     current_words = _word_count(existing_part)
-    need_words = max(100, target_words - current_words)
-    # Cho dư nhẹ để model có thể kết thúc tự nhiên, nhưng tránh sinh quá dài/tốn tiền.
-    requested_words = min(max(need_words + 40, 150), 750)
+    need_words = max(0, target_words - current_words)
+    # Chỉ mua đúng phần còn thiếu; dư rất nhẹ để kết thúc tự nhiên.
+    requested_words = min(max(need_words + 50, 180), 750)
 
     if part_number in (2, 3):
         ending_instruction = f"End with a natural hook or discovery leading into Part {part_number + 1}."
@@ -773,7 +564,7 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 2500-2900 words, ideally near 2650 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
+Continue PART {part_number} from the exact final sentence above. Write ONLY approximately {requested_words} additional words so the COMPLETE part reaches 2500-3000 words, ideally near 2650 words. Stop promptly; do not add filler.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
 Do NOT add a PART heading, headline, END OF PART line, NEXT PART line, Facebook CTA, like/share request, or commentary.
@@ -788,9 +579,9 @@ Output ONLY the new continuation paragraphs."""
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
+                    # Continuation chỉ mua phần còn thiếu để đạt tối thiểu 2500 từ.
+                    "max_completion_tokens": min(2200, max(900, int(requested_words * 1.8))),
                     "reasoning_effort": "none",
-                    # Continuation chỉ mua phần còn thiếu; không mở trần 6000 vô ích.
-                    "max_completion_tokens": min(2200, max(900, int(requested_words * 1.6) + 300)),
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
             )
@@ -859,8 +650,6 @@ def generate_valid_part(story_context: str, part_number: int):
     ok, reason = _validate_part(raw, part_number)
     if ok:
         print(f"[OPENAI] Part {part_number} validation: {reason}")
-        report_error_recovered(f"openai_part_{part_number}_validation_failed", f"Part {part_number} đã đạt kiểm tra nội dung")
-        report_error_recovered(f"openai_part_{part_number}_generation_failed", f"Part {part_number} đã tạo thành công")
         return raw
 
     send_error_alert(
@@ -888,6 +677,8 @@ def call_openai_story(caption: str):
         return None
 
     # Ending chỉ chèn sau khi cả content của part đó đã hoàn chỉnh.
+    # Chỉ kẻ 1 đường phân cách PHÍA TRÊN Part 3 và Part 4 để dễ copy từ TXT.
+    # Không có đường kẻ phía dưới tiêu đề Part.
     separator = "=" * 60
     part2 = f"{p2_raw}\n\n**{PART_ENDINGS[2]}**"
     part3 = f"{separator}\n\n{p3_raw}\n\n**{PART_ENDINGS[3]}**"
@@ -974,68 +765,6 @@ def _retry_due(post_id):
     return time.time() >= float(state.get("retry_after", 0))
 
 
-def _normalized_caption(caption):
-    """Chỉ loại khác biệt Unicode và khoảng trắng; không ghép truyện gần giống."""
-    import unicodedata
-    return " ".join(unicodedata.normalize("NFC", caption).split())
-
-
-def _cache_key(caption):
-    return hashlib.sha256(json.dumps({"caption": _normalized_caption(caption), "model": OPENAI_MODEL, "rules": STORY_WRITING_RULES, "v": 2}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-
-
-def _cache_path(caption):
-    return os.path.join(STORY_CACHE_DIR, _cache_key(caption) + ".json")
-
-
-def _valid_cached_parts(parts):
-    return isinstance(parts, dict) and all(
-        isinstance(parts.get(str(n)), str) and _validate_part(parts[str(n)], n)[0]
-        for n in (2, 3, 4)
-    )
-
-
-def _cache_read(caption):
-    if not ENABLE_STORY_CACHE:
-        return None
-    path = _cache_path(caption)
-    try:
-        with open(path, encoding="utf-8") as f:
-            entry = json.load(f)
-        if entry.get("caption_normalized") == _normalized_caption(caption) and _valid_cached_parts(entry.get("parts")):
-            return dict(entry["parts"])
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    # Tận dụng checkpoint cũ đã hoàn thành (không mua lại API).
-    if os.path.isdir(STORY_PROGRESS_DIR):
-        for filename in os.listdir(STORY_PROGRESS_DIR):
-            if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
-                continue
-            try:
-                with open(os.path.join(STORY_PROGRESS_DIR, filename), encoding="utf-8") as f:
-                    state = json.load(f)
-                if (_normalized_caption(state.get("caption", "")) == _normalized_caption(caption)
-                        and _valid_cached_parts(state.get("parts"))):
-                    _cache_write(caption, state["parts"])
-                    return dict(state["parts"])
-            except (OSError, ValueError, TypeError, AttributeError):
-                continue
-    return None
-
-
-def _cache_write(caption, parts):
-    if not ENABLE_STORY_CACHE or not _valid_cached_parts(parts):
-        return
-    os.makedirs(STORY_CACHE_DIR, exist_ok=True)
-    path = _cache_path(caption)
-    temp = path + ".tmp"
-    with open(temp, "w", encoding="utf-8") as f:
-        json.dump({"caption_normalized": _normalized_caption(caption), "parts": parts}, f, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp, path)
-
-
 def _resume_story(page_name, post_id, caption):
     """Persist each successful part; only generate missing parts. Never re-buy saved parts."""
     state = _load_progress(post_id)
@@ -1044,20 +773,13 @@ def _resume_story(page_name, post_id, caption):
         send_error_alert("caption_changed_" + str(post_id), f"Bài {post_id}: caption đã thay đổi; giữ bản đã lưu, không tạo lại để tránh phí trùng.")
         return False
     if not state:
-        state = {"caption": caption, "parts": {}, "sent": [], "retry_after": 0}
+        state = {"caption": caption, "parts": {}, "sent": [], "retry_after": 0,
+                 "page_name": page_name, "auto_publish_eligible": ENABLE_AUTO_WEB_PUBLISH}
         _save_progress(post_id, state)  # fail closed before any paid request
     if not state.get("page_name"):
         state["page_name"] = page_name
         _save_progress(post_id, state)
     parts = state.setdefault("parts", {})
-    # Chỉ áp dụng cache nếu bài hiện tại chưa sinh phần nào.
-    if not parts:
-        cached = _cache_read(caption)
-        if cached:
-            parts.update(cached)
-            state["cache_reused"] = True
-            _save_progress(post_id, state)
-            send_telegram_message(f"♻️ Bài {post_id}: tái sử dụng Part 2/3/4 từ kho truyện; không gọi OpenAI.")
     for n in (2, 3, 4):
         key = str(n)
         if key in parts:
@@ -1073,34 +795,18 @@ def _resume_story(page_name, post_id, caption):
         parts[key] = result
         _save_progress(post_id, state)  # atomic checkpoint immediately after success
 
-    _cache_write(caption, parts)
     story = "\n\n".join((
         ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n**" + PART_ENDINGS[n] + "**"
         for n in (2, 3, 4)
     ))
-    # Vẫn kiểm tra nội dung 3 phần trước khi xuất bản web.
-    outputs = split_story_into_parts(story)
+    # Các Part đã được xác thực; không gửi 3 file TXT lên Telegram.
+    # Vẫn đánh dấu hoàn tất để bước tự động đăng website tiếp tục chạy.
+    split_story_into_parts(story)
     sent = state.setdefault("sent", [])
-    txt_sent = state.setdefault("txt_sent", [])
     for n in (2, 3, 4):
-        # TXT has its own checkpoint; the web-publishing checkpoint must not
-        # prevent a missing Telegram document from being delivered.
-        if SEND_STORY_TXT_TELEGRAM and n not in txt_sent:
-            path = f"/tmp/story_{re.sub(r'[^a-zA-Z0-9_]', '_', str(post_id))}_PART_{n}.txt"
-            try:
-                create_part_txt(outputs[n], n, path)
-                if not send_telegram_document(path, caption=f"📄 PART {n} — Page: {page_name}"):
-                    return False
-                txt_sent.append(n)
-                _save_progress(post_id, state)
-            finally:
-                if os.path.exists(path):
-                    os.remove(path)
         if n not in sent:
             sent.append(n)
             _save_progress(post_id, state)
-    # Chỉ những bài được worker xác nhận mới sau mốc kích hoạt mới tự xuất bản.
-    # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
     if state.get("auto_publish_eligible") and ENABLE_AUTO_WEB_PUBLISH:
         _auto_publish_with_retry(post_id)
     story_completed.add(str(post_id))
@@ -1108,645 +814,6 @@ def _resume_story(page_name, post_id, caption):
     print(f"[OPENAI] Bài {post_id}: đã hoàn tất Part 2/3/4, không tạo lại.")
     return True
 
-
-
-# ==================== WEBSITE PUBLISH ====================
-# Chỉ sau khi 3 TXT đã hoàn tất, Telegram /publish POST_ID mới cho phép xuất bản.
-
-def _story_title(part2):
-    for line in part2.splitlines():
-        line = line.strip().strip("*# ")
-        if line and not re.fullmatch(r"PART\s+2", line, re.I):
-            return line[:180]
-    return "Story continuation"
-
-
-def _web_part_title(base_title, n, page_number):
-    """Ví dụ: PART 2: The Lifeboat Key6 026."""
-    page_number = int(page_number)
-    if page_number not in PAGE_NUMBER_BY_NAME.values():
-        raise ValueError("Mã số Page chưa được gán")
-    title = base_title.strip()
-    title = re.sub(r"(?i)^PART\s*[234](?:\s*\(THE END\))?\s*[:\-–—]?\s*", "", title).strip()
-    # Xóa hậu tố từ các bản code cũ (FB Page ID dài hoặc mã số ngắn).
-    title = re.sub(r"\s*\d{1,20}\s+" + re.escape(AUTHOR_CODE) + r"$", "", title, flags=re.I).strip()
-    title = re.sub(r"\s+" + re.escape(AUTHOR_CODE) + r"$", "", title, flags=re.I).strip()
-    # Gỡ mã Page cũ dính sát chữ cuối nếu tiêu đề đã được chuẩn hóa trước đó.
-    title = re.sub(r"(?<=\D)(?:" + "|".join(map(str, sorted(PAGE_NUMBER_BY_NAME.values(), key=lambda x: -len(str(x))))) + r")$", "", title).strip() if re.search(r"\d$", title) and re.search(r"\s+" + re.escape(AUTHOR_CODE) + r"$", base_title.strip(), flags=re.I) else title
-    prefix = "PART 4 (THE END): " if n == 4 else f"PART {n}: "
-    return f"{prefix}{title}{page_number} {AUTHOR_CODE}"
-
-
-def _story_body(raw, part):
-    raw = _strip_program_endings(raw)
-    raw = re.sub(r"(?im)^\s*PART\s+%d(?:\s*\(THE END\))?\s*$" % part, "", raw).strip()
-    if part == 2:
-        lines = raw.splitlines()
-        if lines:
-            raw = "\n".join(lines[1:]).strip()
-    return raw
-
-
-def _to_html(body, navigation=None):
-    paragraphs = re.split(r"\n\s*\n", body.strip())
-    content = "\n".join("<p>" + html.escape(p).replace("\n", "<br>") + "</p>" for p in paragraphs if p.strip())
-    if navigation:
-        content += '<hr><nav aria-label="Story chapters">' + " | ".join(
-            '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
-            for label, url in navigation
-        ) + '</nav>'
-    return content
-
-
-def _facebook_original_image(post_id, page_token):
-    """Tìm ảnh gốc của post, không sử dụng ảnh thumbnail nếu có bản full."""
-    response = requests.get(f"{GRAPH_URL}/{post_id}", params={
-        "fields": "full_picture,attachments{type,media,subattachments{media,type}}",
-        "access_token": page_token,
-    }, timeout=30)
-    response.raise_for_status()
-    obj = response.json()
-    if obj.get("error"):
-        raise RuntimeError("Facebook không cấp quyền đọc ảnh bài gốc")
-    attachments = ((obj.get("attachments") or {}).get("data") or [])
-    candidates = []
-    for att in attachments:
-        candidates.append(((att.get("media") or {}).get("image") or {}).get("src"))
-        for sub in ((att.get("subattachments") or {}).get("data") or []):
-            candidates.append(((sub.get("media") or {}).get("image") or {}).get("src"))
-    candidates.append(obj.get("full_picture"))
-    return next((u for u in candidates if isinstance(u, str) and u.startswith("https://")), None)
-
-
-def _download_facebook_image(image_url):
-    """Giới hạn domain và dung lượng, tránh truy cập URL tùy ý."""
-    host = (urlparse(image_url).hostname or "").lower()
-    if not (host == "fbcdn.net" or host.endswith(".fbcdn.net") or
-            host == "fbsbx.com" or host.endswith(".fbsbx.com")):
-        raise RuntimeError("URL ảnh Facebook không thuộc miền CDN được phép")
-    with requests.get(image_url, timeout=50, stream=True, allow_redirects=False) as response:
-        response.raise_for_status()
-        chunks, size = [], 0
-        for chunk in response.iter_content(128 * 1024):
-            size += len(chunk)
-            if size > WEB_IMAGE_MAX_BYTES:
-                raise RuntimeError("Ảnh Facebook vượt giới hạn 15MB")
-            chunks.append(chunk)
-        raw = b"".join(chunks)
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return raw, "image/png", "png"
-    if raw.startswith(b"\xff\xd8\xff"):
-        return raw, "image/jpeg", "jpg"
-    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
-        return raw, "image/webp", "webp"
-    raise RuntimeError("Không nhận diện được ảnh PNG/JPEG/WebP từ Facebook")
-
-
-def _wp_request(method, path, **kwargs):
-    if not WP_USERNAME or not WP_APPLICATION_PASSWORD:
-        raise RuntimeError("Thiếu WP_USERNAME hoặc WP_APPLICATION_PASSWORD")
-    response = requests.request(method, WP_BASE_URL + path,
-        auth=(WP_USERNAME, WP_APPLICATION_PASSWORD), timeout=65, **kwargs)
-    if response.status_code >= 400:
-        raise RuntimeError(f"WordPress {method} {path}: HTTP {response.status_code}: {response.text[:350]}")
-    return response.json()
-
-
-def _wp_upload_featured_image(post_id, page_token):
-    source = _facebook_original_image(post_id, page_token)
-    if not source:
-        raise RuntimeError("Không có ảnh Facebook gốc để đăng WordPress")
-    raw, mime, ext = _download_facebook_image(source)
-    filename = f"fb_{post_id.replace('_', '-')}.{ext}"
-    response = _wp_request("POST", "/wp-json/wp/v2/media", data=raw,
-        headers={"Content-Type": mime, "Content-Disposition": f'attachment; filename="{filename}"'})
-    if not response.get("id"):
-        raise RuntimeError("WordPress không trả media ID")
-    return int(response["id"])
-
-
-def _wp_create_post(title, body_html, media_id):
-    record = _wp_request("POST", "/wp-json/wp/v2/posts", json={
-        "title": title, "content": body_html,
-        "status": "publish" if WP_POSTS_PUBLIC else "draft", "featured_media": media_id})
-    if not record.get("id"):
-        raise RuntimeError("WordPress không trả post ID")
-    return {"id": record["id"], "url": record.get("link", ""), "slug": record.get("slug", "")}
-
-
-def _wp_update_post(post_record, body_html):
-    return _wp_request("POST", f"/wp-json/wp/v2/posts/{int(post_record['id'])}", json={"content": body_html})
-
-
-# WordPress: ending khớp nguyên văn TXT, các liên kết chương là thẻ <a> bấm được.
-def _wp_chapter_html(parts, n, records):
-    content = _to_html(_story_body(parts[str(n)], n))
-    content += "\n" + _to_html(PART_ENDINGS[n])
-    links = []
-    if n > 2:
-        url = records.get(str(n-1), {}).get("url")
-        if not url:
-            raise RuntimeError(f"Thiếu URL Part {n-1} để tạo liên kết chương")
-        links.append((f"← PREVIOUS: PART {n-1}", url))
-    if n < 4:
-        url = records.get(str(n+1), {}).get("url")
-        if not url:
-            raise RuntimeError(f"Thiếu URL Part {n+1} để tạo liên kết chương")
-        links.append((f"NEXT: PART {n+1} →", url))
-    if links:
-        content += '\n<nav aria-label="Story chapter links" class="story-chapter-links">'
-        for label, url in links:
-            parsed = urlparse(url)
-            if parsed.scheme != "https" or parsed.netloc != urlparse(WP_BASE_URL).netloc:
-                raise RuntimeError("URL chương WordPress không thuộc website đang chọn")
-            content += '<p><a href="%s"><strong>%s</strong></a></p>' % (
-                html.escape(url, quote=True), html.escape(label))
-        content += '</nav>'
-    return content
-
-
-def repair_existing_wordpress_links(post_id):
-    """Chỉ cập nhật 3 bài WordPress đã tồn tại; KHÔNG tạo bài, ảnh hay gọi OpenAI."""
-    state = _load_progress(post_id)
-    if state.get("publish_platform") != "wordpress" or state.get("publish_target") != WP_BASE_URL:
-        raise RuntimeError("Checkpoint không thuộc WordPress đang chọn")
-    records = state.get("web_posts") or {}
-    parts = state.get("parts") or {}
-    if not all(records.get(str(n), {}).get("id") and records[str(n)].get("url")
-               and parts.get(str(n)) for n in (2, 3, 4)):
-        raise RuntimeError("Checkpoint chưa đủ 3 chương WordPress; không sửa để tránh sai bài")
-    for n in (2, 3, 4):
-        _wp_update_post(records[str(n)], _wp_chapter_html(parts, n, records))
-        print(f"[WP-REPAIR] {post_id}: updated Part {n}")
-    state["wp_chapter_format_version"] = 2
-    _save_progress(post_id, state)
-
-
-def _wp_repair_requested_once():
-    post_id = os.getenv("WP_REPAIR_EXISTING_POST_ID", "").strip()
-    if not post_id:
-        return
-    if not re.fullmatch(r"\d+_\d+", post_id):
-        print("[WP-REPAIR] WP_REPAIR_EXISTING_POST_ID không hợp lệ")
-        return
-    try:
-        repair_existing_wordpress_links(post_id)
-    except Exception as exc:
-        print(f"[WP-REPAIR] {post_id}: lỗi: {exc}")
-
-
-def publish_wordpress_story(post_id):
-    post_id = str(post_id).strip()
-    if not re.fullmatch(r"\d+_\d+", post_id):
-        raise ValueError("POST_ID không hợp lệ")
-    state = _load_progress(post_id)
-    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
-        raise RuntimeError("Chưa gửi đủ ba TXT")
-    if not ENABLE_WEB_PUBLISH_TEST:
-        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false")
-    target = WP_BASE_URL
-    if state.get("publish_target") and state["publish_target"] != target:
-        raise RuntimeError("Checkpoint thuộc website khác; không tự chuyển bài đã đăng dở")
-    if state.get("web_posts") and not state.get("publish_target"):
-        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
-    state["publish_target"] = target
-    state["publish_platform"] = "wordpress"
-    _save_progress(post_id, state)
-    if state.get("web_posts") and not state.get("publish_target"):
-        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
-    records = state.setdefault("web_posts", {})
-    parts = state["parts"]
-    base_title = _story_title(parts["2"])
-    page_id = post_id.split("_", 1)[0]
-    page_name = state.get("page_name")
-    if not page_name:
-        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
-        page_name = (page or {}).get("name")
-    page_number = _page_number(page_name, page_id)
-    media_id = state.get("wp_media_id")
-    if not media_id:
-        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
-        if not page or not page.get("access_token"):
-            raise RuntimeError("Thiếu Facebook Page token để lấy ảnh")
-        media_id = _wp_upload_featured_image(post_id, page["access_token"])
-        state["wp_media_id"] = media_id
-        _save_progress(post_id, state)
-    for n in (4, 3, 2):
-        key = str(n)
-        if records.get(key, {}).get("id"):
-            continue
-        nav = [(f"READ PART {n+1}", records[str(n+1)]["url"])] if n < 4 and records.get(str(n+1), {}).get("url") else []
-        title = _web_part_title(base_title, n, page_number)
-        records[key] = _wp_create_post(title, _to_html(_story_body(parts[key], n)) + "\n" + _to_html(PART_ENDINGS[n]), media_id)
-        _save_progress(post_id, state)
-        print(f"[WORDPRESS] {post_id}: created Part {n}, ID={records[key]['id']}")
-    # Version 2: ghi lại tất cả chương kể cả checkpoint cũ đã đánh dấu linked.
-    if state.get("wp_chapter_format_version") != 2:
-        for n in (2, 3, 4):
-            _wp_update_post(records[str(n)], _wp_chapter_html(parts, n, records))
-            _save_progress(post_id, state)
-        state["wp_chapter_format_version"] = 2
-        state["web_linked"] = [2, 3, 4]
-        _save_progress(post_id, state)
-    if not state.get("web_links_telegram_sent"):
-        message = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in (2, 3, 4))
-        if not all(records[str(n)].get("url") for n in (2, 3, 4)):
-            raise RuntimeError("WordPress thiếu link chương")
-        if not send_telegram_message(message):
-            raise RuntimeError("Telegram chưa xác nhận thông báo ba link")
-        state["web_links_telegram_sent"] = True
-        _save_progress(post_id, state)
-
-
-def _bioblog_api_request(method, path, *, payload=None):
-    """Official documented Bearer API. No session/login or undocumented update routes."""
-    if not BIOBLOG_API_TOKEN:
-        raise RuntimeError("Thiếu BIOBLOG_API_TOKEN trong Railway Variables")
-    parsed_base = urlparse(BIOBLOG_API_BASE_URL)
-    if parsed_base.scheme != "https" or not parsed_base.netloc or parsed_base.netloc != urlparse(WEB_BASE_URL).netloc:
-        raise RuntimeError("BIOBLOG_API_BASE_URL phải là HTTPS /api trên cùng WEB_BASE_URL")
-    headers = {"Authorization": "Bearer " + BIOBLOG_API_TOKEN,
-               "Accept": "application/json", "Content-Type": "application/json"}
-    # IMPORTANT: do not use HTTP_SESSION here; its adapter retries POST automatically.
-    try:
-        response = requests.request(method, BIOBLOG_API_BASE_URL + path,
-                                    headers=headers, json=payload, timeout=(12, BIOBLOG_API_TIMEOUT))
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"BioBlog {method} {path}: lỗi kết nối/timeout: {exc}") from exc
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    return response.status_code, data, response.text[:350]
-
-
-def _bioblog_slug(post_id, part, title=None, page_number=None):
-    """Permalink theo tiêu đề, ví dụ part-2-the-life-he-thought-he-owned1-026.
-
-    `author` là metadata riêng; không tự gắn -phi vào permalink yêu cầu.
-    Backend vẫn có quyền đổi slug; phải đối chiếu phản hồi POST.
-    """
-    if title is None or page_number is None:
-        raise ValueError("Cần tên truyện và số Page để tạo permalink")
-    full_title = _web_part_title(title, part, page_number)
-    normalized = unicodedata.normalize("NFKD", full_title)
-    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
-    slug = re.sub(r"[^a-z0-9]+", "-", normalized.casefold()).strip("-")
-    if not slug or len(slug) > 240:
-        raise ValueError("Permalink từ tiêu đề không hợp lệ hoặc quá dài")
-    return slug
-
-
-def _bioblog_get_by_slug(slug):
-    status, data, detail = _bioblog_api_request("GET", "/posts/" + quote(slug, safe=""))
-    if status == 404:
-        return None
-    if status != 200:
-        if status == 403 and ("Just a moment" in detail or "cloudflare" in detail.lower()):
-            raise RuntimeError(
-                "BIOBLOG_CLOUDFLARE_403: Cloudflare chặn GET /api/posts/{slug}; "
-                "chưa thể xác định bài đã tồn tại. KHÔNG gửi POST để tránh đăng trùng. "
-                "Cần cho phép Railway truy cập /api/posts/* trong Cloudflare."
-            )
-        raise RuntimeError(f"Không xác minh được slug {slug}: HTTP {status} {detail}")
-    record = data.get("data", data) if isinstance(data, dict) else {}
-    if not isinstance(record, dict):
-        raise RuntimeError("GET post trả JSON không hợp lệ")
-    if isinstance(record.get("post"), dict):
-        record = record["post"]
-    return record
-
-
-def _bioblog_record_url(record):
-    for key in ("frontend_link", "frontend_url", "link", "url", "public_url", "permalink"):
-        value = record.get(key)
-        if isinstance(value, str) and value.startswith("https://"):
-            if urlparse(value).netloc == urlparse(WEB_BASE_URL).netloc:
-                return value
-    return ""
-
-
-def _bioblog_expected_url(slug):
-    if not BIOBLOG_POST_URL_TEMPLATE:
-        return ""
-    if BIOBLOG_POST_URL_TEMPLATE.count("{slug}") != 1:
-        raise RuntimeError("BIOBLOG_POST_URL_TEMPLATE phải chứa đúng một {slug}")
-    url = BIOBLOG_POST_URL_TEMPLATE.replace("{slug}", quote(slug, safe=""))
-    parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
-        raise RuntimeError("BIOBLOG_POST_URL_TEMPLATE không thuộc domain BioBlog hiện tại")
-    return url
-
-
-def _bioblog_save_record(state, post_id, part, record, slug):
-    actual_slug = record.get("slug") or record.get("permalink_slug") or slug
-    if actual_slug != slug:
-        # POST succeeded: persist its actual identity even if the slug differs.
-        # Never re-POST this chapter. Stop before making broken navigation links.
-        actual_url = _bioblog_record_url(record) or _bioblog_expected_url(actual_slug)
-        state.setdefault("web_posts", {})[str(part)] = {
-            "slug": actual_slug, "url": actual_url, "id": record.get("id"),
-            "slug_mismatch": True,
-        }
-        _save_progress(post_id, state)
-        raise RuntimeError(
-            f"Part {part} đã được tạo với slug {actual_slug} (dự kiến {slug}). "
-            "Đã lưu checkpoint để KHÔNG đăng trùng; cần đối chiếu liên kết các phần."
-        )
-    url = _bioblog_record_url(record)
-    expected = _bioblog_expected_url(slug)
-    if expected and url and expected.rstrip("/") != url.rstrip("/"):
-        raise RuntimeError(f"URL thực tế {url} khác URL dự kiến {expected}; dừng để tránh link sai")
-    if not url:
-        url = expected
-    if not url:
-        raise RuntimeError("API không trả URL bài và chưa có BIOBLOG_POST_URL_TEMPLATE được xác minh")
-    state.setdefault("web_posts", {})[str(part)] = {"slug": slug, "url": url, "id": record.get("id")}
-    _save_progress(post_id, state)
-    return url
-
-
-def _bioblog_create_safely(post_id, state, part, payload):
-    """BioBlog create-only API: POST result is authoritative; never require GET.
-
-    Unknown outcomes are quarantined to avoid duplicate publications.
-    """
-    slug = payload["permalink"]
-    if state.get("bioblog_uncertain_posts", {}).get(str(part)):
-        raise RuntimeError(
-            f"Part {part} có POST trước đó chưa xác nhận. "
-            "Cần kiểm tra bài trên BioBlog và đối chiếu checkpoint trước khi thử lại; "
-            "không tự POST lần hai để tránh đăng trùng."
-        )
-    try:
-        status, result, detail = _bioblog_api_request("POST", "/posts", payload=payload)
-    except RuntimeError as exc:
-        # A connection failure may happen after the server has created the post.
-        state.setdefault("bioblog_uncertain_posts", {})[str(part)] = True
-        _save_progress(post_id, state)
-        raise RuntimeError(
-            f"Part {part}: POST không có phản hồi xác nhận; "
-            f"giữ checkpoint và chờ đối chiếu để tránh đăng trùng: {exc}"
-        ) from exc
-    if status not in (200, 201):
-        # A 403/Cloudflare challenge is a definitive rejection response, not a success.
-        # Conflict is ambiguous: the post may already exist.
-        if status in (409, 422):
-            state.setdefault("bioblog_uncertain_posts", {})[str(part)] = True
-            _save_progress(post_id, state)
-        if status == 403 and ("Just a moment" in detail or "cloudflare" in detail.lower()):
-            raise RuntimeError(
-                "BIOBLOG_CLOUDFLARE_403: Cloudflare chặn POST /api/posts. "
-                "Cần cấu hình Cloudflare cho phép API Bearer từ Railway."
-            )
-        raise RuntimeError(f"BioBlog tạo Part {part}: HTTP {status}: {detail}")
-    record = result.get("data", result) if isinstance(result, dict) else {}
-    if isinstance(record, dict) and isinstance(record.get("post"), dict):
-        record = record["post"]
-    if not isinstance(record, dict):
-        record = {}
-    # The provider confirms POST returns slug or URL. Persist immediately,
-    # without making an undocumented GET request that Cloudflare may challenge.
-    if not (record.get("slug") or record.get("permalink_slug") or _bioblog_record_url(record)):
-        state.setdefault("bioblog_uncertain_posts", {})[str(part)] = True
-        _save_progress(post_id, state)
-        raise RuntimeError(
-            f"POST Part {part} thành công HTTP {status} nhưng không có slug/URL "
-            "trong JSON; cần đối chiếu phản hồi trước khi đăng tiếp."
-        )
-    return _bioblog_save_record(state, post_id, part, record, slug)
-
-
-def publish_approved_story(post_id):
-    if PUBLISH_PLATFORM == "wordpress":
-        return publish_wordpress_story(post_id)
-    post_id = str(post_id).strip()
-    if not re.fullmatch(r"\d+_\d+", post_id):
-        raise ValueError("POST_ID phải có dạng PAGEID_POSTID")
-    state = _load_progress(post_id)
-    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)):
-        raise RuntimeError("Chưa có đủ Part 2/3/4 trong checkpoint")
-    if not ENABLE_WEB_PUBLISH_TEST:
-        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false; không đăng")
-    if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
-        raise RuntimeError("Checkpoint thuộc website khác; không tự chuyển domain")
-    if state.get("web_posts") and state.get("publish_platform") != "bioblog_official_api":
-        raise RuntimeError("Checkpoint chứa bài đăng bằng API/login cũ; cần đối chiếu thủ công, không đăng trùng")
-    state["publish_target"] = WEB_BASE_URL
-    state["publish_platform"] = "bioblog_official_api"
-    _save_progress(post_id, state)
-    web = state.setdefault("web_posts", {})
-    # One-time adoption of a chapter created successfully by an older worker
-    # which rejected BioBlog's author-suffixed slug before saving checkpoint.
-    # User must explicitly provide the actual slug from the successful POST log.
-    recovery_raw = os.getenv("BIOBLOG_RECOVERED_POSTS_JSON", "").strip()
-    if recovery_raw:
-        try:
-            recovery_map = json.loads(recovery_raw)
-            if not isinstance(recovery_map, dict):
-                raise ValueError("must be a JSON object")
-            recovered = recovery_map.get(post_id, {})
-            if not isinstance(recovered, dict):
-                raise ValueError("post entry must be an object")
-            for part_text, actual_slug in recovered.items():
-                if part_text not in ("2", "3", "4") or not isinstance(actual_slug, str) or not re.fullmatch(r"[a-z0-9-]{1,240}", actual_slug):
-                    raise ValueError("invalid part or slug")
-                if part_text not in web:
-                    web[part_text] = {"slug": actual_slug, "url": _bioblog_expected_url(actual_slug), "recovered_from_post_response": True}
-                    _save_progress(post_id, state)
-                    print(f"[BIOBLOG-RECOVER] {post_id}: adopted Part {part_text} -> {actual_slug}")
-        except (ValueError, TypeError) as exc:
-            raise RuntimeError(f"BIOBLOG_RECOVERED_POSTS_JSON không hợp lệ: {exc}") from exc
-    parts = state["parts"]
-    title = _story_title(parts["2"])
-    page_id = post_id.split("_", 1)[0]
-    page_name = state.get("page_name")
-    if not page_name:
-        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
-        page_name = (page or {}).get("name")
-    title_page_number = _page_number(page_name, page_id)
-    slugs = {n: _bioblog_slug(post_id, n, title, title_page_number) for n in (2, 3, 4)}
-    expected = {n: _bioblog_expected_url(slugs[n]) for n in (2, 3, 4)}
-    for n in (2, 3, 4):
-        existing = web.get(str(n), {})
-        if existing.get("slug") and existing["slug"] != slugs[n]:
-            raise RuntimeError(
-                f"Part {n} đã tồn tại với slug {existing['slug']} khác slug dự kiến {slugs[n]}; "
-                "dừng để tránh PREVIOUS/NEXT sai."
-            )
-    # Never silently omit PREVIOUS: without update API, that omission is permanent.
-    # Require a URL template so both PREVIOUS and NEXT are embedded at creation.
-    if not all(expected.values()) and not all(
-        state.get("web_posts", {}).get(str(n), {}).get("url") for n in (2, 3, 4)
-    ):
-        raise RuntimeError(
-            "Chưa có BIOBLOG_POST_URL_TEMPLATE cho domain này. "
-            "Xác minh URL bài thật và đặt https://domain/blog/{slug} "
-            "trong Railway để giữ đầy đủ PREVIOUS/NEXT ngay khi tạo bài."
-        )
-    # Reverse creation + deterministic permalink embeds both links on first write.
-    page_id = post_id.split("_", 1)[0]
-    image_url = state.get("web_featured_image", "")
-    if not image_url:
-        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
-        if page and page.get("access_token"):
-            try:
-                image_url = _facebook_original_image(post_id, page["access_token"]) or ""
-            except Exception as exc:
-                print(f"[BIOBLOG] Không lấy được URL ảnh gốc: {exc}")
-        if not image_url and WEB_ALLOW_IMAGE_FALLBACK and WEB_POST_IMAGE_URL.startswith("https://"):
-            image_url = WEB_POST_IMAGE_URL
-        if image_url:
-            state["web_featured_image"] = image_url
-            _save_progress(post_id, state)
-    for n in (4, 3, 2):
-        key = str(n)
-        if web.get(key, {}).get("url"):
-            continue
-        nav = []
-        if n > 2 and expected[n - 1]:
-            nav.append((f"PREVIOUS: PART {n-1}", expected[n - 1]))
-        if n < 4:
-            next_url = expected[n + 1] or web.get(str(n + 1), {}).get("url", "")
-            if not next_url:
-                raise RuntimeError(f"Chưa có URL Part {n+1}; dừng để tránh NEXT hỏng")
-            nav.append(("NEXT: PART 4(THE END)" if n == 3 else "NEXT: PART 3", next_url))
-        payload = {
-            "title": _web_part_title(title, n, title_page_number),
-            "content": _to_html(_story_body(parts[key], n) + "\n\n" + PART_ENDINGS[n], nav),
-            "permalink": slugs[n],
-            "mode": "normal",
-        }
-        if WEB_AUTHOR:
-            payload["author"] = WEB_AUTHOR
-        if image_url:
-            payload["feature_image"] = image_url
-        _bioblog_create_safely(post_id, state, n, payload)
-        print(f"[BIOBLOG] {post_id}: Part {n} = {web[key]['url']}")
-    if not state.get("web_links_telegram_sent"):
-        urls = [web.get(str(n), {}).get("url") for n in (2, 3, 4)]
-        if not all(urls):
-            raise RuntimeError("Thiếu URL của một trong ba Part")
-        message = "\n".join(f"PART {n}: {web[str(n)]['url']}" for n in (2, 3, 4))
-        if not send_telegram_message(message):
-            raise RuntimeError("Telegram chưa xác nhận thông báo ba link")
-        state["web_links_telegram_sent"] = True
-        _save_progress(post_id, state)
-
-
-AUTO_PUBLISH_RETRY_SECONDS = int(os.getenv("AUTO_PUBLISH_RETRY_SECONDS", "300"))
-_AUTO_PUBLISH_LOCK = threading.RLock()
-
-
-def _auto_publish_with_retry(post_id):
-    """Publish after 3 TXT; retry later from persistent state, never recreate saved chapters."""
-    if not (ENABLE_AUTO_WEB_PUBLISH and ENABLE_WEB_PUBLISH_TEST):
-        return False
-    with _AUTO_PUBLISH_LOCK:
-        state = _load_progress(post_id)
-        if not state.get("auto_publish_eligible"):
-            return False
-        if state.get("web_publish_complete"):
-            return True
-        if time.time() < float(state.get("web_retry_after", 0)):
-            return False
-        if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)):
-            return False
-        if not all(n in state.get("sent", []) for n in (2, 3, 4)):
-            return False
-        try:
-            publish_approved_story(post_id)
-            state = _load_progress(post_id)
-            state["web_publish_complete"] = True
-            state.pop("web_retry_after", None)
-            _save_progress(post_id, state)
-            report_error_recovered("web_publish_failure", "Đăng website đã hoạt động lại")
-            return True
-        except Exception as exc:
-            state = _load_progress(post_id)
-            # Cloudflare challenge cannot be resolved by rapid retries. Keep checkpoint intact.
-            retry_seconds = max(AUTO_PUBLISH_RETRY_SECONDS, 1800) if "BIOBLOG_CLOUDFLARE_403" in str(exc) else AUTO_PUBLISH_RETRY_SECONDS
-            state["web_retry_after"] = time.time() + retry_seconds
-            state["web_last_error"] = str(exc)[:800]
-            _save_progress(post_id, state)
-            print(f"[AUTO-WEB] {post_id}: {exc}; retry in {retry_seconds}s")
-            send_error_alert("web_publish_failure", f"Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; checkpoint vẫn được giữ.")
-            return False
-
-
-def auto_publish_recovery_worker():
-    """Only recover explicitly eligible NEW posts; old stories never auto-publish."""
-    while True:
-        try:
-            if ENABLE_AUTO_WEB_PUBLISH and ENABLE_WEB_PUBLISH_TEST and os.path.isdir(STORY_PROGRESS_DIR):
-                for filename in os.listdir(STORY_PROGRESS_DIR):
-                    if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
-                        continue
-                    post_id = filename[:-5]
-                    state = _load_progress(post_id)
-                    if state.get("auto_publish_eligible") and not state.get("web_publish_complete"):
-                        _auto_publish_with_retry(post_id)
-        except Exception as exc:
-            print(f"[AUTO-WEB-RECOVERY] {exc}")
-        time.sleep(60)
-
-def _prepare_telegram_publish_polling():
-    """Switch this bot from webhook to polling without discarding pending commands."""
-    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    response = requests.get(base + "/getWebhookInfo", timeout=20)
-    response.raise_for_status()
-    info = response.json()
-    if not info.get("ok"):
-        raise RuntimeError("Không kiểm tra được Telegram webhook")
-    if (info.get("result") or {}).get("url"):
-        print("[PUBLISH-TEST] Telegram webhook đang bật; chuyển sang polling, giữ các update đang chờ.")
-        result = requests.post(base + "/deleteWebhook", data={"drop_pending_updates": "false"}, timeout=25)
-        result.raise_for_status()
-        if not result.json().get("ok"):
-            raise RuntimeError("Telegram không xác nhận deleteWebhook")
-    print("[PUBLISH-TEST] Telegram polling sẵn sàng nhận /publish.")
-
-
-def publish_command_worker():
-    """Chỉ nhận /publish PAGEID_POSTID từ TELEGRAM_CHAT_ID; không tự đăng khi tạo TXT."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    offset = None
-    # Chỉ chuyển webhook khi tính năng publish test được bật; không xóa update cũ.
-    # Nếu bot token còn được dùng bởi dịch vụ khác, cần chuyển dịch vụ đó sang polling chung.
-    while True:
-        try:
-            _prepare_telegram_publish_polling()
-            break
-        except Exception as exc:
-            print(f"[PUBLISH-TEST] Chưa thể khởi tạo polling: {exc}")
-            time.sleep(30)
-    while True:
-        try:
-            args = {"timeout": 20, "allowed_updates": json.dumps(["message"])}
-            if offset is not None:
-                args["offset"] = offset
-            response = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=args, timeout=30)
-            data = response.json()
-            if not data.get("ok"):
-                raise RuntimeError(str(data.get("description", "Telegram getUpdates failed")))
-            for update in data.get("result", []):
-                offset = int(update["update_id"]) + 1
-                msg = update.get("message") or {}
-                if str((msg.get("chat") or {}).get("id")) != str(TELEGRAM_CHAT_ID):
-                    continue
-                content = (msg.get("text") or "").strip()
-                match = re.fullmatch(r"/publish(?:@\w+)?\s+(\d+_\d+)", content, re.I)
-                if match:
-                    pid = match.group(1)
-                    try:
-                        publish_approved_story(pid)
-                        send_telegram_message(f"✅ Đã hoàn thành lệnh /publish {pid} (xem trạng thái website ở trên).")
-                    except Exception as exc:
-                        send_telegram_message(f"⚠️ /publish {pid} chưa hoàn tất: {str(exc)[:700]}")
-        except Exception as exc:
-            print(f"[PUBLISH-TEST] Telegram polling: {exc}")
-            time.sleep(PUBLISH_APPROVAL_POLL_SECONDS)
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
     if not ENABLE_STORY_CONTINUATION or not ENABLE_PAID_GENERATION or not caption.strip():
@@ -1772,61 +839,27 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
                 print(f"[STORY] Không lưu được lịch thử lại {post_id}: {exc}")
 
 
-# Persist active incidents; one failure alert, one recovery alert PER incident.
-# /data should be a persistent Railway volume to survive redeploys.
-INCIDENTS_FILE = "/data/active_incidents.json"
-_INCIDENT_LOCK = threading.RLock()
-def _load_incidents():
-    try:
-        with open(INCIDENTS_FILE, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
-_active_incidents = _load_incidents()
+ERROR_COOLDOWN_MINUTES = 30
+_last_error_sent_at = {}
 
-def _incident_key(error_key):
-    # Group errors of the same class, without spamming for every post ID.
-    key = re.sub(r"\b\d{10,}_\d{10,}\b", "POST_ID", str(error_key))
-    key = re.sub(r"^(?:qualified_link_check_|story_resume_|worker_).*", lambda m: m.group(0).split("_")[0] + "_post", key) if re.match(r"^(qualified_link_check_|story_resume_|worker_)", key) else key
-    return key[:160]
 
 def send_error_alert(error_key: str, text: str):
-    key = _incident_key(error_key)
-    with _INCIDENT_LOCK:
-        if key in _active_incidents:
-            return False
-        # Reserve before sending to prevent concurrent duplicate alerts.
-        _active_incidents[key] = {"since": datetime.now(timezone.utc).isoformat(), "detail": text[:250]}
-        _save_incidents()
-    ok = send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nChỉ thông báo lại khi đã khắc phục.")
-    if not ok:
-        # No confirmed delivery; allow next iteration to try again.
-        with _INCIDENT_LOCK:
-            _active_incidents.pop(key, None)
-            _save_incidents()
-    return ok
+    now = datetime.now()
+    # Chỉ gửi một lần cho mỗi loại lỗi, kể cả sau khi restart.
+    error_key = re.sub(r"\b\d{10,}_\d{10,}\b", "POST_ID", error_key)
+    if error_key in error_once_keys:
+        return
+    last_sent = _last_error_sent_at.get(error_key)
+    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
+        return
+    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
+    _last_error_sent_at[error_key] = now
+    error_once_keys.add(error_key)
+    try:
+        _save_keys(ERROR_ONCE_FILE, error_once_keys)
+    except OSError as exc:
+        print(f"[CẢNH BÁO] Không lưu được error-once: {exc}")
 
-def _save_incidents():
-    os.makedirs(os.path.dirname(INCIDENTS_FILE), exist_ok=True)
-    tmp = INCIDENTS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(_active_incidents, f, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, INCIDENTS_FILE)
-
-def report_error_recovered(error_key: str, description: str = ""):
-    key = _incident_key(error_key)
-    with _INCIDENT_LOCK:
-        if key not in _active_incidents:
-            return False
-        # Send before clearing: failed Telegram will be retried next success.
-        ok = send_telegram_message(f"✅ ĐÃ KHẮC PHỤC: {description or key}\nHệ thống hoạt động bình thường.")
-        if ok:
-            _active_incidents.pop(key, None)
-            _save_incidents()
-        return ok
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
 def check_token_expiry():
@@ -1849,15 +882,12 @@ def check_token_expiry():
         )
         return
 
-    report_error_recovered("token_invalid", "Facebook token hợp lệ trở lại")
     expires_at = data.get("expires_at")
     if not expires_at:  # 0 hoặc None = token không có hạn / không xác định được
         return
 
     expire_dt = datetime.fromtimestamp(expires_at)
     days_left = (expire_dt - datetime.now()).days
-    if days_left > TOKEN_EXPIRY_WARNING_DAYS:
-        report_error_recovered("token_expiry_warning", "Facebook token đã được gia hạn")
     if days_left <= TOKEN_EXPIRY_WARNING_DAYS:
         send_error_alert(
             "token_expiry_warning",
@@ -1888,8 +918,15 @@ def note_fb_network_success(error_key: str):
     was_alerted = error_key in _fb_network_alerted
     _fb_network_failures[error_key] = 0
     _fb_network_alerted.discard(error_key)
-    if was_alerted or _incident_key(error_key) in _active_incidents:
-        report_error_recovered(error_key, "Facebook API đã kết nối lại")
+    if was_alerted:
+        recovery_key = f"recovered_{error_key}"
+        if recovery_key not in error_once_keys:
+            send_telegram_message("✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
+            error_once_keys.add(recovery_key)
+            try:
+                _save_keys(ERROR_ONCE_FILE, error_once_keys)
+            except OSError as exc:
+                print(f"[CẢNH BÁO] Không lưu được recovery-once: {exc}")
     elif had_failures:
         print(f"[FACEBOOK NETWORK] {error_key}: kết nối đã phục hồi sau {had_failures} lần lỗi.")
 
@@ -1910,71 +947,42 @@ def _adaptive_poll_seconds(views: int, comments: int) -> int:
 
 
 def get_managed_pages():
-    """Lấy toàn bộ Page do via tổng USER_ACCESS_TOKEN quản lý."""
     now_mono = time.monotonic()
     cached = _managed_pages_cache.get("pages") or []
     if cached and now_mono - float(_managed_pages_cache.get("at", 0)) < MANAGED_PAGES_CACHE_SECONDS:
         return cached
 
-    url = f"{GRAPH_URL}/me/accounts"
-    params = {
-        "fields": "id,name,access_token",
-        "limit": 100,
-        "access_token": USER_ACCESS_TOKEN,
-    }
     pages = []
-
+    url = f"{GRAPH_URL}/me/accounts"
+    params = {"fields": "id,name,access_token", "limit": 100, "access_token": USER_ACCESS_TOKEN}
     while url:
         try:
             r = api_get(url, params=params)
-            data = r.json()
         except Exception as e:
-            note_fb_network_failure(
-                "get_managed_pages_network",
-                f"Không kết nối được Facebook để lấy danh sách Page: {e}",
-            )
-            break
-
+            note_fb_network_failure("get_managed_pages_network", f"Không kết nối được Facebook để lấy danh sách Page: {e}")
+            return []
         note_fb_network_success("get_managed_pages_network")
-
+        data = r.json()
         if "error" in data:
             err_msg = data["error"].get("message", "Không rõ nguyên nhân")
             print(f"[LỖI] Không lấy được danh sách Page: {err_msg}")
             send_error_alert(
                 "get_managed_pages",
-                f"Không lấy được danh sách Page từ USER_ACCESS_TOKEN. Chi tiết: {err_msg}",
+                f"Không lấy được danh sách Page (có thể USER_ACCESS_TOKEN đã hết hạn/sai quyền).\nChi tiết: {err_msg}",
             )
-            break
-
+            return []
         pages.extend(data.get("data", []))
-        url = data.get("paging", {}).get("next")
+        next_url = data.get("paging", {}).get("next")
+        url = next_url
         params = None
-
-    # Khử trùng Page ID nếu Facebook trả lặp qua pagination.
-    unique = {}
-    for page in pages:
-        pid = str(page.get("id") or "")
-        if pid:
-            unique[pid] = page
-    pages = list(unique.values())
-
     if INCLUDE_PAGE_NAMES:
         pages = [p for p in pages if p.get("name") in INCLUDE_PAGE_NAMES]
-    # Loai Page theo ten hoac ID ngay tu nguon, tranh quet / sinh truyen / gui Telegram.
-    pages = [p for p in pages if str(p.get("id") or "") not in EXCLUDE_PAGE_IDS
-             and str(p.get("name") or "").strip().casefold() not in EXCLUDE_PAGE_NAMES]
-
+    if EXCLUDE_PAGE_NAMES:
+        pages = [p for p in pages if not any(x in (p.get("name") or "").casefold() for x in EXCLUDE_PAGE_NAMES)]
     _managed_pages_cache["pages"] = pages
     _managed_pages_cache["at"] = time.monotonic()
-
-    print(f"[FACEBOOK] Tổng Page từ USER_ACCESS_TOKEN: {len(pages)}")
-    for p in pages:
-        pid = str(p.get("id") or "")
-        pname = p.get("name") or "(không tên)"
-        marker = "  <<< SPECIAL-INSTANT" if pid in SPECIAL_INSTANT_PAGE_IDS else ""
-        print(f"[PAGE] {pname} | ID={pid}{marker}")
-
     return pages
+
 
 def get_recent_post_ids(page_id: str, page_token: str):
     """Đọc nhiều trang /posts thay vì chỉ 25 bài đầu; không đánh dấu thiếu dữ liệu là đã xử lý."""
@@ -2057,7 +1065,6 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             continue
 
         note_fb_network_success("batch_request_network")
-        report_error_recovered("batch_request_error", "Facebook Batch API hoạt động lại")
         try:
             batch_resp = resp.json()
         except Exception as e:
@@ -2289,6 +1296,571 @@ def post_already_has_link(post_id: str, page_id: str, page_token: str, post_mess
     return False
 
 
+# ==================== WEBSITE PUBLISH ====================
+# Chỉ tự đăng sau khi gửi đủ ba TXT; áp dụng mọi Page đạt ngưỡng thông thường.
+
+def _story_title(part2):
+    for line in part2.splitlines():
+        line = line.strip().strip("*# ")
+        if line and not re.fullmatch(r"PART\s+2", line, re.I):
+            return line[:180]
+    return "Story continuation"
+
+
+def _web_part_title(base_title, n):
+    """Tiêu đề web không dùng danh sách/mã Page từ phiên bản khác."""
+    title = base_title.strip()
+    title = re.sub(r"(?i)^PART\s*[234](?:\s*\(THE END\))?\s*[:\-–—]?\s*", "", title).strip()
+    suffix = f" {AUTHOR_CODE}" if AUTHOR_CODE else ""
+    prefix = "PART 4 (THE END): " if n == 4 else f"PART {n}: "
+    return f"{prefix}{title}{suffix}"
+
+
+def _story_body(raw, part):
+    raw = _strip_program_endings(raw)
+    raw = re.sub(r"(?im)^\s*PART\s+%d(?:\s*\(THE END\))?\s*$" % part, "", raw).strip()
+    if part == 2:
+        lines = raw.splitlines()
+        if lines:
+            raw = "\n".join(lines[1:]).strip()
+    return raw
+
+
+def _to_html(body, navigation=None):
+    paragraphs = re.split(r"\n\s*\n", body.strip())
+    content = "\n".join("<p>" + html.escape(p).replace("\n", "<br>") + "</p>" for p in paragraphs if p.strip())
+    if navigation:
+        content += '<hr><nav aria-label="Story chapters">' + " | ".join(
+            '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
+            for label, url in navigation
+        ) + '</nav>'
+    return content
+
+
+def _web_login():
+    """Đăng nhập bằng Laravel session và CSRF; kiểm tra API /me trước khi ghi."""
+    if not WEB_ADMIN_EMAIL or not WEB_ADMIN_PASSWORD:
+        raise RuntimeError("Thiếu WEB_ADMIN_EMAIL hoặc WEB_ADMIN_PASSWORD")
+    session = requests.Session()
+    login_url = WEB_BASE_URL + WEB_LOGIN_PATH
+    r = session.get(login_url, timeout=25)
+    r.raise_for_status()
+    patterns = (
+        r'<input[^>]*name=["\']_token["\'][^>]*value=["\']([^"\']+)',
+        r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)',
+    )
+    token = next((html.unescape(m.group(1)) for pattern in patterns if (m := re.search(pattern, r.text, re.I))), None)
+    if not token:
+        raise RuntimeError("Không tìm thấy CSRF trong form đăng nhập")
+    form = {"email": WEB_ADMIN_EMAIL, "password": WEB_ADMIN_PASSWORD, "_token": token}
+    result = session.post(login_url, data=form, headers={"Referer": login_url}, timeout=25, allow_redirects=False)
+    if result.status_code not in (302, 303):
+        raise RuntimeError(f"Đăng nhập không trả redirect hợp lệ: HTTP {result.status_code}")
+    redirect = result.headers.get("Location", "")
+    if "dashboard" not in redirect and "admin" not in redirect:
+        raise RuntimeError("Đăng nhập không chuyển đến Admin; có thể sai thông tin")
+    session.headers.update({"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"})
+    # Laravel session thường xoay CSRF token sau login: lấy token mới ở trang admin.
+    dashboard = session.get(WEB_BASE_URL + "/admin/dashboard", timeout=25)
+    dashboard.raise_for_status()
+    fresh = re.search(r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)', dashboard.text, re.I)
+    if fresh:
+        token = html.unescape(fresh.group(1))
+    session.headers["X-CSRF-TOKEN"] = token
+    # Cookie XSRF-TOKEN tự động được requests gửi kèm.
+    xsrf = session.cookies.get("XSRF-TOKEN")
+    if xsrf:
+        from urllib.parse import unquote
+        session.headers["X-XSRF-TOKEN"] = unquote(xsrf)
+    me = session.get(WEB_BASE_URL + "/admin/api/v1/me", timeout=25)
+    if me.status_code != 200:
+        raise RuntimeError(f"Không xác minh được phiên Admin qua /me: HTTP {me.status_code}")
+    try:
+        info = me.json()
+    except ValueError:
+        raise RuntimeError("API /me không trả JSON")
+    if not info:
+        raise RuntimeError("API /me trả dữ liệu rỗng")
+    return session
+
+
+def _facebook_original_image(post_id, page_token):
+    """Tìm ảnh gốc của post, không sử dụng ảnh thumbnail nếu có bản full."""
+    response = requests.get(f"{GRAPH_URL}/{post_id}", params={
+        "fields": "full_picture,attachments{type,media,subattachments{media,type}}",
+        "access_token": page_token,
+    }, timeout=30)
+    response.raise_for_status()
+    obj = response.json()
+    if obj.get("error"):
+        raise RuntimeError("Facebook không cấp quyền đọc ảnh bài gốc")
+    attachments = ((obj.get("attachments") or {}).get("data") or [])
+    candidates = []
+    for att in attachments:
+        candidates.append(((att.get("media") or {}).get("image") or {}).get("src"))
+        for sub in ((att.get("subattachments") or {}).get("data") or []):
+            candidates.append(((sub.get("media") or {}).get("image") or {}).get("src"))
+    candidates.append(obj.get("full_picture"))
+    return next((u for u in candidates if isinstance(u, str) and u.startswith("https://")), None)
+
+
+def _download_facebook_image(image_url):
+    """Giới hạn domain và dung lượng, tránh truy cập URL tùy ý."""
+    host = (urlparse(image_url).hostname or "").lower()
+    if not (host == "fbcdn.net" or host.endswith(".fbcdn.net") or
+            host == "fbsbx.com" or host.endswith(".fbsbx.com")):
+        raise RuntimeError("URL ảnh Facebook không thuộc miền CDN được phép")
+    with requests.get(image_url, timeout=50, stream=True, allow_redirects=False) as response:
+        response.raise_for_status()
+        chunks, size = [], 0
+        for chunk in response.iter_content(128 * 1024):
+            size += len(chunk)
+            if size > WEB_IMAGE_MAX_BYTES:
+                raise RuntimeError("Ảnh Facebook vượt giới hạn 15MB")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return raw, "image/png", "png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return raw, "image/jpeg", "jpg"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return raw, "image/webp", "webp"
+    raise RuntimeError("Không nhận diện được ảnh PNG/JPEG/WebP từ Facebook")
+
+
+def _web_upload_featured_image(session, post_id, page_token):
+    image_url = _facebook_original_image(post_id, page_token)
+    if not image_url:
+        if WEB_ALLOW_IMAGE_FALLBACK and WEB_POST_IMAGE_URL.startswith("https://"):
+            return WEB_POST_IMAGE_URL
+        raise RuntimeError("Không lấy được ảnh gốc Facebook; dừng đăng web")
+    raw, content_type, ext = _download_facebook_image(image_url)
+    payload = {"fileName": f"fb_{post_id.replace('_', '-')}.{ext}",
+               "contentType": content_type, "size": len(raw),
+               "auditContext": {"record_type": "Post", "action_label": "upload_featured_image"}}
+    resp = session.post(WEB_BASE_URL + "/admin/api/v1/uploads/presigned-image-url",
+        json=payload, headers={"Origin": WEB_BASE_URL,
+                               "Referer": WEB_BASE_URL + "/admin/posts/new"}, timeout=40)
+    resp.raise_for_status()
+    data = (resp.json().get("data") or {})
+    upload = data.get("upload") or {}
+    signed_url, public_url = upload.get("url"), data.get("fileUrl")
+    if upload.get("method") != "PUT" or not signed_url or not public_url:
+        raise RuntimeError("API cấp URL upload thiếu upload.url/fileUrl")
+    signed_host = (urlparse(signed_url).hostname or "").lower()
+    public_host = (urlparse(public_url).hostname or "").lower()
+    if not (signed_host.endswith(".r2.cloudflarestorage.com") and
+            public_host == "blog.igallery.blog" and
+            urlparse(signed_url).scheme == urlparse(public_url).scheme == "https"):
+        raise RuntimeError("API trả URL ảnh ngoài domain lưu trữ dự kiến")
+    headers = dict(upload.get("headers") or {})
+    headers["Content-Type"] = content_type
+    # requests tự xác định Content-Length khớp bytes; không chuyển Cookie admin lên R2.
+    headers.pop("Content-Length", None)
+    put = requests.put(signed_url, data=raw, headers=headers, timeout=100)
+    if put.status_code not in (200, 201, 204):
+        raise RuntimeError(f"R2 upload ảnh thất bại HTTP {put.status_code}")
+    return public_url
+
+
+def _web_create_post(session, title, body_html, image_url, slug=""):
+    payload = {
+        "title": title, "slug": slug, "description": body_html,
+        "image": image_url, "is_active": WEB_POSTS_PUBLIC,
+        "is_home": False, "is_top": False, "next_chapter": "", "prev_chapter": "",
+        "selected_categories": [], "selected_tags": [],
+        "seo_description": "", "seo_keywords": "", "seo_title": "", "series_id": None,
+    }
+    response = session.post(WEB_BASE_URL + "/admin/api/v1/posts", json=payload, timeout=45,
+                            headers={"Origin": WEB_BASE_URL, "Referer": WEB_BASE_URL + "/admin/posts/new"})
+    if response.status_code != 201:
+        raise RuntimeError(f"Website HTTP {response.status_code}: {response.text[:250]}")
+    data = response.json()
+    if data.get("ok") is not True:
+        raise RuntimeError("Website không xác nhận ok=true")
+    record = data.get("data") or {}
+    link = record.get("public_url") or record.get("permalink")
+    parsed = urlparse(link or "")
+    if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
+        raise RuntimeError("Website trả về public_url không hợp lệ")
+    return {"url": link, "id": record.get("id"), "slug": record.get("slug")}
+
+
+def _web_update_chapter(session, post_record, title, description, image_url, prev_slug="", next_slug=""):
+    """PUT đúng payload đã quan sát trong DevTools, với slug chương liền kề."""
+    post_id = post_record.get("id")
+    if not post_id or not post_record.get("slug"):
+        raise RuntimeError("Thiếu id/slug của bài web")
+    payload = {"title": title, "slug": post_record["slug"], "description": description,
+               "is_active": WEB_POSTS_PUBLIC, "is_home": False, "is_top": False,
+               "image": image_url, "selected_categories": [], "selected_tags": [],
+               "seo_description": None, "seo_keywords": None, "seo_title": None, "series_id": None,
+               "next_chapter": next_slug, "prev_chapter": prev_slug, "version": "1"}
+    response = session.put(f"{WEB_BASE_URL}/admin/api/v1/posts/{post_id}", json=payload,
+        headers={"Origin": WEB_BASE_URL, "Referer": f"{WEB_BASE_URL}/admin/posts/{post_id}/edit"}, timeout=45)
+    if response.status_code != 200:
+        raise RuntimeError(f"Không cập nhật được liên kết chương: HTTP {response.status_code}: {response.text[:200]}")
+    result = response.json()
+    if result.get("ok") is not True:
+        raise RuntimeError("API sửa bài không xác nhận ok=true")
+
+
+def _wp_request(method, path, **kwargs):
+    if not WP_USERNAME or not WP_APPLICATION_PASSWORD:
+        raise RuntimeError("Thiếu WP_USERNAME hoặc WP_APPLICATION_PASSWORD")
+    response = requests.request(method, WP_BASE_URL + path,
+        auth=(WP_USERNAME, WP_APPLICATION_PASSWORD), timeout=65, **kwargs)
+    if response.status_code >= 400:
+        raise RuntimeError(f"WordPress {method} {path}: HTTP {response.status_code}: {response.text[:350]}")
+    return response.json()
+
+
+def _wp_upload_featured_image(post_id, page_token):
+    source = _facebook_original_image(post_id, page_token)
+    if not source:
+        raise RuntimeError("Không có ảnh Facebook gốc để đăng WordPress")
+    raw, mime, ext = _download_facebook_image(source)
+    filename = f"fb_{post_id.replace('_', '-')}.{ext}"
+    response = _wp_request("POST", "/wp-json/wp/v2/media", data=raw,
+        headers={"Content-Type": mime, "Content-Disposition": f'attachment; filename="{filename}"'})
+    if not response.get("id"):
+        raise RuntimeError("WordPress không trả media ID")
+    return int(response["id"])
+
+
+def _wp_create_post(title, body_html, media_id):
+    record = _wp_request("POST", "/wp-json/wp/v2/posts", json={
+        "title": title, "content": body_html,
+        "status": "publish" if WP_POSTS_PUBLIC else "draft", "featured_media": media_id})
+    if not record.get("id"):
+        raise RuntimeError("WordPress không trả post ID")
+    return {"id": record["id"], "url": record.get("link", ""), "slug": record.get("slug", "")}
+
+
+def _wp_update_post(post_record, body_html):
+    return _wp_request("POST", f"/wp-json/wp/v2/posts/{int(post_record['id'])}", json={"content": body_html})
+
+
+# WordPress: ending khớp nguyên văn TXT, các liên kết chương là thẻ <a> bấm được.
+def _wp_chapter_html(parts, n, records):
+    content = _to_html(_story_body(parts[str(n)], n))
+    content += "\n" + _to_html(PART_ENDINGS[n])
+    links = []
+    if n > 2:
+        url = records.get(str(n-1), {}).get("url")
+        if not url:
+            raise RuntimeError(f"Thiếu URL Part {n-1} để tạo liên kết chương")
+        links.append((f"← PREVIOUS: PART {n-1}", url))
+    if n < 4:
+        url = records.get(str(n+1), {}).get("url")
+        if not url:
+            raise RuntimeError(f"Thiếu URL Part {n+1} để tạo liên kết chương")
+        links.append(("NEXT: PART 4(THE END)" if n + 1 == 4 else f"NEXT: PART {n+1}", url))
+    if links:
+        content += '\n<nav aria-label="Story chapter links" class="story-chapter-links">'
+        for label, url in links:
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.netloc != urlparse(WP_BASE_URL).netloc:
+                raise RuntimeError("URL chương WordPress không thuộc website đang chọn")
+            content += '<p><a href="%s"><strong>%s</strong></a></p>' % (
+                html.escape(url, quote=True), html.escape(label))
+        content += '</nav>'
+    return content
+
+
+def repair_existing_wordpress_links(post_id):
+    """Chỉ cập nhật 3 bài WordPress đã tồn tại; KHÔNG tạo bài, ảnh hay gọi OpenAI."""
+    state = _load_progress(post_id)
+    if state.get("publish_platform") != "wordpress" or state.get("publish_target") != WP_BASE_URL:
+        raise RuntimeError("Checkpoint không thuộc WordPress đang chọn")
+    records = state.get("web_posts") or {}
+    parts = state.get("parts") or {}
+    if not all(records.get(str(n), {}).get("id") and records[str(n)].get("url")
+               and parts.get(str(n)) for n in (2, 3, 4)):
+        raise RuntimeError("Checkpoint chưa đủ 3 chương WordPress; không sửa để tránh sai bài")
+    for n in (2, 3, 4):
+        _wp_update_post(records[str(n)], _wp_chapter_html(parts, n, records))
+        print(f"[WP-REPAIR] {post_id}: updated Part {n}")
+    state["wp_chapter_format_version"] = 3
+    _save_progress(post_id, state)
+
+
+def _wp_repair_requested_once():
+    post_id = os.getenv("WP_REPAIR_EXISTING_POST_ID", "").strip()
+    if not post_id:
+        return
+    if not re.fullmatch(r"\d+_\d+", post_id):
+        print("[WP-REPAIR] WP_REPAIR_EXISTING_POST_ID không hợp lệ")
+        return
+    try:
+        repair_existing_wordpress_links(post_id)
+    except Exception as exc:
+        print(f"[WP-REPAIR] {post_id}: lỗi: {exc}")
+
+
+def publish_wordpress_story(post_id):
+    post_id = str(post_id).strip()
+    if not re.fullmatch(r"\d+_\d+", post_id):
+        raise ValueError("POST_ID không hợp lệ")
+    state = _load_progress(post_id)
+    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
+        raise RuntimeError("Chưa gửi đủ ba TXT")
+    if not ENABLE_WEB_PUBLISH_TEST:
+        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false")
+    target = WP_BASE_URL
+    if state.get("publish_target") and state["publish_target"] != target:
+        raise RuntimeError("Checkpoint thuộc website khác; không tự chuyển bài đã đăng dở")
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
+    state["publish_target"] = target
+    state["publish_platform"] = "wordpress"
+    _save_progress(post_id, state)
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
+    records = state.setdefault("web_posts", {})
+    parts = state["parts"]
+    base_title = _story_title(parts["2"])
+    page_id = post_id.split("_", 1)[0]
+    page_name = state.get("page_name")
+    if not page_name:
+        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+        page_name = (page or {}).get("name")
+    media_id = state.get("wp_media_id")
+    if not media_id:
+        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+        if not page or not page.get("access_token"):
+            raise RuntimeError("Thiếu Facebook Page token để lấy ảnh")
+        media_id = _wp_upload_featured_image(post_id, page["access_token"])
+        state["wp_media_id"] = media_id
+        _save_progress(post_id, state)
+    for n in (4, 3, 2):
+        key = str(n)
+        if records.get(key, {}).get("id"):
+            continue
+        nav = [(f"READ PART {n+1}", records[str(n+1)]["url"])] if n < 4 and records.get(str(n+1), {}).get("url") else []
+        title = _web_part_title(base_title, n)
+        records[key] = _wp_create_post(title, _to_html(_story_body(parts[key], n)) + "\n" + _to_html(PART_ENDINGS[n]), media_id)
+        _save_progress(post_id, state)
+        print(f"[WORDPRESS] {post_id}: created Part {n}, ID={records[key]['id']}")
+    # Version 3: đồng bộ nhãn NEXT: PART 4(THE END) kể cả checkpoint cũ.
+    if state.get("wp_chapter_format_version") != 3:
+        for n in (2, 3, 4):
+            _wp_update_post(records[str(n)], _wp_chapter_html(parts, n, records))
+            _save_progress(post_id, state)
+        state["wp_chapter_format_version"] = 3
+        state["web_linked"] = [2, 3, 4]
+        _save_progress(post_id, state)
+    if not state.get("web_links_telegram_sent"):
+        message = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in (2, 3, 4))
+        if not all(records[str(n)].get("url") for n in (2, 3, 4)):
+            raise RuntimeError("WordPress thiếu link chương")
+        if not send_telegram_message(message):
+            raise RuntimeError("Telegram chưa xác nhận thông báo ba link")
+        state["web_links_telegram_sent"] = True
+        _save_progress(post_id, state)
+
+
+def _bioblog_slug(value):
+    """Nguồn permalink: giữ kiểu slug từ tiêu đề, không tự nối tên author."""
+    import unicodedata
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    value = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return value[:180].rstrip("-")
+
+
+def _bioblog_api_create(title, content, feature_image, permalink):
+    """Chỉ sử dụng POST /api/posts trong tài liệu chính thức."""
+    # Chọn Bearer token đúng website từ các Railway Variables đã có sẵn.
+    token_env_by_host = {
+        "puretales.cafex.biz": "PURETALES_CAFEX_TOKEN",
+        "twisttales.idolsgift.com": "TWISTTALES_TOKEN",
+        "storynests.idolsgift.com": "STORYNESTS_TOKEN",
+        "storyviral.idolsgift.com": "STORYVIRAL_TOKEN",
+        "puretales.idolsgift.com": "PURETALES_TOKEN",
+        "echoesofstories.feji.io": "ECHOES_FEJI_TOKEN",
+        "echoesofstories.idolsgift.com": "ECHOES_TOKEN",
+    }
+    host = (urlparse(WEB_BASE_URL).hostname or "").lower()
+    token_key = token_env_by_host.get(host)
+    token = (os.getenv(token_key, "").strip() if token_key else "")
+    if not token:
+        token = os.getenv("BIOBLOG_API_TOKEN", "").strip() or os.getenv("WEB_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError(f"Thiếu Bearer token BioBlog cho {host}: {token_key or 'BIOBLOG_API_TOKEN'}")
+    payload = {
+        "title": title,
+        "content": content,
+        "permalink": permalink,
+        "feature_image": feature_image,
+        "mode": "normal",
+    }
+    # author dùng để tạo slug theo API docs; cột AUTHOR trong Admin phụ thuộc backend.
+    author = (os.getenv("WEB_AUTHOR", "").strip() or os.getenv("BIOBLOG_API_AUTHOR", "").strip()
+              or os.getenv("WEB_ADMIN_EMAIL", "").strip())
+    if author:
+        payload["author"] = author
+    url = WEB_BASE_URL + "/api/posts"
+    try:
+        # Không retry POST mơ hồ vì có nguy cơ đăng bài trùng.
+        response = requests.post(url, json=payload, headers={
+            "Authorization": "Bearer " + token,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }, timeout=(15, 90))
+    except requests.RequestException as exc:
+        raise RuntimeError("POST /api/posts chưa rõ thành công hay chưa; "
+                           "dừng để kiểm tra Admin trước khi thử lại, tránh đăng trùng: " + str(exc))
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"BioBlog POST /api/posts HTTP {response.status_code}: {response.text[:350]}")
+    try:
+        obj = response.json()
+    except ValueError:
+        raise RuntimeError("BioBlog đã trả thành công nhưng JSON không đọc được; kiểm tra Admin tránh đăng trùng")
+    record = obj.get("data", obj) if isinstance(obj, dict) else {}
+    if isinstance(record, list):
+        record = record[0] if record else {}
+    if not isinstance(record, dict):
+        record = {}
+    # API docs: trả ID, slug, frontend link; không giả định tên khóa cố định.
+    slug = record.get("slug") or record.get("post_slug")
+    link = record.get("frontend_link") or record.get("frontend_url") or record.get("public_url") or record.get("url") or record.get("link")
+    if not slug and isinstance(link, str):
+        slug = urlparse(link).path.rstrip("/").split("/")[-1]
+    if not slug:
+        raise RuntimeError("POST thành công nhưng response thiếu slug/link; kiểm tra Admin, KHÔNG tự đăng lại")
+    if not link:
+        link = WEB_BASE_URL + "/blog/" + str(slug)
+    if isinstance(link, str) and link.startswith("/"):
+        link = WEB_BASE_URL + link
+    parsed = urlparse(str(link))
+    if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
+        raise RuntimeError("POST thành công nhưng link không thuộc website; kiểm tra Admin trước khi thử lại")
+    return {"id": record.get("id"), "slug": str(slug), "url": str(link)}
+
+
+def publish_approved_story(post_id):
+    if PUBLISH_PLATFORM == "wordpress":
+        return publish_wordpress_story(post_id)
+    post_id = str(post_id).strip()
+    if not re.fullmatch(r"\d+_\d+", post_id):
+        raise ValueError("POST_ID phải có dạng PAGEID_POSTID")
+    state = _load_progress(post_id)
+    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
+        raise RuntimeError("Chưa đủ Part 2/3/4")
+    if not ENABLE_WEB_PUBLISH_TEST:
+        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false")
+    if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
+        raise RuntimeError("Checkpoint thuộc website khác")
+    if state.get("web_posts") and state.get("publish_platform") not in (None, "bioblog_official"):
+        raise RuntimeError("Checkpoint từ API Admin cũ: cần kiểm tra thủ công để tránh đăng trùng")
+    if state.get("web_posts") and not state.get("publish_target"):
+        raise RuntimeError("Checkpoint web cũ chưa xác định domain")
+    state["publish_target"] = WEB_BASE_URL
+    state["publish_platform"] = "bioblog_official"
+    _save_progress(post_id, state)
+    web = state.setdefault("web_posts", {})
+    parts = state["parts"]
+    base_title = _story_title(parts["2"])
+    page_id = post_id.split("_", 1)[0]
+    # API công khai nhận URL ảnh, không dùng endpoint upload nội bộ /admin/api/v1.
+    image_url = state.get("web_featured_image")
+    if not image_url:
+        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+        if not page or not page.get("access_token"):
+            raise RuntimeError("Thiếu Page token để lấy ảnh gốc")
+        image_url = _facebook_original_image(post_id, page["access_token"])
+        if not image_url and WEB_ALLOW_IMAGE_FALLBACK:
+            image_url = WEB_POST_IMAGE_URL
+        if not image_url:
+            raise RuntimeError("Không lấy được URL ảnh Facebook; API chính thức chỉ nhận feature_image URL")
+        state["web_featured_image"] = image_url
+        _save_progress(post_id, state)
+    # Đăng 4 -> 3 -> 2: liên kết NEXT trong HTML luôn trỏ tới bài đã có thật.
+    # Tài liệu KHÔNG cung cấp API sửa bài, nên không giả định PUT /api/posts.
+    for n in (4, 3, 2):
+        key = str(n)
+        if web.get(key, {}).get("url"):
+            continue
+        nav = [(f"NEXT: PART {n+1}", web[str(n+1)]["url"])] if n < 4 else []
+        title = _web_part_title(base_title, n)
+        content = _to_html(_story_body(parts[key], n) + "\n\n" + PART_ENDINGS[n], nav)
+        permalink = _bioblog_slug(title)
+        # Dùng permalink theo title (bao gồm AUTHOR_CODE như code cũ);
+        # KHÔNG gắn tên Phi/Loan vào cuối slug.
+        # Ghi trạng thái trước POST: timeout/đứt mạng sẽ KHÔNG tự tạo bài trùng.
+        if state.get("web_post_uncertain", {}).get(key):
+            raise RuntimeError(f"Part {n} từng POST chưa rõ kết quả. Kiểm tra Admin trước khi tiếp tục")
+        state.setdefault("web_post_uncertain", {})[key] = True
+        _save_progress(post_id, state)
+        result = _bioblog_api_create(title, content, image_url, permalink)
+        web[key] = result
+        state["web_post_uncertain"].pop(key, None)
+        _save_progress(post_id, state)
+        print(f"[AUTO-WEB] {post_id}: Part {n} created: {result['url']}")
+    if not state.get("web_links_telegram_sent"):
+        message = "\n".join(f"PART {n}: {web[str(n)]['url']}" for n in (2, 3, 4))
+        if not send_telegram_message(message):
+            raise RuntimeError("Telegram chưa xác nhận gửi 3 link")
+        state["web_links_telegram_sent"] = True
+        _save_progress(post_id, state)
+
+
+AUTO_PUBLISH_RETRY_SECONDS = int(os.getenv("AUTO_PUBLISH_RETRY_SECONDS", "300"))
+_AUTO_PUBLISH_LOCK = threading.RLock()
+
+
+def _auto_publish_with_retry(post_id):
+    """Publish after 3 TXT; retry later from persistent state, never recreate saved chapters."""
+    if not (ENABLE_AUTO_WEB_PUBLISH and ENABLE_WEB_PUBLISH_TEST):
+        return False
+    with _AUTO_PUBLISH_LOCK:
+        state = _load_progress(post_id)
+        if not state.get("auto_publish_eligible"):
+            return False
+        if state.get("web_publish_complete"):
+            return True
+        if time.time() < float(state.get("web_retry_after", 0)):
+            return False
+        if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)):
+            return False
+        if not all(n in state.get("sent", []) for n in (2, 3, 4)):
+            return False
+        try:
+            publish_approved_story(post_id)
+            state = _load_progress(post_id)
+            state["web_publish_complete"] = True
+            state.pop("web_retry_after", None)
+            _save_progress(post_id, state)
+            return True
+        except Exception as exc:
+            state = _load_progress(post_id)
+            state["web_retry_after"] = time.time() + AUTO_PUBLISH_RETRY_SECONDS
+            state["web_last_error"] = str(exc)[:800]
+            _save_progress(post_id, state)
+            print(f"[AUTO-WEB] {post_id}: {exc}; retry in {AUTO_PUBLISH_RETRY_SECONDS}s")
+            send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; các Part đã đăng được lưu checkpoint.")
+            return False
+
+
+def auto_publish_recovery_worker():
+    """Only recover explicitly eligible NEW posts; old stories never auto-publish."""
+    while True:
+        try:
+            if ENABLE_AUTO_WEB_PUBLISH and ENABLE_WEB_PUBLISH_TEST and os.path.isdir(STORY_PROGRESS_DIR):
+                for filename in os.listdir(STORY_PROGRESS_DIR):
+                    if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
+                        continue
+                    post_id = filename[:-5]
+                    state = _load_progress(post_id)
+                    if state.get("auto_publish_eligible") and not state.get("web_publish_complete"):
+                        _auto_publish_with_retry(post_id)
+        except Exception as exc:
+            print(f"[AUTO-WEB-RECOVERY] {exc}")
+        time.sleep(60)
+
+
+
 STORY_QUEUE = queue.Queue()
 _story_pending = set()
 _story_lock = threading.Lock()
@@ -2322,18 +1894,11 @@ def story_worker():
                     published = datetime.strptime(verify["created_time"], "%Y-%m-%dT%H:%M:%S%z")
                     age = datetime.now(timezone.utc) - published
                     if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
-                        print(f"[COST GUARD] {post_id}: bài ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
+                        print(f"[COST GUARD] {post_id}: ngoài giới hạn {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
                         continue
                 except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
                     continue
-                # Đã xác nhận bài mới theo thời gian Facebook: đánh dấu đủ điều kiện auto-web.
-                # Lưu trước khi gọi OpenAI để retry/redeploy không mất quyền xử lý.
-                state = _load_progress(post_id)
-                if not state.get("auto_publish_eligible"):
-                    state["auto_publish_eligible"] = True
-                    state["page_name"] = page_name
-                    _save_progress(post_id, state)
                 if notified_key not in already_notified:
                     print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN.")
                     send_telegram_message(alert_text)
@@ -2354,7 +1919,6 @@ def story_worker():
             STORY_QUEUE.task_done()
 
 def check_all_pages():
-    global _special_baseline_ready, special_baseline_posts
     # Token expiry được kiểm tra theo ngày để vòng quét nhanh hơn.
     if not hasattr(check_all_pages, "_last_token_check") or time.time() - check_all_pages._last_token_check > 86400:
         check_token_expiry()
@@ -2378,28 +1942,13 @@ def check_all_pages():
         page_token = page["access_token"]
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
-        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS 
-
-        # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
-        # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
-        if is_special_page and not _special_baseline_ready:
-            special_baseline_posts.update(str(pid) for pid in all_post_ids)
-            save_special_baseline(special_baseline_posts)
-            _special_baseline_ready = True
-            print(
-                f"[SPECIAL-BASELINE] [{page_name}] đã ghi nhận {len(all_post_ids)} bài hiện có. "
-                "Từ bây giờ bài mới sẽ tạo TXT ngay, không cần chờ ngưỡng."
-            )
-            continue
 
         # Không quét lại bài đã gửi đủ TXT. Adaptive polling: bài gần ngưỡng 1 phút,
         # bài xa ngưỡng 2-5 phút. Vòng scanner vẫn chạy mỗi 60 giây để bắt bài mới nhanh.
         now_mono = time.monotonic()
         post_ids_to_check = [
             pid for pid in all_post_ids
-            if str(pid) not in story_completed
-            and (not is_special_page or str(pid) not in special_baseline_posts)
-            and now_mono >= _post_next_check.get(str(pid), 0)
+            if str(pid) not in story_completed and now_mono >= _post_next_check.get(str(pid), 0)
         ]
 
         if not post_ids_to_check:
@@ -2411,9 +1960,7 @@ def check_all_pages():
             key = f"{page_id}_{post_id}"
             views, comments, link, message = stats.get(post_id, (None, None, None, ""))
 
-            if not is_special_page and (comments is None or (
-                views is None and comments <= COMMENT_ONLY_THRESHOLD
-            )):
+            if comments is None or (views is None and comments <= COMMENT_ONLY_THRESHOLD):
                 print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
                 # Dữ liệu lỗi: thử lại ngay vòng 60 giây kế tiếp, không cache kết quả lỗi lâu.
                 _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
@@ -2424,7 +1971,7 @@ def check_all_pages():
             # Khi pagination hoàn tất, biến comments được thay bằng TOP_LEVEL; vì vậy cả threshold
             # VÀ dòng "Comments:" trong Telegram đều dùng cùng một số top_level sát Facebook.
             summary_comments = int(comments or 0)
-            if not is_special_page and should_deep_count_comments(views or 0, summary_comments):
+            if should_deep_count_comments(views or 0, summary_comments):
                 effective_comments, comment_debug = get_comment_count_fallback(
                     post_id, page_token, summary_comments
                 )
@@ -2443,61 +1990,11 @@ def check_all_pages():
                 + f" | next={poll_seconds}s"
             )
 
-            # Luôn ghi lịch sử views để khi bật công tắc spike đã có baseline 30 phút.
-            # Cảnh báo "BÀI ĐANG DỰNG ĐỨNG" độc lập với ngưỡng BÀI ĐANG LÊN
-            # và chỉ gửi đúng 1 lần/post nhờ key spike_ được lưu persistent.
-            spike_detected = record_and_check_spike(post_id, int(views or 0), datetime.now())
-
-            spike_key = f"spike_{page_id}_{post_id}"
-
-            if ENABLE_SPIKE_ALERT and spike_detected and spike_key not in already_notified:
-
-                # Spike cũng phải kiểm tra link TRƯỚC khi báo Telegram.
-
-                spike_link_status = post_already_has_link(post_id, page_id, page_token, message)
-
-                if spike_link_status is True:
-
-                    print(f"[SPIKE-SKIP-LINK] [{page_name}] {post_id}: đang dựng đứng nhưng đã có link -> KHÔNG BÁO.")
-
-                elif spike_link_status is None:
-
-                    print(f"[SPIKE-BLOCKED] [{page_name}] {post_id}: chưa xác minh được link -> KHÔNG BÁO, thử lại vòng sau.")
-
-                    _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
-
-                else:
-
-                    evidence = spike_evidence.get(str(post_id), {})
-                    spike_msg = (
-                        f"🚀 BÀI ĐANG DỰNG ĐỨNG! (Page: {page_name})\n"
-                        f"Views: {views}\n"
-                        f"Comments: {comments}\n"
-                        + (f"Link: {link}\n" if link else "")
-                        + f"Đo thực tế: {evidence.get('baseline_views', '?'):,} → {views:,} views "
-                          f"trong {evidence.get('minutes', '?')} phút.\n"
-                        + f"Tăng: +{evidence.get('increase', '?'):,} "
-                          f"({evidence.get('percent', '?')}%), "
-                          f"{evidence.get('rate', '?')} views/phút.\n"
-                        + "=> Kiểm tra bài ngay!"
-                    )
-
-                    print(f"[SPIKE] [{page_name}] {post_id}: dựng đứng + CHƯA có link -> gửi Telegram.")
-
-                    if send_telegram_message(spike_msg):
-                        already_notified.add(spike_key)
-                        save_notified(already_notified)
-                        changed = True
-                    else:
-                        print(f"[SPIKE-TELEGRAM-FAILED] [{page_name}] {post_id}: chưa đánh dấu đã báo; sẽ thử lại.")
-                        _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
-
-            # Little Girl: bài xuất hiện sau baseline được xử lý ngay, kể cả 0 views/comments.
-            # Những Page còn lại vẫn phải đạt ngưỡng tương tác.
-            if not is_special_page and not meets_threshold(views or 0, comments):
+            if not meets_threshold(views or 0, comments):
                 continue
 
-            qualified_reasons = ["Little Girl: bài mới, không cần ngưỡng"] if is_special_page else []
+            # Log rõ ràng để biết chính xác bài đã đạt ngưỡng ở vòng quét nào.
+            qualified_reasons = []
             if comments > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
             for rule in THRESHOLD_RULES:
@@ -2518,7 +2015,7 @@ def check_all_pages():
             if link_status is None:
                 print(
                     f"[QUALIFIED-BUT-BLOCKED] [{page_name}] {post_id}: "
-                    f"đã đủ điều kiện xử lý nhưng KHÔNG xác minh được comments/link; "
+                    f"đã đạt ngưỡng nhưng KHÔNG xác minh được comments/link; "
                     f"không gọi OpenAI để tránh tạo trùng."
                 )
                 send_error_alert(
