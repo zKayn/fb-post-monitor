@@ -123,6 +123,11 @@ PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đ
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
 SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT_TELEGRAM", "true").strip().lower() in ("1", "true", "yes", "on")
+# BioBlog documented POST /api/posts field: author (string, optional).
+# This is a slug-building field, NOT verified as the admin dashboard creator identity.
+WEB_AUTHOR = os.getenv("WEB_AUTHOR", "").strip()
+if len(WEB_AUTHOR) > 100 or any(ord(ch) < 32 for ch in WEB_AUTHOR):
+    raise ValueError("WEB_AUTHOR không hợp lệ (tối đa 100 ký tự, không chứa ký tự điều khiển)")
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
 # One website selector: WEB_BASE_URL. Store each site's token in Railway as
 # PURETALES_TOKEN, TWISTTALES_TOKEN, ECHOES_TOKEN, etc.
@@ -1558,6 +1563,8 @@ def publish_approved_story(post_id):
             "permalink": slugs[n],
             "mode": "normal",
         }
+        if WEB_AUTHOR:
+            payload["author"] = WEB_AUTHOR
         if image_url:
             payload["feature_image"] = image_url
         _bioblog_create_safely(post_id, state, n, payload)
