@@ -70,6 +70,9 @@ PART_ENDINGS = {
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
+# Loai Little Boy khoi danh sach quet, khong anh huong cac Page khac.
+EXCLUDE_PAGE_NAMES = {x.strip().casefold() for x in os.getenv("EXCLUDE_PAGE_NAMES", "Little Boy").split(",") if x.strip()}
+EXCLUDE_PAGE_IDS = {x.strip() for x in os.getenv("EXCLUDE_PAGE_IDS", "").split(",") if x.strip()}
 
 # Mã Page do chủ Page quy định (KHÔNG phải Facebook Page ID).
 PAGE_NUMBER_BY_NAME = {
@@ -83,7 +86,7 @@ PAGE_NUMBER_BY_NAME = {
     "US Stories 2": 8,
     "Rainy Stories": 9,
     "Velvet Dynasty": 10,
-    "Little Boy": 11,
+    "Swisher Ryantnh": 11,
     "Soul Garden": 12,
     "True Fireside": 13,
     "Dena Hartmanext": 14,
@@ -95,7 +98,7 @@ PAGE_NUMBER_BY_PROFILE_ID = {
     "61591856275808": 5, "61590840651745": 6,
     "61589209621700": 7, "61590495543078": 8,
     "61589897181314": 9, "61589270882934": 10,
-    "61592823142405": 11, "61592934357052": 12,
+    "1386470377872868": 11, "61592934357052": 12,
     "61592776354916": 13, "61593873274389": 14,
     "61591782185355": 15,
 }
@@ -1376,10 +1379,21 @@ def _bioblog_api_request(method, path, *, payload=None):
     return response.status_code, data, response.text[:350]
 
 
-def _bioblog_slug(post_id, part):
-    # Stable across retries/redeploys; author code avoids collisions across workers.
-    author = (AUTHOR_CODE or "story").lower()
-    return f"fb-{post_id.replace('_', '-')}-{author}-part-{part}"
+def _bioblog_slug(post_id, part, title=None, page_number=None):
+    """Permalink theo tiêu đề, ví dụ part-2-the-life-he-thought-he-owned1-026.
+
+    `author` là metadata riêng; không tự gắn -phi vào permalink yêu cầu.
+    Backend vẫn có quyền đổi slug; phải đối chiếu phản hồi POST.
+    """
+    if title is None or page_number is None:
+        raise ValueError("Cần tên truyện và số Page để tạo permalink")
+    full_title = _web_part_title(title, part, page_number)
+    normalized = unicodedata.normalize("NFKD", full_title)
+    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized.casefold()).strip("-")
+    if not slug or len(slug) > 240:
+        raise ValueError("Permalink từ tiêu đề không hợp lệ hoặc quá dài")
+    return slug
 
 
 def _bioblog_get_by_slug(slug):
@@ -1426,7 +1440,18 @@ def _bioblog_expected_url(slug):
 def _bioblog_save_record(state, post_id, part, record, slug):
     actual_slug = record.get("slug") or record.get("permalink_slug") or slug
     if actual_slug != slug:
-        raise RuntimeError(f"API đổi slug {slug} thành {actual_slug}; cần kiểm tra thủ công trước khi đăng tiếp")
+        # POST succeeded: persist its actual identity even if the slug differs.
+        # Never re-POST this chapter. Stop before making broken navigation links.
+        actual_url = _bioblog_record_url(record) or _bioblog_expected_url(actual_slug)
+        state.setdefault("web_posts", {})[str(part)] = {
+            "slug": actual_slug, "url": actual_url, "id": record.get("id"),
+            "slug_mismatch": True,
+        }
+        _save_progress(post_id, state)
+        raise RuntimeError(
+            f"Part {part} đã được tạo với slug {actual_slug} (dự kiến {slug}). "
+            "Đã lưu checkpoint để KHÔNG đăng trùng; cần đối chiếu liên kết các phần."
+        )
     url = _bioblog_record_url(record)
     expected = _bioblog_expected_url(slug)
     if expected and url and expected.rstrip("/") != url.rstrip("/"):
@@ -1510,6 +1535,27 @@ def publish_approved_story(post_id):
     state["publish_platform"] = "bioblog_official_api"
     _save_progress(post_id, state)
     web = state.setdefault("web_posts", {})
+    # One-time adoption of a chapter created successfully by an older worker
+    # which rejected BioBlog's author-suffixed slug before saving checkpoint.
+    # User must explicitly provide the actual slug from the successful POST log.
+    recovery_raw = os.getenv("BIOBLOG_RECOVERED_POSTS_JSON", "").strip()
+    if recovery_raw:
+        try:
+            recovery_map = json.loads(recovery_raw)
+            if not isinstance(recovery_map, dict):
+                raise ValueError("must be a JSON object")
+            recovered = recovery_map.get(post_id, {})
+            if not isinstance(recovered, dict):
+                raise ValueError("post entry must be an object")
+            for part_text, actual_slug in recovered.items():
+                if part_text not in ("2", "3", "4") or not isinstance(actual_slug, str) or not re.fullmatch(r"[a-z0-9-]{1,240}", actual_slug):
+                    raise ValueError("invalid part or slug")
+                if part_text not in web:
+                    web[part_text] = {"slug": actual_slug, "url": _bioblog_expected_url(actual_slug), "recovered_from_post_response": True}
+                    _save_progress(post_id, state)
+                    print(f"[BIOBLOG-RECOVER] {post_id}: adopted Part {part_text} -> {actual_slug}")
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f"BIOBLOG_RECOVERED_POSTS_JSON không hợp lệ: {exc}") from exc
     parts = state["parts"]
     title = _story_title(parts["2"])
     page_id = post_id.split("_", 1)[0]
@@ -1518,8 +1564,15 @@ def publish_approved_story(post_id):
         page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
         page_name = (page or {}).get("name")
     title_page_number = _page_number(page_name, page_id)
-    slugs = {n: _bioblog_slug(post_id, n) for n in (2, 3, 4)}
+    slugs = {n: _bioblog_slug(post_id, n, title, title_page_number) for n in (2, 3, 4)}
     expected = {n: _bioblog_expected_url(slugs[n]) for n in (2, 3, 4)}
+    for n in (2, 3, 4):
+        existing = web.get(str(n), {})
+        if existing.get("slug") and existing["slug"] != slugs[n]:
+            raise RuntimeError(
+                f"Part {n} đã tồn tại với slug {existing['slug']} khác slug dự kiến {slugs[n]}; "
+                "dừng để tránh PREVIOUS/NEXT sai."
+            )
     # Never silently omit PREVIOUS: without update API, that omission is permanent.
     # Require a URL template so both PREVIOUS and NEXT are embedded at creation.
     if not all(expected.values()) and not all(
@@ -1906,6 +1959,9 @@ def get_managed_pages():
 
     if INCLUDE_PAGE_NAMES:
         pages = [p for p in pages if p.get("name") in INCLUDE_PAGE_NAMES]
+    # Loai Page theo ten hoac ID ngay tu nguon, tranh quet / sinh truyen / gui Telegram.
+    pages = [p for p in pages if str(p.get("id") or "") not in EXCLUDE_PAGE_IDS
+             and str(p.get("name") or "").strip().casefold() not in EXCLUDE_PAGE_NAMES]
 
     _managed_pages_cache["pages"] = pages
     _managed_pages_cache["at"] = time.monotonic()
