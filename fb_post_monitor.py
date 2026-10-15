@@ -121,9 +121,16 @@ SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 # Website: 
 PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
-ENABLE_AUTO_WEB_PUBLISH = os.getenv("ENABLE_AUTO_WEB_PUBLISH", "true").lower() == "true"
-SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT_TELEGRAM", "false").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_AUTO_WEB_PUBLISH = False  # Chặn luồng web cũ; chỉ test qua API công khai cho Page 6
+SEND_STORY_TXT_TELEGRAM = True  # Giữ gửi đủ ba TXT trên tất cả Page
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
+# Chỉ Epic Stories (Page số 6) được phép thử đăng web; tất cả Page khác chỉ TXT.
+# Tắt ngay bằng ENABLE_PAGE6_WEB_TEST=false trên Railway.
+ENABLE_PAGE6_WEB_TEST = os.getenv("ENABLE_PAGE6_WEB_TEST", "false").strip().lower() in ("1", "true", "yes", "on")
+BIOBLOG_API_TOKEN = os.getenv("BIOBLOG_API_TOKEN", "").strip()
+BIOBLOG_AUTHOR_USERNAME = os.getenv("BIOBLOG_AUTHOR_USERNAME", "phi").strip().lstrip("@")
+PAGE6_TEST_MARKER = "/data/page6_web_test_one_post.json"
+
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
     raise ValueError("PUBLISH_PLATFORM phải là bioblog hoặc wordpress")
@@ -1043,8 +1050,8 @@ def _resume_story(page_name, post_id, caption):
         _save_progress(post_id, state)
     # Chỉ những bài được worker xác nhận mới sau mốc kích hoạt mới tự xuất bản.
     # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
-    if state.get("auto_publish_eligible") and ENABLE_AUTO_WEB_PUBLISH:
-        _auto_publish_with_retry(post_id)
+    if state.get("auto_publish_eligible") and ENABLE_PAGE6_WEB_TEST and _page6_number_for_post(post_id) == 6:
+        _page6_try_publish_once(post_id)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
     print(f"[OPENAI] Bài {post_id}: đã hoàn tất Part 2/3/4, không tạo lại.")
@@ -1425,6 +1432,9 @@ def publish_wordpress_story(post_id):
 
 
 def publish_approved_story(post_id):
+    if _page6_number_for_post(post_id) != 6:
+        raise RuntimeError("Chế độ thử nghiệm chỉ cho phép Epic Stories (Page 6)")
+    return publish_page6_bioblog_test(post_id)
     if PUBLISH_PLATFORM == "wordpress":
         return publish_wordpress_story(post_id)
     post_id = str(post_id).strip()
@@ -2456,13 +2466,144 @@ def check_all_pages():
     save_view_history(view_history)
 
 
+# ==================== PAGE 6 / BIOBLOG API TEST ====================
+def _page6_number_for_post(post_id):
+    state = _load_progress(str(post_id))
+    name = state.get("page_name", "")
+    if name:
+        try:
+            return _page_number(name, str(post_id).split("_", 1)[0])
+        except ValueError:
+            return None
+    # Không suy đoán Page từ ID nếu chưa có page_name trong checkpoint.
+    return None
+
+def _page6_test_reserved(post_id):
+    os.makedirs(os.path.dirname(PAGE6_TEST_MARKER), exist_ok=True)
+    if os.path.exists(PAGE6_TEST_MARKER):
+        with open(PAGE6_TEST_MARKER, encoding="utf-8") as f:
+            value = json.load(f)
+        return str(value.get("post_id")) == str(post_id)
+    tmp = PAGE6_TEST_MARKER + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"post_id": str(post_id), "reserved_at": datetime.now(timezone.utc).isoformat()}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, PAGE6_TEST_MARKER)
+    return True
+
+def _page6_bioblog_create(post_id, part, title, content, image_url=""):
+    payload = {"title": title, "content": content, "author": BIOBLOG_AUTHOR_USERNAME, "mode": "normal"}
+    if image_url:
+        payload["feature_image"] = image_url
+    # Không retry POST vì request có thể đã tạo bài dù mất phản hồi.
+    resp = requests.post(WEB_BASE_URL + "/api/posts",
+        headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN, "Accept": "application/json"},
+        json=payload, timeout=65)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"BioBlog HTTP {resp.status_code}: {resp.text[:350]}")
+    obj = resp.json()
+    data = obj.get("data", obj) if isinstance(obj, dict) else {}
+    if not isinstance(data, dict):
+        raise RuntimeError("BioBlog trả JSON không đúng cấu trúc")
+    url = data.get("link") or data.get("frontend_link") or data.get("url") or data.get("public_url")
+    slug = data.get("slug")
+    if not url and slug:
+        url = WEB_BASE_URL + "/" + str(slug).lstrip("/")
+    if not url or urlparse(str(url)).netloc != urlparse(WEB_BASE_URL).netloc:
+        raise RuntimeError("BioBlog không trả link thuộc domain đã cấu hình; cần kiểm tra thủ công")
+    return {"id": data.get("id"), "slug": slug, "url": str(url), "author_sent": BIOBLOG_AUTHOR_USERNAME}
+
+def publish_page6_bioblog_test(post_id):
+    if not ENABLE_PAGE6_WEB_TEST:
+        raise RuntimeError("ENABLE_PAGE6_WEB_TEST chưa bật")
+    if _page6_number_for_post(post_id) != 6:
+        raise RuntimeError("Chỉ Page 6 (Epic Stories) được thử đăng web")
+    if not BIOBLOG_API_TOKEN or not BIOBLOG_AUTHOR_USERNAME:
+        raise RuntimeError("Thiếu BIOBLOG_API_TOKEN hoặc BIOBLOG_AUTHOR_USERNAME")
+    if not WEB_BASE_URL.startswith("https://"):
+        raise RuntimeError("WEB_BASE_URL phải là HTTPS")
+    state = _load_progress(post_id)
+    if not state.get("auto_publish_eligible"):
+        raise RuntimeError("Checkpoint chưa xác nhận bài mới đủ điều kiện")
+    if not all(str(n) in (state.get("parts") or {}) for n in (2,3,4)) or not all(n in state.get("sent",[]) for n in (2,3,4)):
+        raise RuntimeError("Chưa gửi đủ ba TXT")
+    if state.get("web_posts") and not state.get("page6_api_posts"):
+        raise RuntimeError("Đã có checkpoint web phiên bản cũ; cần đối chiếu trước khi đăng")
+    if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
+        raise RuntimeError("Checkpoint thuộc website khác")
+    if not _page6_test_reserved(post_id):
+        raise RuntimeError("Đã dành một bài khác cho thử nghiệm Page 6; không đăng thêm")
+    state["publish_target"] = WEB_BASE_URL
+    state["publish_platform"] = "bioblog_api_page6_test"
+    state.setdefault("page6_api_posts", {})
+    _save_progress(post_id, state)
+    posts = state["page6_api_posts"]
+    base_title = _story_title(state["parts"]["2"])
+    # Mỗi phần tạo một bài, không đăng lại nếu request đã bắt đầu mà chưa rõ kết quả.
+    for n in (4,3,2):
+        k = str(n)
+        if posts.get(k, {}).get("url"):
+            continue
+        if posts.get(k, {}).get("request_started"):
+            raise RuntimeError(f"Part {n} đã gọi API nhưng chưa xác minh kết quả; cần đối chiếu thủ công để tránh đăng trùng")
+        posts[k] = {"request_started": True, "started_at": datetime.now(timezone.utc).isoformat()}
+        _save_progress(post_id, state)
+        title = _web_part_title(base_title, n, 6)
+        body = _to_html(_story_body(state["parts"][k], n)) + "\n" + _to_html(PART_ENDINGS[n])
+        if n < 4 and posts.get(str(n+1), {}).get("url"):
+            body += "\n" + _to_html("READ PART " + str(n+1), [("NEXT: PART " + str(n+1), posts[str(n+1)]["url"])])
+        result = _page6_bioblog_create(post_id, n, title, body)
+        posts[k] = result
+        _save_progress(post_id, state)
+    if not state.get("page6_api_links_sent"):
+        msg = "🧪 PAGE 6 / Epic Stories — TEST BioBlog (author=" + BIOBLOG_AUTHOR_USERNAME + ")\n" + "\n".join("PART " + str(n) + ": " + posts[str(n)]["url"] for n in (2,3,4))
+        if not send_telegram_message(msg):
+            raise RuntimeError("Chưa gửi được link Telegram")
+        state["page6_api_links_sent"] = True
+        _save_progress(post_id, state)
+    state["web_publish_complete"] = True
+    _save_progress(post_id, state)
+    return True
+
+def _page6_try_publish_once(post_id):
+    if not ENABLE_PAGE6_WEB_TEST or _page6_number_for_post(post_id) != 6:
+        return False
+    state = _load_progress(post_id)
+    if state.get("web_publish_complete"):
+        return True
+    if state.get("page6_test_blocked"):
+        return False
+    try:
+        return publish_page6_bioblog_test(post_id)
+    except Exception as exc:
+        state = _load_progress(post_id)
+        state["page6_test_blocked"] = str(exc)[:500]
+        _save_progress(post_id, state)
+        send_error_alert("page6_bioblog_test", "Thử đăng web Page 6 dừng để tránh trùng bài: " + str(exc)[:400])
+        return False
+
+def page6_test_recovery_worker():
+    # Chỉ phục hồi bài test đang có checkpoint, không quét để đăng hàng loạt.
+    while True:
+        try:
+            if os.path.isfile(PAGE6_TEST_MARKER):
+                with open(PAGE6_TEST_MARKER, encoding="utf-8") as f:
+                    post_id = str(json.load(f).get("post_id", ""))
+                if post_id and _page6_number_for_post(post_id) == 6:
+                    _page6_try_publish_once(post_id)
+        except Exception as exc:
+            print("[PAGE6-TEST] " + str(exc))
+        time.sleep(60)
+
+
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
     if PUBLISH_PLATFORM == "wordpress":
         threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
     threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
-    if ENABLE_WEB_PUBLISH_TEST and ENABLE_AUTO_WEB_PUBLISH:
-        threading.Thread(target=auto_publish_recovery_worker, name="auto-web-recovery", daemon=True).start()
+    if ENABLE_PAGE6_WEB_TEST:
+        threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
     while True:
         scan_started = time.monotonic()
         try:
