@@ -2186,9 +2186,7 @@ def story_worker():
                     if age > timedelta(hours=PAGE6_TEST_MAX_AGE_HOURS):
                         print(f"[PAGE6-TEST] {post_id}: cũ hơn {PAGE6_TEST_MAX_AGE_HOURS} giờ, bỏ qua.")
                         continue
-                    if not _page6_test_reserved(post_id):
-                        print(f"[PAGE6-TEST] {post_id}: slot test đã dành cho bài khác.")
-                        continue
+                    # Mỗi post_id có checkpoint riêng; không khóa toàn Page vào bài test cũ.
                 # Đã xác nhận bài mới theo thời gian Facebook: đánh dấu đủ điều kiện auto-web.
                 # Lưu trước khi gọi OpenAI để retry/redeploy không mất quyền xử lý.
                 state = _load_progress(post_id)
@@ -2267,17 +2265,9 @@ def check_all_pages():
         ]
 
         if is_page6_instant:
-            # Facebook thường trả bài mới nhất trước. Chỉ kiểm tra bài mới nhất
-            # chưa hoàn tất; thời gian đăng được xác minh lại trong story_worker.
-            if os.path.isfile(PAGE6_TEST_MARKER):
-                try:
-                    with open(PAGE6_TEST_MARKER, encoding="utf-8") as f:
-                        reserved_id = str(json.load(f).get("post_id", ""))
-                    post_ids_to_check = [pid for pid in post_ids_to_check if str(pid) == reserved_id]
-                except (OSError, ValueError, TypeError):
-                    post_ids_to_check = []  # fail closed
-            else:
-                post_ids_to_check = post_ids_to_check[:1]
+            # Không lọc theo marker của bài test cũ: nhận mọi bài Page 6 mới.
+            # Chỉ nhận bài trong cửa sổ thời gian ở story_worker.
+            pass
 
         if not post_ids_to_check:
             continue
@@ -2571,8 +2561,6 @@ def publish_page6_bioblog_test(post_id):
         raise RuntimeError("Đã có checkpoint web phiên bản cũ; cần đối chiếu trước khi đăng")
     if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
         raise RuntimeError("Checkpoint thuộc website khác")
-    if not _page6_test_reserved(post_id):
-        raise RuntimeError("Đã dành một bài khác cho thử nghiệm Page 6; không đăng thêm")
     state["publish_target"] = WEB_BASE_URL
     state["publish_platform"] = "bioblog_api_page6_test"
     state.setdefault("page6_api_posts", {})
@@ -2642,14 +2630,21 @@ def _page6_try_publish_once(post_id):
         return False
 
 def page6_test_recovery_worker():
-    # Chỉ phục hồi bài test đang có checkpoint, không quét để đăng hàng loạt.
+    # Khôi phục các bài Page 6 đã có checkpoint, không phụ thuộc marker một bài cũ.
+    # Chỉ thử tiếp các bài đã gửi đủ 3 TXT, chưa hoàn tất web và chưa bị chặn.
     while True:
         try:
-            if os.path.isfile(PAGE6_TEST_MARKER):
-                with open(PAGE6_TEST_MARKER, encoding="utf-8") as f:
-                    post_id = str(json.load(f).get("post_id", ""))
-                if post_id and _page6_number_for_post(post_id) == 6:
-                    _page6_try_publish_once(post_id)
+            if os.path.isdir(STORY_PROGRESS_DIR):
+                for filename in os.listdir(STORY_PROGRESS_DIR):
+                    if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
+                        continue
+                    post_id = filename[:-5]
+                    state = _load_progress(post_id)
+                    if (state.get("auto_publish_eligible")
+                            and _page6_number_for_post(post_id) == 6
+                            and not state.get("web_publish_complete")
+                            and all(n in state.get("sent", []) for n in (2, 3, 4))):
+                        _page6_try_publish_once(post_id)
         except Exception as exc:
             print("[PAGE6-TEST] " + str(exc))
         time.sleep(60)
