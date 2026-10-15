@@ -2661,4 +2661,19 @@ def page6_test_recovery_worker():
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
     if PUBLISH_PLATFORM == "wordpress":
-        threading.Thread(target=_wp_repair_requested_once, name="w
+        threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
+    threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
+    if ENABLE_PAGE6_WEB_TEST:
+        threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
+    while True:
+        scan_started = time.monotonic()
+        try:
+            check_all_pages()
+        except Exception as e:
+            print(f"[LỖI] Lỗi không xác định trong vòng quét: {e}")
+            send_error_alert("main_loop_exception", f"Lỗi không xác định trong vòng quét:\n{e}")
+        time.sleep(max(0, CHECK_INTERVAL_SECONDS - (time.monotonic() - scan_started)))
+
+
+if __name__ == "__main__":
+    main()
