@@ -135,6 +135,8 @@ PAGE6_TEST_MARKER = "/data/page6_web_test_one_post.json"
 PAGE6_FIX_422_PERMALINK = os.getenv("PAGE6_FIX_422_PERMALINK", "true").strip().lower() in ("true", "1", "yes", "on")
 PAGE6_CHAPTER_MODE = os.getenv("PAGE6_CHAPTER_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
 PAGE6_TEST_MAX_AGE_HOURS = float(os.getenv("PAGE6_TEST_MAX_AGE_HOURS", "3"))  # nhận cả bài vừa đăng trước lúc deploy
+# Sau khi 3 Part đã tạo xong mà bước nối chương / gửi link lỗi: thử lại sau N giây (an toàn, không tạo lại bài).
+PAGE6_LINK_RETRY_SECONDS = int(os.getenv("PAGE6_LINK_RETRY_SECONDS", "300"))
 
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
@@ -2343,7 +2345,17 @@ def _page6_navigation(part, urls):
         for label, url in links) + '</nav>') if links else ''
 
 
+def _page6_nav_html(links):
+    """Nav HTML từ danh sách (label, url); dùng khi chỉ biết một phía (ví dụ lúc mới tạo Part)."""
+    if not links:
+        return ''
+    return ('<hr><nav aria-label="Story chapters">' + ' | '.join(
+        '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
+        for label, url in links) + '</nav>')
+
+
 def _page6_bioblog_create(post_id, part, title, content, image_url, permalink):
+    # (Giữ lại để tương thích; luồng normal hiện tạo bài qua admin API để có id nối chương.)
     if not image_url or not image_url.startswith("https://"):
         raise RuntimeError("Thiếu ảnh đại diện công khai; không tạo bài BioBlog")
     payload = {"title": title, "content": content, "author": BIOBLOG_AUTHOR_USERNAME,
@@ -2360,12 +2372,30 @@ def _page6_bioblog_create(post_id, part, title, content, image_url, permalink):
         raise RuntimeError("BioBlog trả JSON không đúng cấu trúc")
     url = data.get("link") or data.get("frontend_link") or data.get("url") or data.get("public_url")
     slug = data.get("slug")
-    if not url and slug:
+    # Link báo Telegram luôn theo dạng https://<domain>/blog/<slug cuối cùng do server tạo>
+    # (server ghép permalink + author thành slug, ví dụ ...-collapse6-026).
+    if slug:
         url = WEB_BASE_URL + "/blog/" + str(slug).lstrip("/")
     if not url or urlparse(str(url)).netloc != urlparse(WEB_BASE_URL).netloc:
         raise RuntimeError("BioBlog không trả link thuộc domain đã cấu hình; cần kiểm tra thủ công")
     return {"id": data.get("id"), "slug": slug, "url": str(url),
             "author_sent": BIOBLOG_AUTHOR_USERNAME, "permalink_sent": permalink}
+
+
+def _page6_bioblog_lookup_id(slug):
+    """Lấy id bài theo slug qua GET /api/posts/{slug} (tài liệu API) khi POST không trả id. Chỉ đọc, an toàn."""
+    resp = requests.get(WEB_BASE_URL + "/api/posts/" + str(slug).lstrip("/"),
+        headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN, "Accept": "application/json"}, timeout=40)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Không lấy được id theo slug {slug!r}: HTTP {resp.status_code}: {resp.text[:200]}")
+    obj = resp.json()
+    data = obj.get("data", obj) if isinstance(obj, dict) else {}
+    if isinstance(data, dict) and isinstance(data.get("post"), dict):
+        data = data["post"]
+    post_id = data.get("id") if isinstance(data, dict) else None
+    if not post_id:
+        raise RuntimeError(f"API chi tiết bài không trả id cho slug {slug!r}")
+    return post_id
 
 
 def _page6_chapter_response(obj):
@@ -2484,20 +2514,22 @@ def publish_page6_bioblog_test(post_id):
         raise RuntimeError("ENABLE_PAGE6_WEB_TEST chưa bật")
     if _page6_number_for_post(post_id) != 6:
         raise RuntimeError("Chỉ Page 6 (Epic Stories) được thử đăng web")
-    if not BIOBLOG_API_TOKEN or not BIOBLOG_AUTHOR_USERNAME:
-        raise RuntimeError("Thiếu BIOBLOG_API_TOKEN hoặc BIOBLOG_AUTHOR_USERNAME")
     if not WEB_BASE_URL.startswith("https://"):
         raise RuntimeError("WEB_BASE_URL phải là HTTPS")
+    if not BIOBLOG_API_TOKEN or not BIOBLOG_AUTHOR_USERNAME:
+        raise RuntimeError("Thiếu BIOBLOG_API_TOKEN hoặc BIOBLOG_AUTHOR_USERNAME")
     state = _load_progress(post_id)
     if not state.get("auto_publish_eligible"):
         raise RuntimeError("Checkpoint chưa xác nhận bài mới đủ điều kiện")
     if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
-        print(f"[PAGE6-TEST] {post_id}: chờ gửi đủ 3 TXT rồi mới gọi BioBlog.")
+        print(f"[PAGE6-TEST] {post_id}: chờ gửi đủ 3 TXT rồi mới đăng web.")
         return False
     # Ưu tiên chapter API TRƯỚC khi tạo checkpoint legacy page6_api_posts.
-    # Bài đã đăng bằng API normal (dù chỉ Part 4) không được tự chuyển mode.
+    # Bài đã đăng bằng normal mode (dù chỉ Part 4) không được tự chuyển mode.
     legacy_posts = state.get("page6_api_posts") or {}
     if PAGE6_CHAPTER_MODE:
+        if not BIOBLOG_API_TOKEN or not BIOBLOG_AUTHOR_USERNAME:
+            raise RuntimeError("Thiếu BIOBLOG_API_TOKEN hoặc BIOBLOG_AUTHOR_USERNAME")
         if state.get("web_publish_complete"):
             print(f"[PAGE6-TEST] {post_id}: đã hoàn tất, bỏ qua")
             return True
@@ -2519,109 +2551,107 @@ def publish_page6_bioblog_test(post_id):
     posts = state["page6_api_posts"]
     base_title = _story_title(state["parts"]["2"])
     titles = {n: _web_part_title(base_title, n, 6) for n in (2, 3, 4)}
+    # Slug nguồn như bản đầu: theo tiêu đề, bỏ hậu tố AUTHOR_CODE (server ghép author vào slug cuối).
     slugs = {n: _page6_permalink(titles[n]) for n in (2, 3, 4)}
     if len(set(slugs.values())) != 3:
         raise RuntimeError("Trùng permalink giữa các Part")
-    urls = {n: WEB_BASE_URL + "/blog/" + slugs[n] for n in (2, 3, 4)}
-    # Không thay link cũ: các Part đã đăng trước đó vẫn giữ nguyên URL thực tế.
-    for n in (2, 3, 4):
-        if posts.get(str(n), {}).get("url"):
-            urls[n] = posts[str(n)]["url"]
-    # Chỉ upload ảnh MỘT lần và lưu checkpoint; URL ảnh Facebook tạm thời không dùng trực tiếp.
-    if any(not posts.get(str(n), {}).get("url") for n in (2, 3, 4)):
-        image_url = state.get("web_featured_image")
-        if not image_url:
-            page_id = str(post_id).split("_", 1)[0]
-            page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
-            if not page or not page.get("access_token"):
-                raise RuntimeError("Không có Facebook Page token để lấy ảnh gốc")
-            # Sử dụng cơ chế upload ảnh bền vững có sẵn của worker.
-            session = _web_login()
-            image_url = _web_upload_featured_image(session, post_id, page["access_token"])
-            state["web_featured_image"] = image_url
-            _save_progress(post_id, state)
-            print(f"[PAGE6-TEST] {post_id}: đã upload ảnh đại diện dùng chung 3 Part")
-    else:
-        image_url = state.get("web_featured_image", "")
-    # Bản cũ: tạo đủ 3 post qua public API (đúng author Phi), sau đó
-    # PUT cập nhật prev_chapter/next_chapter bằng admin API và chèn nav HTML.
-    # Không giả định URL: lấy slug thực tế từ response của từng bài.
+
+    # ---- Tạo bài bằng API công khai (đúng author + permalink như bản đầu),
+    # ---- sau đó lấy id và PUT prev/next bằng admin API, cuối cùng gửi link Telegram một lần.
+    session = _web_login()
+    image_url = state.get("web_featured_image")
+    if not image_url:
+        if any(posts.get(str(n)) for n in (2, 3, 4)):
+            raise RuntimeError("Checkpoint đã có bài nhưng thiếu ảnh gốc; không tiếp tục để tránh sai ảnh")
+        page_id = str(post_id).split("_", 1)[0]
+        page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+        if not page or not page.get("access_token"):
+            raise RuntimeError("Không có Facebook Page token để lấy ảnh gốc")
+        image_url = _web_upload_featured_image(session, post_id, page["access_token"])
+        if not isinstance(image_url, str) or not image_url.startswith("https://"):
+            raise RuntimeError("Ảnh upload không có HTTPS URL")
+        state["web_featured_image"] = image_url
+        _save_progress(post_id, state)
+        print(f"[PAGE6-TEST] {post_id}: đã upload ảnh đại diện dùng chung 3 Part")
+
+    def _base_body(n):
+        return _to_html(_story_body(state["parts"][str(n)], n)) + "\n" + _to_html(PART_ENDINGS[n])
+
+    # Tạo theo thứ tự ngược Part 4 -> 3 -> 2 để next-link luôn tồn tại khi tạo.
     for n in (4, 3, 2):
         k = str(n)
         if posts.get(k, {}).get("url"):
             continue
         if posts.get(k, {}).get("request_started"):
             raise RuntimeError(f"Part {n} đã gọi POST nhưng chưa rõ kết quả; kiểm tra thủ công trước khi tiếp tục")
-        body = _to_html(_story_body(state["parts"][k], n)) + "\n" + _to_html(PART_ENDINGS[n])
+        nav_next = []
+        if n < 4 and posts.get(str(n + 1), {}).get("url"):
+            nav_next = [(f"READ PART {n+1}", posts[str(n + 1)]["url"])]
+        body = _base_body(n) + ("\n" + _page6_nav_html(nav_next) if nav_next else "")
         posts[k] = {"request_started": True, "started_at": datetime.now(timezone.utc).isoformat()}
         _save_progress(post_id, state)
         result = _page6_bioblog_create(post_id, n, titles[n], body, image_url, slugs[n])
         posts[k] = result
         _save_progress(post_id, state)
-        print(f"[PAGE6-TEST] {post_id}: đã tạo Part {n}; slug={result.get('slug')}; id={result.get('id')}", flush=True)
+        print(f"[PAGE6-TEST] {post_id}: đã đăng Part {n}: {result.get('url')} id={result.get('id')} slug={result.get('slug')}", flush=True)
 
-    # Chỉ sửa các post đã được tạo, tuyệt đối không POST lại.
-    # API công khai có thể chỉ trả slug và URL, KHÔNG trả id.
     for n in (2, 3, 4):
         rec = posts.get(str(n)) or {}
-        if not rec.get("slug") or not rec.get("url"):
-            raise RuntimeError(f"Part {n} thiếu slug/url thực tế; không thể liên kết an toàn")
-        parsed = urlparse(rec["url"])
-        if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
-            raise RuntimeError(f"URL Part {n} không hợp lệ: {rec['url']}")
-
+        if not (rec.get("slug") and rec.get("url")):
+            raise RuntimeError(f"Part {n} thiếu slug/url từ website; cần kiểm tra thủ công")
     actual_urls = {n: posts[str(n)]["url"] for n in (2, 3, 4)}
     if len(set(actual_urls.values())) != 3:
         raise RuntimeError("Ba chương có URL trùng; dừng liên kết")
-    # Gửi link ngay sau khi đủ 3 URL; không phụ thuộc quyền PUT quản trị.
-    if not state.get("page6_api_links_sent"):
-        msg = "🧪 PAGE 6 / Epic Stories — 3 LINK BIOBLOG\n" + "\n".join(
-            "PART " + str(n) + ": " + actual_urls[n] for n in (2, 3, 4))
-        if send_telegram_message(msg):
-            state["page6_api_links_sent"] = True
+
+    # Bổ sung id còn thiếu qua GET /api/posts/{slug} (chỉ đọc), rồi lưu checkpoint.
+    id_error = None
+    for n in (2, 3, 4):
+        rec = posts[str(n)]
+        if rec.get("id"):
+            continue
+        try:
+            rec["id"] = _page6_bioblog_lookup_id(rec["slug"])
             _save_progress(post_id, state)
-            print(f"[PAGE6-LINKS] {post_id}: đã gửi đủ 3 URL", flush=True)
-        else:
-            print(f"[PAGE6-LINKS-ERROR] {post_id}: Telegram chưa xác nhận", flush=True)
+            print(f"[PAGE6-NAV] {post_id}: lấy id Part {n} qua slug -> {rec['id']}", flush=True)
+        except Exception as exc:
+            id_error = exc
+            break
+    if id_error is not None:
+        # Không có id thì không nối chương được; vẫn gửi đủ 3 link một lần để không mất bài.
+        if not state.get("page6_api_links_sent"):
+            warn = "\n".join(f"PART {n}: {actual_urls[n]}" for n in (2, 3, 4))
+            if send_telegram_message(warn + "\n⚠️ Chưa nối được Previous/Next (thiếu id bài)."):
+                state["page6_api_links_sent"] = True
+                _save_progress(post_id, state)
+        raise RuntimeError(f"Không lấy được id để nối chương: {id_error}")
+
+    # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4 (PUT prev_chapter/next_chapter + nav HTML).
     linked = state.setdefault("page6_linked_parts", [])
-    print(f"[PAGE6-NAV] {post_id}: created={[posts[str(n)].get('id') for n in (2,3,4)]}; linked={linked}", flush=True)
-    if not all(n in linked for n in (2, 3, 4)) and any(not posts[str(n)].get("id") for n in (2, 3, 4)):
-        # Không đoán ID admin: API public chỉ trả slug. Dừng riêng phần PUT,
-        # vẫn giữ ba bài + đã gửi link. Không đánh dấu nav hoàn tất giả.
-        missing = [n for n in (2, 3, 4) if not posts[str(n)].get("id")]
-        print(f"[PAGE6-NAV-PENDING] {post_id}: thiếu admin post id Part {missing}; không PUT sai ID. "
-              "Cần endpoint lookup slug->id từ kỹ thuật.", flush=True)
-        state["page6_nav_pending"] = True
+    for n in (2, 3, 4):
+        if n in linked:
+            continue
+        prev_slug = posts[str(n - 1)]["slug"] if n > 2 else ""
+        next_slug = posts[str(n + 1)]["slug"] if n < 4 else ""
+        body = _base_body(n) + "\n" + _page6_navigation(n, actual_urls)
+        print(f"[PAGE6-NAV] {post_id}: PUT Part {n} prev={prev_slug!r} next={next_slug!r}", flush=True)
+        _web_update_chapter(session, posts[str(n)], titles[n], body, image_url,
+                            prev_slug=prev_slug, next_slug=next_slug)
+        linked.append(n)
         _save_progress(post_id, state)
-        return False
-    if not all(n in linked for n in (2, 3, 4)):
-        # API admin này được lấy từ code cũ. Nếu BioBlog mới đã đổi API,
-        # PUT sẽ báo lỗi và bot dừng, không báo thành công giả.
-        session = _web_login()
-        for n in (2, 3, 4):
-            if n in linked:
-                continue
-            body = _to_html(_story_body(state["parts"][str(n)], n))
-            body += "\n" + _to_html(PART_ENDINGS[n])
-            body += "\n" + _page6_navigation(n, actual_urls)
-            prev_slug = posts[str(n-1)]["slug"] if n > 2 else ""
-            next_slug = posts[str(n+1)]["slug"] if n < 4 else ""
-            print(f"[PAGE6-NAV] {post_id}: PUT Part {n} prev={prev_slug!r} next={next_slug!r}", flush=True)
-            _web_update_chapter(session, posts[str(n)], titles[n], body, image_url,
-                                prev_slug=prev_slug, next_slug=next_slug)
-            linked.append(n)
-            _save_progress(post_id, state)
-            print(f"[PAGE6-TEST] {post_id}: đã nối Part {n}: prev={prev_slug!r} next={next_slug!r}", flush=True)
+        print(f"[PAGE6-TEST] {post_id}: đã nối Part {n}: prev={prev_slug!r} next={next_slug!r}", flush=True)
+
+    # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và nối chương xong.
+    # Lưu checkpoint để retry/redeploy không gửi lại.
     if not state.get("page6_api_links_sent"):
-        print(f"[PAGE6-NAV] {post_id}: đã nối đủ 3 Part; chuẩn bị gửi 3 URL Telegram", flush=True)
-        msg = "🧪 PAGE 6 / Epic Stories — ĐÃ NỐI CHƯƠNG (author=" + BIOBLOG_AUTHOR_USERNAME + ")\n" + "\n".join(
-            "PART " + str(n) + ": " + actual_urls[n] for n in (2, 3, 4))
-        if not send_telegram_message(msg):
-            raise RuntimeError("Gửi Telegram ba link chưa thành công")
+        message = "\n".join(f"PART {n}: {actual_urls[n]}" for n in (2, 3, 4))
+        if send_telegram_message(message) is False:
+            raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
         state["page6_api_links_sent"] = True
         _save_progress(post_id, state)
+        print(f"[PAGE6-LINKS] {post_id}: đã gửi đủ 3 URL sau khi nối chương", flush=True)
 
     state["web_publish_complete"] = True
+    state.pop("page6_retry_after", None)
     _save_progress(post_id, state)
     if state.get("page6_422_recovered") and not state.get("page6_422_recovery_notified"):
         if send_telegram_message("✅ ĐÃ KHẮC PHỤC: Page 6 đăng BioBlog thành công sau lỗi HTTP 422 thiếu permalink."):
@@ -2635,6 +2665,9 @@ def _page6_try_publish_once(post_id):
     state = _load_progress(post_id)
     if state.get("web_publish_complete"):
         return True
+    # Sau khi 3 Part đã tạo xong mà nối chương/gửi link lỗi: chờ rồi thử lại (không tạo lại bài).
+    if time.time() < float(state.get("page6_retry_after", 0)):
+        return False
     if state.get("page6_test_blocked"):
         reason = str(state.get("page6_test_blocked", ""))
         records = state.get("page6_api_posts") or {}
@@ -2665,10 +2698,24 @@ def _page6_try_publish_once(post_id):
         return publish_page6_bioblog_test(post_id)
     except Exception as exc:
         state = _load_progress(post_id)
-        state["page6_test_blocked"] = str(exc)[:500]
-        _save_progress(post_id, state)
-        print(f"[PAGE6-TEST-ERROR] {post_id}: {type(exc).__name__}: {exc}", flush=True)
-        send_error_alert("page6_bioblog_test", "Thử đăng web Page 6 dừng để tránh trùng bài: " + str(exc)[:400])
+        records = state.get("page6_api_posts") or {}
+        creation_done = bool(state.get("page6_chapter_posts")) or all(
+            (records.get(str(n)) or {}).get("slug") and (records.get(str(n)) or {}).get("url")
+            for n in (2, 3, 4))
+        if creation_done:
+            # Các Part đã tồn tại trên web: lỗi nằm ở bước nối chương / gửi link -> thử lại an toàn.
+            state["page6_retry_after"] = time.time() + PAGE6_LINK_RETRY_SECONDS
+            state["page6_last_error"] = str(exc)[:800]
+            _save_progress(post_id, state)
+            print(f"[PAGE6-TEST-RETRY] {post_id}: {type(exc).__name__}: {exc}; thử lại sau {PAGE6_LINK_RETRY_SECONDS}s", flush=True)
+            send_error_alert("page6_bioblog_link_retry",
+                             "Page 6 đã đăng đủ 3 Part nhưng nối chương/gửi link chưa xong; bot sẽ tự thử lại, "
+                             "không tạo lại bài: " + str(exc)[:400])
+        else:
+            state["page6_test_blocked"] = str(exc)[:500]
+            _save_progress(post_id, state)
+            print(f"[PAGE6-TEST-ERROR] {post_id}: {type(exc).__name__}: {exc}", flush=True)
+            send_error_alert("page6_bioblog_test", "Thử đăng web Page 6 dừng để tránh trùng bài: " + str(exc)[:400])
         return False
 
 def page6_test_recovery_worker():
