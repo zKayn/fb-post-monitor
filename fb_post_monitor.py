@@ -6,6 +6,7 @@ import requests
 import threading
 import queue
 import hashlib
+import unicodedata
 import html
 from urllib.parse import urlparse
 from io import BytesIO
@@ -130,6 +131,8 @@ ENABLE_PAGE6_WEB_TEST = os.getenv("ENABLE_PAGE6_WEB_TEST", "false").strip().lowe
 BIOBLOG_API_TOKEN = os.getenv("BIOBLOG_API_TOKEN", "").strip()
 BIOBLOG_AUTHOR_USERNAME = os.getenv("BIOBLOG_AUTHOR_USERNAME", "phi").strip().lstrip("@")
 PAGE6_TEST_MARKER = "/data/page6_web_test_one_post.json"
+# Chỉ cho phép khôi phục lỗi validation HTTP 422 permalink thiếu của phiên bản cũ.
+PAGE6_FIX_422_PERMALINK = os.getenv("PAGE6_FIX_422_PERMALINK", "true").strip().lower() in ("true", "1", "yes", "on")
 PAGE6_TEST_MAX_AGE_HOURS = float(os.getenv("PAGE6_TEST_MAX_AGE_HOURS", "3"))  # nhận cả bài vừa đăng trước lúc deploy
 
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
@@ -2519,7 +2522,15 @@ def _page6_test_reserved(post_id):
     return True
 
 def _page6_bioblog_create(post_id, part, title, content, image_url=""):
-    payload = {"title": title, "content": content, "author": BIOBLOG_AUTHOR_USERNAME, "mode": "normal"}
+    # API thực tế yêu cầu permalink dù tài liệu ghi optional.
+    # Ổn định theo Facebook post + part, không phụ thuộc thời điểm retry.
+    slug_title = unicodedata.normalize("NFKD", title)
+    slug_title = "".join(ch for ch in slug_title if not unicodedata.combining(ch))
+    slug_title = re.sub(r"[^a-z0-9]+", "-", slug_title.lower()).strip("-")[:85].strip("-")
+    slug_id = re.sub(r"[^a-zA-Z0-9]+", "-", str(post_id)).strip("-")
+    permalink = f"{slug_title}-fb-{slug_id}-p{int(part)}"
+    payload = {"title": title, "content": content, "author": BIOBLOG_AUTHOR_USERNAME,
+               "permalink": permalink, "mode": "normal"}
     if image_url:
         payload["feature_image"] = image_url
     # Không retry POST vì request có thể đã tạo bài dù mất phản hồi.
@@ -2553,7 +2564,9 @@ def publish_page6_bioblog_test(post_id):
     if not state.get("auto_publish_eligible"):
         raise RuntimeError("Checkpoint chưa xác nhận bài mới đủ điều kiện")
     if not all(str(n) in (state.get("parts") or {}) for n in (2,3,4)) or not all(n in state.get("sent",[]) for n in (2,3,4)):
-        raise RuntimeError("Chưa gửi đủ ba TXT")
+        # Đang tạo/gửi TXT là trạng thái chờ bình thường, không phải lỗi web.
+        print(f"[PAGE6-TEST] {post_id}: chờ gửi đủ 3 TXT rồi mới gọi BioBlog.")
+        return False
     if state.get("web_posts") and not state.get("page6_api_posts"):
         raise RuntimeError("Đã có checkpoint web phiên bản cũ; cần đối chiếu trước khi đăng")
     if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
@@ -2590,6 +2603,10 @@ def publish_page6_bioblog_test(post_id):
         _save_progress(post_id, state)
     state["web_publish_complete"] = True
     _save_progress(post_id, state)
+    if state.get("page6_422_recovered") and not state.get("page6_422_recovery_notified"):
+        if send_telegram_message("✅ ĐÃ KHẮC PHỤC: Page 6 đăng BioBlog thành công sau lỗi HTTP 422 thiếu permalink."):
+            state["page6_422_recovery_notified"] = True
+            _save_progress(post_id, state)
     return True
 
 def _page6_try_publish_once(post_id):
@@ -2599,7 +2616,22 @@ def _page6_try_publish_once(post_id):
     if state.get("web_publish_complete"):
         return True
     if state.get("page6_test_blocked"):
-        return False
+        # Chỉ mở khóa lỗi 422 validation xác định được: không có bài nào tạo thành công
+        # trong phần đang lỗi, và 3 TXT đã gửi. Không mở khóa lỗi mạng/timeout/5xx.
+        reason = str(state.get("page6_test_blocked", ""))
+        records = state.get("page6_api_posts") or {}
+        invalid = [k for k, r in records.items() if r.get("request_started") and not r.get("url")]
+        sent = set(state.get("sent") or [])
+        if (PAGE6_FIX_422_PERMALINK and "HTTP 422" in reason
+                and "permalink" in reason.lower() and len(invalid) == 1
+                and all(n in sent for n in (2, 3, 4))):
+            records.pop(invalid[0], None)
+            state.pop("page6_test_blocked", None)
+            state["page6_422_recovered"] = True
+            _save_progress(post_id, state)
+            print(f"[PAGE6-TEST] {post_id}: đã gỡ chặn lỗi 422 permalink, retry đúng Part {invalid[0]}.")
+        else:
+            return False
     try:
         return publish_page6_bioblog_test(post_id)
     except Exception as exc:
