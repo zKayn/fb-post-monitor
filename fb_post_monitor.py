@@ -2567,6 +2567,18 @@ def publish_page6_bioblog_test(post_id):
     actual_urls = {n: posts[str(n)]["url"] for n in (2, 3, 4)}
     if len(set(actual_urls.values())) != 3:
         raise RuntimeError("Ba chương có URL trùng; dừng liên kết")
+    # Gửi URL ngay khi cả 3 bài đã tồn tại; không để lỗi admin NEXT/PREV chặn Telegram.
+    # Checkpoint riêng để không gửi trùng sau restart.
+    if not state.get("page6_api_links_sent"):
+        msg = "🧪 PAGE 6 / Epic Stories — 3 LINK BÀI ĐÃ ĐĂNG (author=" + BIOBLOG_AUTHOR_USERNAME + ")\n" + "\n".join(
+            "PART " + str(n) + ": " + actual_urls[n] for n in (2, 3, 4))
+        msg += "\n⏳ Đang kiểm tra liên kết NEXT/PREVIOUS CHAPTER."
+        print(f"[PAGE6-LINKS] {post_id}: gửi 3 URL Telegram trước bước nối chương", flush=True)
+        if not send_telegram_message(msg):
+            raise RuntimeError("Gửi Telegram ba link chưa thành công")
+        state["page6_api_links_sent"] = True
+        _save_progress(post_id, state)
+
     linked = state.setdefault("page6_linked_parts", [])
     print(f"[PAGE6-NAV] {post_id}: created={[posts[str(n)].get('id') for n in (2,3,4)]}; linked={linked}", flush=True)
     if not all(n in linked for n in (2, 3, 4)):
@@ -2587,14 +2599,10 @@ def publish_page6_bioblog_test(post_id):
             linked.append(n)
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST] {post_id}: đã nối Part {n}: prev={prev_slug!r} next={next_slug!r}", flush=True)
-    if not state.get("page6_api_links_sent"):
-        print(f"[PAGE6-NAV] {post_id}: đã nối đủ 3 Part; chuẩn bị gửi 3 URL Telegram", flush=True)
-        msg = "🧪 PAGE 6 / Epic Stories — ĐÃ NỐI CHƯƠNG (author=" + BIOBLOG_AUTHOR_USERNAME + ")\n" + "\n".join(
-            "PART " + str(n) + ": " + actual_urls[n] for n in (2, 3, 4))
-        if not send_telegram_message(msg):
-            raise RuntimeError("Gửi Telegram ba link chưa thành công")
-        state["page6_api_links_sent"] = True
-        _save_progress(post_id, state)
+    if not state.get("page6_nav_success_notified"):
+        if send_telegram_message(f"✅ PAGE 6 / Epic Stories — NEXT/PREVIOUS đã cập nhật đủ 3 Part\nBài: {post_id}"):
+            state["page6_nav_success_notified"] = True
+            _save_progress(post_id, state)
 
     state["web_publish_complete"] = True
     _save_progress(post_id, state)
@@ -2626,12 +2634,33 @@ def _page6_try_publish_once(post_id):
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST] {post_id}: đã gỡ chặn lỗi 422 permalink, retry đúng Part {invalid[0]}.")
         else:
-            return False
+            # Khôi phục CHỈ bước navigation khi cả 3 bài đã được xác nhận từ API.
+            # Tuyệt đối không tự mở chặn nếu bất kỳ Part nào chưa có id/slug/url,
+            # hoặc còn request_started chưa rõ kết quả (nguy cơ tạo trùng).
+            complete = all(
+                isinstance(records.get(str(n)), dict)
+                and all(records[str(n)].get(field) for field in ("id", "slug", "url"))
+                for n in (2, 3, 4)
+            )
+            nav_pending = not all(n in state.get("page6_linked_parts", []) for n in (2, 3, 4))
+            if complete and nav_pending and not state.get("web_publish_complete"):
+                # Chỉ retry theo chu kỳ, không dồn request lỗi mỗi phút.
+                if time.time() < float(state.get("page6_nav_retry_after", 0)):
+                    return False
+                state.pop("page6_test_blocked", None)
+                _save_progress(post_id, state)
+                print(f"[PAGE6-RECOVERY] {post_id}: đủ 3 post; chỉ thử nối chương và gửi link, KHÔNG POST lại", flush=True)
+            else:
+                print(f"[PAGE6-RECOVERY-SKIP] {post_id}: blocked={reason[:180]!r}; đủ 3 post={complete}; nav_pending={nav_pending}", flush=True)
+                return False
     try:
         return publish_page6_bioblog_test(post_id)
     except Exception as exc:
         state = _load_progress(post_id)
         state["page6_test_blocked"] = str(exc)[:500]
+        records = state.get("page6_api_posts") or {}
+        if all(isinstance(records.get(str(n)), dict) and all(records[str(n)].get(k) for k in ("id", "slug", "url")) for n in (2, 3, 4)):
+            state["page6_nav_retry_after"] = time.time() + 300
         _save_progress(post_id, state)
         print(f"[PAGE6-TEST-ERROR] {post_id}: {type(exc).__name__}: {exc}", flush=True)
         send_error_alert("page6_bioblog_test", "Thử đăng web Page 6 dừng để tránh trùng bài: " + str(exc)[:400])
