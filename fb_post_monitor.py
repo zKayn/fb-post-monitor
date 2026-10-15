@@ -1281,29 +1281,6 @@ def _web_update_chapter(session, post_record, title, description, image_url, pre
         print(f"[PAGE6-NAV-ERROR] PUT post_id={post_id} JSON={str(result)[:400]}", flush=True)
         raise RuntimeError(f"API sửa bài post_id={post_id} không xác nhận ok=true")
 
-    # HTTP 200 không đủ: kiểm tra backend thực sự lưu hai slug chương.
-    check = session.get(f"{WEB_BASE_URL}/admin/api/v1/posts/{post_id}", timeout=35)
-    print(f"[PAGE6-NAV] VERIFY post_id={post_id} GET HTTP={check.status_code}", flush=True)
-    if check.status_code != 200:
-        raise RuntimeError(f"Không xác minh được NEXT/PREV sau PUT post_id={post_id}: GET HTTP {check.status_code}")
-    try:
-        saved = check.json()
-        saved = saved.get("data", saved) if isinstance(saved, dict) else None
-        if isinstance(saved, dict) and isinstance(saved.get("post"), dict):
-            saved = saved["post"]
-    except ValueError as exc:
-        raise RuntimeError("GET xác minh chương không trả JSON") from exc
-    if not isinstance(saved, dict):
-        raise RuntimeError("GET xác minh chương không trả object bài đăng")
-    actual_prev = str(saved.get("prev_chapter") or "")
-    actual_next = str(saved.get("next_chapter") or "")
-    if actual_prev != str(prev_slug or "") or actual_next != str(next_slug or ""):
-        raise RuntimeError(
-            f"BioBlog chưa lưu NEXT/PREV post_id={post_id}: "
-            f"expected=({prev_slug!r},{next_slug!r}) actual=({actual_prev!r},{actual_next!r})"
-        )
-    print(f"[PAGE6-NAV] VERIFIED post_id={post_id} prev={actual_prev!r} next={actual_next!r}", flush=True)
-
 
 def _wp_request(method, path, **kwargs):
     if not WP_USERNAME or not WP_APPLICATION_PASSWORD:
@@ -2344,12 +2321,12 @@ def _page6_test_reserved(post_id):
     return True
 
 def _page6_permalink(title):
-    """Slug theo title: part-3-...15-026; AUTHOR_CODE là mã, không phải username Phi."""
+    """Slug ngắn theo tiêu đề + mã Page + AUTHOR_CODE; không thêm Facebook ID."""
     value = unicodedata.normalize("NFKD", title)
     value = "".join(c for c in value if not unicodedata.combining(c))
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    # Author vẫn được truyền riêng qua API; không đưa username vào permalink.
-    suffix = "-" + BIOBLOG_AUTHOR_USERNAME.lower()
+    # AUTHOR_CODE vẫn nằm trong title nhưng KHÔNG nằm trong URL.
+    suffix = "-" + AUTHOR_CODE.lower()
     if slug.endswith(suffix):
         slug = slug[:-len(suffix)]
     return slug
@@ -2584,10 +2561,11 @@ def publish_page6_bioblog_test(post_id):
         print(f"[PAGE6-TEST] {post_id}: đã tạo Part {n}; slug={result.get('slug')}; id={result.get('id')}", flush=True)
 
     # Chỉ sửa các post đã được tạo, tuyệt đối không POST lại.
+    # API công khai có thể chỉ trả slug và URL, KHÔNG trả id.
     for n in (2, 3, 4):
         rec = posts.get(str(n)) or {}
-        if not rec.get("id") or not rec.get("slug") or not rec.get("url"):
-            raise RuntimeError(f"Part {n} thiếu id/slug/url thực tế; không thể liên kết an toàn")
+        if not rec.get("slug") or not rec.get("url"):
+            raise RuntimeError(f"Part {n} thiếu slug/url thực tế; không thể liên kết an toàn")
         parsed = urlparse(rec["url"])
         if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
             raise RuntimeError(f"URL Part {n} không hợp lệ: {rec['url']}")
@@ -2595,12 +2573,27 @@ def publish_page6_bioblog_test(post_id):
     actual_urls = {n: posts[str(n)]["url"] for n in (2, 3, 4)}
     if len(set(actual_urls.values())) != 3:
         raise RuntimeError("Ba chương có URL trùng; dừng liên kết")
-    # Telegram độc lập với PUT admin: không giữ link chỉ vì NEXT/PREV bị lỗi.
-    if not _page6_send_existing_links(post_id, state):
-        print(f"[PAGE6-LINKS-ERROR] {post_id}: sẽ thử gửi lại qua recovery worker", flush=True)
-
+    # Gửi link ngay sau khi đủ 3 URL; không phụ thuộc quyền PUT quản trị.
+    if not state.get("page6_api_links_sent"):
+        msg = "🧪 PAGE 6 / Epic Stories — 3 LINK BIOBLOG\n" + "\n".join(
+            "PART " + str(n) + ": " + actual_urls[n] for n in (2, 3, 4))
+        if send_telegram_message(msg):
+            state["page6_api_links_sent"] = True
+            _save_progress(post_id, state)
+            print(f"[PAGE6-LINKS] {post_id}: đã gửi đủ 3 URL", flush=True)
+        else:
+            print(f"[PAGE6-LINKS-ERROR] {post_id}: Telegram chưa xác nhận", flush=True)
     linked = state.setdefault("page6_linked_parts", [])
     print(f"[PAGE6-NAV] {post_id}: created={[posts[str(n)].get('id') for n in (2,3,4)]}; linked={linked}", flush=True)
+    if not all(n in linked for n in (2, 3, 4)) and any(not posts[str(n)].get("id") for n in (2, 3, 4)):
+        # Không đoán ID admin: API public chỉ trả slug. Dừng riêng phần PUT,
+        # vẫn giữ ba bài + đã gửi link. Không đánh dấu nav hoàn tất giả.
+        missing = [n for n in (2, 3, 4) if not posts[str(n)].get("id")]
+        print(f"[PAGE6-NAV-PENDING] {post_id}: thiếu admin post id Part {missing}; không PUT sai ID. "
+              "Cần endpoint lookup slug->id từ kỹ thuật.", flush=True)
+        state["page6_nav_pending"] = True
+        _save_progress(post_id, state)
+        return False
     if not all(n in linked for n in (2, 3, 4)):
         # API admin này được lấy từ code cũ. Nếu BioBlog mới đã đổi API,
         # PUT sẽ báo lỗi và bot dừng, không báo thành công giả.
@@ -2619,10 +2612,14 @@ def publish_page6_bioblog_test(post_id):
             linked.append(n)
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST] {post_id}: đã nối Part {n}: prev={prev_slug!r} next={next_slug!r}", flush=True)
-    if not state.get("page6_nav_success_notified"):
-        if send_telegram_message(f"✅ PAGE 6 / Epic Stories — NEXT/PREVIOUS đã cập nhật đủ 3 Part\nBài: {post_id}"):
-            state["page6_nav_success_notified"] = True
-            _save_progress(post_id, state)
+    if not state.get("page6_api_links_sent"):
+        print(f"[PAGE6-NAV] {post_id}: đã nối đủ 3 Part; chuẩn bị gửi 3 URL Telegram", flush=True)
+        msg = "🧪 PAGE 6 / Epic Stories — ĐÃ NỐI CHƯƠNG (author=" + BIOBLOG_AUTHOR_USERNAME + ")\n" + "\n".join(
+            "PART " + str(n) + ": " + actual_urls[n] for n in (2, 3, 4))
+        if not send_telegram_message(msg):
+            raise RuntimeError("Gửi Telegram ba link chưa thành công")
+        state["page6_api_links_sent"] = True
+        _save_progress(post_id, state)
 
     state["web_publish_complete"] = True
     _save_progress(post_id, state)
@@ -2632,118 +2629,21 @@ def publish_page6_bioblog_test(post_id):
             _save_progress(post_id, state)
     return True
 
-# Chỉ sửa liên kết Part 2 của câu chuyện test đã có đủ ba bài.
-# Không thay permalink của các bài đã đăng; không POST, không gọi OpenAI.
-PAGE6_REPAIR_P2_TITLE_FRAGMENT = os.getenv(
-    "PAGE6_REPAIR_P2_TITLE_FRAGMENT", "the-message-hidden-in-the-hospital-records"
-).strip().lower()
-
-
-def _page6_repair_existing_part2(post_id, state):
-    if not ENABLE_PAGE6_WEB_TEST or not PAGE6_REPAIR_P2_TITLE_FRAGMENT:
-        return False
-    if state.get("page6_part2_repair_verified"):
-        return False
-    posts = state.get("page6_api_posts") or {}
-    if not all(isinstance(posts.get(str(n)), dict) and all(
-            posts[str(n)].get(k) for k in ("id", "slug", "url")) for n in (2, 3, 4)):
-        return False
-    if PAGE6_REPAIR_P2_TITLE_FRAGMENT not in str(posts["2"]["slug"]).lower():
-        return False
-    if time.time() < float(state.get("page6_part2_repair_retry_after", 0)):
-        return False
-    print(f"[PAGE6-P2-REPAIR] {post_id}: chỉ sửa NEXT Part 2 -> Part 3, không tạo bài", flush=True)
-    try:
-        # Đọc bài đang có trước khi ghi để tránh sửa nhầm hoặc ghi đè ngoài ý muốn.
-        session = _web_login()
-        rec = posts["2"]
-        response = session.get(f"{WEB_BASE_URL}/admin/api/v1/posts/{rec['id']}", timeout=35)
-        print(f"[PAGE6-P2-REPAIR] GET Part 2 HTTP={response.status_code}", flush=True)
-        if response.status_code != 200:
-            raise RuntimeError(f"Không đọc được Part 2: HTTP {response.status_code}")
-        obj = response.json()
-        existing = obj.get("data", obj) if isinstance(obj, dict) else None
-        if isinstance(existing, dict) and isinstance(existing.get("post"), dict):
-            existing = existing["post"]
-        if not isinstance(existing, dict) or str(existing.get("id", rec['id'])) != str(rec['id']):
-            raise RuntimeError("GET Part 2 không xác nhận đúng bài")
-        current_slug = str(existing.get("slug") or "")
-        if current_slug != str(rec["slug"]):
-            raise RuntimeError("Slug Part 2 trên website khác checkpoint; không tự ghi đè")
-        # Dùng nội dung gốc lưu trong checkpoint, có NEXT HTML thực tế.
-        parts = state.get("parts") or {}
-        if not parts.get("2"):
-            raise RuntimeError("Checkpoint thiếu nội dung Part 2")
-        urls = {n: posts[str(n)]["url"] for n in (2, 3, 4)}
-        body = _to_html(_story_body(parts["2"], 2))
-        body += "\n" + _to_html(PART_ENDINGS[2])
-        body += "\n" + _page6_navigation(2, urls)
-        title = str(existing.get("title") or _web_part_title(_story_title(parts["2"]), 2, 6))
-        image_url = str(existing.get("image") or state.get("web_featured_image") or "")
-        if not image_url.startswith("https://"):
-            raise RuntimeError("Không tìm thấy URL ảnh hiện tại, tránh ghi đè mất ảnh")
-        _web_update_chapter(session, rec, title, body, image_url,
-                            prev_slug="", next_slug=posts["3"]["slug"])
-        # PUT 200 chưa chứng minh đã lưu: đọc lại trường NEXT để xác minh.
-        verify = session.get(f"{WEB_BASE_URL}/admin/api/v1/posts/{rec['id']}", timeout=35)
-        if verify.status_code != 200:
-            raise RuntimeError(f"Không xác minh được sau PUT: HTTP {verify.status_code}")
-        verified = verify.json()
-        verified = verified.get("data", verified) if isinstance(verified, dict) else None
-        if isinstance(verified, dict) and isinstance(verified.get("post"), dict):
-            verified = verified["post"]
-        if not isinstance(verified, dict) or str(verified.get("next_chapter") or "") != str(posts["3"]["slug"]):
-            raise RuntimeError("API chưa xác nhận lưu next_chapter của Part 2")
-        state["page6_part2_repair_verified"] = True
-        state.pop("page6_part2_repair_error", None)
-        _save_progress(post_id, state)
-        print(f"[PAGE6-P2-REPAIR] {post_id}: xác minh NEXT Part 2 -> Part 3 thành công", flush=True)
-        send_telegram_message("✅ Đã sửa NEXT Part 2 → Part 3 trên BioBlog\n" + urls[2])
-        return True
-    except Exception as exc:
-        state["page6_part2_repair_error"] = str(exc)[:400]
-        state["page6_part2_repair_retry_after"] = time.time() + 300
-        _save_progress(post_id, state)
-        print(f"[PAGE6-P2-REPAIR-ERROR] {post_id}: {type(exc).__name__}: {exc}", flush=True)
-        send_error_alert("page6_part2_repair_" + str(post_id),
-                         "Chưa sửa được NEXT Part 2: " + str(exc)[:250])
-        return False
-
-
-def _page6_send_existing_links(post_id, state):
-    """Gửi 3 link đã tồn tại, KHÔNG gọi POST/PUT/OpenAI; idempotent bằng checkpoint."""
-    if state.get("page6_api_links_sent"):
-        return True
-    records = state.get("page6_api_posts") or {}
-    if not all(isinstance(records.get(str(n)), dict) and
-               all(records[str(n)].get(k) for k in ("id", "slug", "url"))
-               for n in (2, 3, 4)):
-        return False
-    urls = {n: records[str(n)]["url"] for n in (2, 3, 4)}
-    if len(set(urls.values())) != 3 or any(
-        urlparse(url).scheme != "https" or urlparse(url).netloc != urlparse(WEB_BASE_URL).netloc
-        for url in urls.values()
-    ):
-        print(f"[PAGE6-LINKS-ERROR] {post_id}: URL checkpoint không hợp lệ", flush=True)
-        return False
-    msg = "🧪 PAGE 6 / Epic Stories — 3 LINK BÀI ĐÃ ĐĂNG\n" + "\n".join(
-        f"PART {n}: {urls[n]}" for n in (2, 3, 4)
-    ) + "\n⏳ NEXT/PREVIOUS đang được kiểm tra."
-    print(f"[PAGE6-LINKS] {post_id}: gửi 3 URL đã có, không tạo bài mới", flush=True)
-    if not send_telegram_message(msg):
-        print(f"[PAGE6-LINKS-ERROR] {post_id}: Telegram chưa xác nhận", flush=True)
-        return False
-    state["page6_api_links_sent"] = True
-    _save_progress(post_id, state)
-    return True
-
-
 def _page6_try_publish_once(post_id):
     if not ENABLE_PAGE6_WEB_TEST or _page6_number_for_post(post_id) != 6:
         return False
     state = _load_progress(post_id)
     if state.get("web_publish_complete"):
         return True
+    if state.get("page6_test_blocked"):
+        reason = str(state.get("page6_test_blocked", ""))
+        records = state.get("page6_api_posts") or {}
+        if "thiếu id/slug/url thực tế" in reason and all(
+                (records.get(str(n)) or {}).get("url") and (records.get(str(n)) or {}).get("slug")
+                for n in (2, 3, 4)):
+            state.pop("page6_test_blocked", None)
+            _save_progress(post_id, state)
+            print(f"[PAGE6-RECOVERY] {post_id}: gỡ khóa cũ thiếu id; không POST lại", flush=True)
     if state.get("page6_test_blocked"):
         # Chỉ mở khóa lỗi 422 validation xác định được: không có bài nào tạo thành công
         # trong phần đang lỗi, và 3 TXT đã gửi. Không mở khóa lỗi mạng/timeout/5xx.
@@ -2760,33 +2660,12 @@ def _page6_try_publish_once(post_id):
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST] {post_id}: đã gỡ chặn lỗi 422 permalink, retry đúng Part {invalid[0]}.")
         else:
-            # Khôi phục CHỈ bước navigation khi cả 3 bài đã được xác nhận từ API.
-            # Tuyệt đối không tự mở chặn nếu bất kỳ Part nào chưa có id/slug/url,
-            # hoặc còn request_started chưa rõ kết quả (nguy cơ tạo trùng).
-            complete = all(
-                isinstance(records.get(str(n)), dict)
-                and all(records[str(n)].get(field) for field in ("id", "slug", "url"))
-                for n in (2, 3, 4)
-            )
-            nav_pending = not all(n in state.get("page6_linked_parts", []) for n in (2, 3, 4))
-            if complete and nav_pending and not state.get("web_publish_complete"):
-                # Chỉ retry theo chu kỳ, không dồn request lỗi mỗi phút.
-                if time.time() < float(state.get("page6_nav_retry_after", 0)):
-                    return False
-                state.pop("page6_test_blocked", None)
-                _save_progress(post_id, state)
-                print(f"[PAGE6-RECOVERY] {post_id}: đủ 3 post; chỉ thử nối chương và gửi link, KHÔNG POST lại", flush=True)
-            else:
-                print(f"[PAGE6-RECOVERY-SKIP] {post_id}: blocked={reason[:180]!r}; đủ 3 post={complete}; nav_pending={nav_pending}", flush=True)
-                return False
+            return False
     try:
         return publish_page6_bioblog_test(post_id)
     except Exception as exc:
         state = _load_progress(post_id)
         state["page6_test_blocked"] = str(exc)[:500]
-        records = state.get("page6_api_posts") or {}
-        if all(isinstance(records.get(str(n)), dict) and all(records[str(n)].get(k) for k in ("id", "slug", "url")) for n in (2, 3, 4)):
-            state["page6_nav_retry_after"] = time.time() + 300
         _save_progress(post_id, state)
         print(f"[PAGE6-TEST-ERROR] {post_id}: {type(exc).__name__}: {exc}", flush=True)
         send_error_alert("page6_bioblog_test", "Thử đăng web Page 6 dừng để tránh trùng bài: " + str(exc)[:400])
@@ -2803,10 +2682,6 @@ def page6_test_recovery_worker():
                         continue
                     post_id = filename[:-5]
                     state = _load_progress(post_id)
-                    if _page6_number_for_post(post_id) == 6:
-                        # Ba bài đã tồn tại: gửi link ngay, kể cả checkpoint bị block ở PUT.
-                        _page6_send_existing_links(post_id, state)
-                        _page6_repair_existing_part2(post_id, state)
                     if (state.get("auto_publish_eligible")
                             and _page6_number_for_post(post_id) == 6
                             and not state.get("web_publish_complete")
@@ -2819,7 +2694,6 @@ def page6_test_recovery_worker():
 
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
-    print(f"[PAGE6-CONFIG] enabled={ENABLE_PAGE6_WEB_TEST} chapter_mode={PAGE6_CHAPTER_MODE} author={BIOBLOG_AUTHOR_USERNAME} author_code={AUTHOR_CODE}; slug không chứa username", flush=True)
     if PUBLISH_PLATFORM == "wordpress":
         threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
     threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
