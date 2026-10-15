@@ -1281,6 +1281,29 @@ def _web_update_chapter(session, post_record, title, description, image_url, pre
         print(f"[PAGE6-NAV-ERROR] PUT post_id={post_id} JSON={str(result)[:400]}", flush=True)
         raise RuntimeError(f"API sửa bài post_id={post_id} không xác nhận ok=true")
 
+    # HTTP 200 không đủ: kiểm tra backend thực sự lưu hai slug chương.
+    check = session.get(f"{WEB_BASE_URL}/admin/api/v1/posts/{post_id}", timeout=35)
+    print(f"[PAGE6-NAV] VERIFY post_id={post_id} GET HTTP={check.status_code}", flush=True)
+    if check.status_code != 200:
+        raise RuntimeError(f"Không xác minh được NEXT/PREV sau PUT post_id={post_id}: GET HTTP {check.status_code}")
+    try:
+        saved = check.json()
+        saved = saved.get("data", saved) if isinstance(saved, dict) else None
+        if isinstance(saved, dict) and isinstance(saved.get("post"), dict):
+            saved = saved["post"]
+    except ValueError as exc:
+        raise RuntimeError("GET xác minh chương không trả JSON") from exc
+    if not isinstance(saved, dict):
+        raise RuntimeError("GET xác minh chương không trả object bài đăng")
+    actual_prev = str(saved.get("prev_chapter") or "")
+    actual_next = str(saved.get("next_chapter") or "")
+    if actual_prev != str(prev_slug or "") or actual_next != str(next_slug or ""):
+        raise RuntimeError(
+            f"BioBlog chưa lưu NEXT/PREV post_id={post_id}: "
+            f"expected=({prev_slug!r},{next_slug!r}) actual=({actual_prev!r},{actual_next!r})"
+        )
+    print(f"[PAGE6-NAV] VERIFIED post_id={post_id} prev={actual_prev!r} next={actual_next!r}", flush=True)
+
 
 def _wp_request(method, path, **kwargs):
     if not WP_USERNAME or not WP_APPLICATION_PASSWORD:
@@ -2321,7 +2344,7 @@ def _page6_test_reserved(post_id):
     return True
 
 def _page6_permalink(title):
-    """Slug ngắn theo tiêu đề + mã Page + AUTHOR_CODE; không thêm Facebook ID."""
+    """Slug theo title: part-3-...15-026; AUTHOR_CODE là mã, không phải username Phi."""
     value = unicodedata.normalize("NFKD", title)
     value = "".join(c for c in value if not unicodedata.combining(c))
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
@@ -2572,17 +2595,9 @@ def publish_page6_bioblog_test(post_id):
     actual_urls = {n: posts[str(n)]["url"] for n in (2, 3, 4)}
     if len(set(actual_urls.values())) != 3:
         raise RuntimeError("Ba chương có URL trùng; dừng liên kết")
-    # Gửi URL ngay khi cả 3 bài đã tồn tại; không để lỗi admin NEXT/PREV chặn Telegram.
-    # Checkpoint riêng để không gửi trùng sau restart.
-    if not state.get("page6_api_links_sent"):
-        msg = "🧪 PAGE 6 / Epic Stories — 3 LINK BÀI ĐÃ ĐĂNG (author=" + BIOBLOG_AUTHOR_USERNAME + ")\n" + "\n".join(
-            "PART " + str(n) + ": " + actual_urls[n] for n in (2, 3, 4))
-        msg += "\n⏳ Đang kiểm tra liên kết NEXT/PREVIOUS CHAPTER."
-        print(f"[PAGE6-LINKS] {post_id}: gửi 3 URL Telegram trước bước nối chương", flush=True)
-        if not send_telegram_message(msg):
-            raise RuntimeError("Gửi Telegram ba link chưa thành công")
-        state["page6_api_links_sent"] = True
-        _save_progress(post_id, state)
+    # Telegram độc lập với PUT admin: không giữ link chỉ vì NEXT/PREV bị lỗi.
+    if not _page6_send_existing_links(post_id, state):
+        print(f"[PAGE6-LINKS-ERROR] {post_id}: sẽ thử gửi lại qua recovery worker", flush=True)
 
     linked = state.setdefault("page6_linked_parts", [])
     print(f"[PAGE6-NAV] {post_id}: created={[posts[str(n)].get('id') for n in (2,3,4)]}; linked={linked}", flush=True)
@@ -2695,6 +2710,34 @@ def _page6_repair_existing_part2(post_id, state):
         return False
 
 
+def _page6_send_existing_links(post_id, state):
+    """Gửi 3 link đã tồn tại, KHÔNG gọi POST/PUT/OpenAI; idempotent bằng checkpoint."""
+    if state.get("page6_api_links_sent"):
+        return True
+    records = state.get("page6_api_posts") or {}
+    if not all(isinstance(records.get(str(n)), dict) and
+               all(records[str(n)].get(k) for k in ("id", "slug", "url"))
+               for n in (2, 3, 4)):
+        return False
+    urls = {n: records[str(n)]["url"] for n in (2, 3, 4)}
+    if len(set(urls.values())) != 3 or any(
+        urlparse(url).scheme != "https" or urlparse(url).netloc != urlparse(WEB_BASE_URL).netloc
+        for url in urls.values()
+    ):
+        print(f"[PAGE6-LINKS-ERROR] {post_id}: URL checkpoint không hợp lệ", flush=True)
+        return False
+    msg = "🧪 PAGE 6 / Epic Stories — 3 LINK BÀI ĐÃ ĐĂNG\n" + "\n".join(
+        f"PART {n}: {urls[n]}" for n in (2, 3, 4)
+    ) + "\n⏳ NEXT/PREVIOUS đang được kiểm tra."
+    print(f"[PAGE6-LINKS] {post_id}: gửi 3 URL đã có, không tạo bài mới", flush=True)
+    if not send_telegram_message(msg):
+        print(f"[PAGE6-LINKS-ERROR] {post_id}: Telegram chưa xác nhận", flush=True)
+        return False
+    state["page6_api_links_sent"] = True
+    _save_progress(post_id, state)
+    return True
+
+
 def _page6_try_publish_once(post_id):
     if not ENABLE_PAGE6_WEB_TEST or _page6_number_for_post(post_id) != 6:
         return False
@@ -2761,6 +2804,8 @@ def page6_test_recovery_worker():
                     post_id = filename[:-5]
                     state = _load_progress(post_id)
                     if _page6_number_for_post(post_id) == 6:
+                        # Ba bài đã tồn tại: gửi link ngay, kể cả checkpoint bị block ở PUT.
+                        _page6_send_existing_links(post_id, state)
                         _page6_repair_existing_part2(post_id, state)
                     if (state.get("auto_publish_eligible")
                             and _page6_number_for_post(post_id) == 6
@@ -2774,6 +2819,7 @@ def page6_test_recovery_worker():
 
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
+    print(f"[PAGE6-CONFIG] enabled={ENABLE_PAGE6_WEB_TEST} chapter_mode={PAGE6_CHAPTER_MODE} author={BIOBLOG_AUTHOR_USERNAME} author_code={AUTHOR_CODE}; slug không chứa username", flush=True)
     if PUBLISH_PLATFORM == "wordpress":
         threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
     threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
