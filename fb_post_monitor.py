@@ -133,6 +133,7 @@ BIOBLOG_AUTHOR_USERNAME = os.getenv("BIOBLOG_AUTHOR_USERNAME", "phi").strip().ls
 PAGE6_TEST_MARKER = "/data/page6_web_test_one_post.json"
 # Chỉ cho phép khôi phục lỗi validation HTTP 422 permalink thiếu của phiên bản cũ.
 PAGE6_FIX_422_PERMALINK = os.getenv("PAGE6_FIX_422_PERMALINK", "true").strip().lower() in ("true", "1", "yes", "on")
+PAGE6_CHAPTER_MODE = os.getenv("PAGE6_CHAPTER_MODE", "true").strip().lower() in ("1", "true", "yes", "on")
 PAGE6_TEST_MAX_AGE_HOURS = float(os.getenv("PAGE6_TEST_MAX_AGE_HOURS", "3"))  # nhận cả bài vừa đăng trước lúc deploy
 
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
@@ -1449,6 +1450,14 @@ def publish_approved_story(post_id):
         raise RuntimeError("Chưa đủ 3 TXT gửi Telegram; không xuất bản")
     if not ENABLE_WEB_PUBLISH_TEST:
         raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false; không có bài nào được đăng")
+    # Checkpoint cũ đã có bài đăng riêng: luôn đi theo luồng cũ, không tạo trùng.
+    # Checkpoint mới: dùng một POST chapter cho 3 phần.
+    if PAGE6_CHAPTER_MODE and not state.get("page6_api_posts") and not state.get("web_posts"):
+        if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
+            raise RuntimeError("Checkpoint thuộc website khác")
+        return _page6_publish_chapter_batch(post_id, state)
+    if state.get("page6_chapter_request_started"):
+        raise RuntimeError("Đã bắt đầu chapter mode; không chuyển sang normal mode để tránh trùng")
     if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
         raise RuntimeError("Checkpoint thuộc website khác; không tự chuyển bài đã đăng dở")
     if state.get("web_posts") and not state.get("publish_target"):
@@ -2552,6 +2561,114 @@ def _page6_bioblog_create(post_id, part, title, content, image_url, permalink):
         raise RuntimeError("BioBlog không trả link thuộc domain đã cấu hình; cần kiểm tra thủ công")
     return {"id": data.get("id"), "slug": slug, "url": str(url),
             "author_sent": BIOBLOG_AUTHOR_USERNAME, "permalink_sent": permalink}
+
+
+def _page6_chapter_response(obj):
+    """Chỉ chấp nhận đúng 3 chapter có URL riêng; không đoán slug."""
+    root = obj.get("data", obj) if isinstance(obj, dict) else obj
+    candidates = []
+    if isinstance(root, list):
+        candidates = root
+    elif isinstance(root, dict):
+        for key in ("posts", "chapters", "items", "results"):
+            if isinstance(root.get(key), list):
+                candidates = root[key]
+                break
+        if not candidates and isinstance(root.get("data"), list):
+            candidates = root["data"]
+    if len(candidates) != 3:
+        raise RuntimeError(
+            "API chapter không trả đúng 3 bài (hoặc cấu trúc response chưa được hỗ trợ); "
+            "đã gửi request, KHÔNG tự gửi lại để tránh trùng. Kiểm tra BioBlog thủ công."
+        )
+    result = {}
+    for n, item in zip((2, 3, 4), candidates):
+        if not isinstance(item, dict):
+            raise RuntimeError("Response chapter không có thông tin từng bài; kiểm tra thủ công")
+        slug = item.get("slug")
+        url = item.get("link") or item.get("frontend_link") or item.get("url") or item.get("public_url")
+        if not url and slug:
+            url = WEB_BASE_URL + "/blog/" + str(slug).lstrip("/")
+        if isinstance(url, str) and url.startswith("/"):
+            url = WEB_BASE_URL + url
+        parsed = urlparse(str(url or ""))
+        if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
+            raise RuntimeError("Response chapter thiếu URL hợp lệ; kiểm tra thủ công, không POST lại")
+        result[str(n)] = {"id": item.get("id"), "slug": slug, "url": url}
+    if len({v["url"] for v in result.values()}) != 3:
+        raise RuntimeError("API trả URL trùng chương; cần kiểm tra thủ công")
+    return result
+
+
+def _page6_publish_chapter_batch(post_id, state):
+    """Một POST cho 3 chương; trạng thái 'started' ngăn retry không an toàn."""
+    if state.get("page6_chapter_request_started") and not state.get("page6_chapter_posts"):
+        raise RuntimeError("Chapter POST đã bắt đầu, chưa xác nhận response; kiểm tra website trước khi thử lại")
+    if not state.get("page6_chapter_posts"):
+        image_url = state.get("web_featured_image")
+        if not image_url:
+            page_id = str(post_id).split("_", 1)[0]
+            page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
+            if not page or not page.get("access_token"):
+                raise RuntimeError("Thiếu Facebook Page token để tải ảnh")
+            session = _web_login()
+            image_url = _web_upload_featured_image(session, post_id, page["access_token"])
+            if not isinstance(image_url, str) or not image_url.startswith("https://"):
+                raise RuntimeError("Ảnh upload không có HTTPS URL")
+            state["web_featured_image"] = image_url
+            _save_progress(post_id, state)
+        base_title = _story_title(state["parts"]["2"])
+        title = re.sub(r"(?i)^PART\s*2\s*[:\-–—]?\s*", "", base_title).strip()
+        chapters = []
+        for n in (2, 3, 4):
+            chapter_title = _web_part_title(base_title, n, 6)
+            body = _to_html(_story_body(state["parts"][str(n)], n))
+            body += "\n" + _to_html(PART_ENDINGS[n])
+            chapters.append(f"CHAPTER {n} - {chapter_title}\n{body}")
+        content = "\n".join(chapters)
+        payload = {
+            "title": title,
+            "content": content,
+            "author": BIOBLOG_AUTHOR_USERNAME,
+            "permalink": _page6_permalink(_web_part_title(base_title, 2, 6)),
+            "feature_image": image_url,
+            "mode": "chapter",
+            "apply_image_to_all": True,
+        }
+        state["page6_chapter_request_started"] = True
+        state["page6_chapter_started_at"] = datetime.now(timezone.utc).isoformat()
+        _save_progress(post_id, state)
+        # Không dùng session retry POST: kết quả timeout có thể đã tạo đủ 3 bài.
+        resp = requests.post(
+            WEB_BASE_URL + "/api/posts",
+            headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN,
+                     "Accept": "application/json", "Content-Type": "application/json"},
+            json=payload, timeout=100,
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"Chapter API HTTP {resp.status_code}: {resp.text[:400]}")
+        try:
+            obj = resp.json()
+        except ValueError:
+            raise RuntimeError("Chapter API không trả JSON; kiểm tra website, không POST lại")
+        posts = _page6_chapter_response(obj)
+        state["page6_chapter_posts"] = posts
+        state["publish_target"] = WEB_BASE_URL
+        state["publish_platform"] = "bioblog_api_page6_chapter_test"
+        _save_progress(post_id, state)
+    posts = state["page6_chapter_posts"]
+    if not state.get("page6_api_links_sent"):
+        message = "🧪 PAGE 6 / Epic Stories — BioBlog CHAPTER TEST\n" + "\n".join(
+            f"PART {n}: {posts[str(n)]['url']}" for n in (2, 3, 4))
+        message += "\n⚠️ Kiểm tra nút Previous/Next trên giao diện BioBlog trước khi bật chính thức."
+        if not send_telegram_message(message):
+            raise RuntimeError("Gửi link Telegram chưa thành công")
+        state["page6_api_links_sent"] = True
+        _save_progress(post_id, state)
+    state["web_publish_complete"] = True
+    _save_progress(post_id, state)
+    print(f"[PAGE6-TEST] {post_id}: chapter batch đủ 3 Part, dùng chung ảnh.")
+    return True
 
 
 def publish_page6_bioblog_test(post_id):
