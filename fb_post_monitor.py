@@ -1440,209 +1440,7 @@ def publish_approved_story(post_id):
     if _page6_number_for_post(post_id) != 6:
         raise RuntimeError("Chế độ thử nghiệm chỉ cho phép Epic Stories (Page 6)")
     return publish_page6_bioblog_test(post_id)
-    if PUBLISH_PLATFORM == "wordpress":
-        return publish_wordpress_story(post_id)
-    post_id = str(post_id).strip()
-    if not re.fullmatch(r"\d+_\d+", post_id):
-        raise ValueError("POST_ID phải có dạng PAGEID_POSTID")
-    state = _load_progress(post_id)
-    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
-        raise RuntimeError("Chưa đủ 3 TXT gửi Telegram; không xuất bản")
-    if not ENABLE_WEB_PUBLISH_TEST:
-        raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false; không có bài nào được đăng")
-    # Checkpoint cũ đã có bài đăng riêng: luôn đi theo luồng cũ, không tạo trùng.
-    # Checkpoint mới: dùng một POST chapter cho 3 phần.
-    if PAGE6_CHAPTER_MODE and not state.get("page6_api_posts") and not state.get("web_posts"):
-        if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
-            raise RuntimeError("Checkpoint thuộc website khác")
-        return _page6_publish_chapter_batch(post_id, state)
-    if state.get("page6_chapter_request_started"):
-        raise RuntimeError("Đã bắt đầu chapter mode; không chuyển sang normal mode để tránh trùng")
-    if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
-        raise RuntimeError("Checkpoint thuộc website khác; không tự chuyển bài đã đăng dở")
-    if state.get("web_posts") and not state.get("publish_target"):
-        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
-    state["publish_target"] = WEB_BASE_URL
-    state["publish_platform"] = "bioblog"
-    _save_progress(post_id, state)
-    if state.get("web_posts") and not state.get("publish_target"):
-        raise RuntimeError("Checkpoint cũ đã có bài web nhưng chưa ghi domain; cần xác minh thủ công")
-    web = state.setdefault("web_posts", {})
-    parts = state["parts"]
-    base_title = _story_title(parts["2"])
-    page_id = post_id.split("_", 1)[0]
-    page_name = state.get("page_name")
-    if not page_name:
-        page_record = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
-        page_name = (page_record or {}).get("name")
-    title_page_number = _page_number(page_name, page_id)  # Fail closed với Page chưa có mã
-    # Xuất bản theo thứ tự ngược: Part 4 -> 3 -> 2 để next-link luôn tồn tại.
-    # Link quay lại phần trước cần API edit; khi chưa xác minh API edit,
-    # không tạo liên kết giả. Telegram sẽ cảnh báo để cập nhật thủ công.
-    session = _web_login()
-    image_url = state.get("web_featured_image")
-    if web and not image_url:
-        raise RuntimeError("Checkpoint web cũ thiếu ảnh gốc; không tiếp tục để tránh sai ảnh")
-    if not image_url:
-        pages = get_managed_pages()
-        page = next((p for p in pages if str(p.get("id")) == page_id), None)
-        if not page or not page.get("access_token"):
-            raise RuntimeError("Không có Page token để lấy ảnh Facebook gốc")
-        image_url = _web_upload_featured_image(session, post_id, page["access_token"])
-        state["web_featured_image"] = image_url
-        _save_progress(post_id, state)
-        print(f"[AUTO-WEB] {post_id}: đã upload ảnh dùng chung cho Part 2/3/4")
-    for n in (4, 3, 2):
-        key = str(n)
-        if web.get(key, {}).get("url"):
-            continue
-        nav = [(f"READ PART {n+1}", web[str(n+1)]["url"])] if n < 4 and web.get(str(n+1), {}).get("url") else []
-        title = _web_part_title(base_title, n, title_page_number)
-        body = _to_html(_story_body(parts[key], n), nav)
-        result = _web_create_post(session, title, body, image_url)
-        web[key] = result
-        _save_progress(post_id, state)
-        print(f"[AUTO-WEB] {post_id}: đã đăng Part {n}: {result['url']}")
-    # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4.
-    linked = state.setdefault("web_linked", [])
-    for n in (2, 3, 4):
-        if n in linked:
-            continue
-        nav = []
-        if n > 2:
-            nav.append((f"PREVIOUS: PART {n-1}", web[str(n-1)]["url"]))
-        if n < 4:
-            nav.append((f"NEXT: PART 4(THE END)" if n + 1 == 4 else f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
-        _web_update_chapter(session, web[str(n)], _web_part_title(base_title, n, title_page_number),
-                            _to_html(_story_body(parts[str(n)], n), nav), image_url,
-                            prev_slug=web[str(n-1)]["slug"] if n > 2 else "",
-                            next_slug=web[str(n+1)]["slug"] if n < 4 else "")
-        linked.append(n)
-        _save_progress(post_id, state)
-    # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và liên kết hoàn tất.
-    # Lưu checkpoint để các lần retry/redeploy không gửi lại thông báo.
-    if not state.get("web_links_telegram_sent"):
-        urls = [web[str(n)].get("url") for n in (2, 3, 4)]
-        if not all(urls):
-            raise RuntimeError("Chưa có đủ 3 URL công khai để gửi Telegram")
-        message = "\n".join(f"PART {n}: {web[str(n)]['url']}" for n in (2, 3, 4))
-        if send_telegram_message(message) is False:
-            raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
-        state["web_links_telegram_sent"] = True
-        _save_progress(post_id, state)
 
-
-
-AUTO_PUBLISH_RETRY_SECONDS = int(os.getenv("AUTO_PUBLISH_RETRY_SECONDS", "300"))
-_AUTO_PUBLISH_LOCK = threading.RLock()
-
-
-def _auto_publish_with_retry(post_id):
-    """Publish after 3 TXT; retry later from persistent state, never recreate saved chapters."""
-    if not (ENABLE_AUTO_WEB_PUBLISH and ENABLE_WEB_PUBLISH_TEST):
-        return False
-    with _AUTO_PUBLISH_LOCK:
-        state = _load_progress(post_id)
-        if not state.get("auto_publish_eligible"):
-            return False
-        if state.get("web_publish_complete"):
-            return True
-        if time.time() < float(state.get("web_retry_after", 0)):
-            return False
-        if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)):
-            return False
-        if not all(n in state.get("sent", []) for n in (2, 3, 4)):
-            return False
-        try:
-            publish_approved_story(post_id)
-            state = _load_progress(post_id)
-            state["web_publish_complete"] = True
-            state.pop("web_retry_after", None)
-            _save_progress(post_id, state)
-            return True
-        except Exception as exc:
-            state = _load_progress(post_id)
-            state["web_retry_after"] = time.time() + AUTO_PUBLISH_RETRY_SECONDS
-            state["web_last_error"] = str(exc)[:800]
-            _save_progress(post_id, state)
-            print(f"[AUTO-WEB] {post_id}: {exc}; retry in {AUTO_PUBLISH_RETRY_SECONDS}s")
-            send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; các Part đã đăng được lưu checkpoint.")
-            return False
-
-
-def auto_publish_recovery_worker():
-    """Only recover explicitly eligible NEW posts; old stories never auto-publish."""
-    while True:
-        try:
-            if ENABLE_AUTO_WEB_PUBLISH and ENABLE_WEB_PUBLISH_TEST and os.path.isdir(STORY_PROGRESS_DIR):
-                for filename in os.listdir(STORY_PROGRESS_DIR):
-                    if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
-                        continue
-                    post_id = filename[:-5]
-                    state = _load_progress(post_id)
-                    if state.get("auto_publish_eligible") and not state.get("web_publish_complete"):
-                        _auto_publish_with_retry(post_id)
-        except Exception as exc:
-            print(f"[AUTO-WEB-RECOVERY] {exc}")
-        time.sleep(60)
-
-def _prepare_telegram_publish_polling():
-    """Switch this bot from webhook to polling without discarding pending commands."""
-    base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    response = requests.get(base + "/getWebhookInfo", timeout=20)
-    response.raise_for_status()
-    info = response.json()
-    if not info.get("ok"):
-        raise RuntimeError("Không kiểm tra được Telegram webhook")
-    if (info.get("result") or {}).get("url"):
-        print("[PUBLISH-TEST] Telegram webhook đang bật; chuyển sang polling, giữ các update đang chờ.")
-        result = requests.post(base + "/deleteWebhook", data={"drop_pending_updates": "false"}, timeout=25)
-        result.raise_for_status()
-        if not result.json().get("ok"):
-            raise RuntimeError("Telegram không xác nhận deleteWebhook")
-    print("[PUBLISH-TEST] Telegram polling sẵn sàng nhận /publish.")
-
-
-def publish_command_worker():
-    """Chỉ nhận /publish PAGEID_POSTID từ TELEGRAM_CHAT_ID; không tự đăng khi tạo TXT."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    offset = None
-    # Chỉ chuyển webhook khi tính năng publish test được bật; không xóa update cũ.
-    # Nếu bot token còn được dùng bởi dịch vụ khác, cần chuyển dịch vụ đó sang polling chung.
-    while True:
-        try:
-            _prepare_telegram_publish_polling()
-            break
-        except Exception as exc:
-            print(f"[PUBLISH-TEST] Chưa thể khởi tạo polling: {exc}")
-            time.sleep(30)
-    while True:
-        try:
-            args = {"timeout": 20, "allowed_updates": json.dumps(["message"])}
-            if offset is not None:
-                args["offset"] = offset
-            response = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=args, timeout=30)
-            data = response.json()
-            if not data.get("ok"):
-                raise RuntimeError(str(data.get("description", "Telegram getUpdates failed")))
-            for update in data.get("result", []):
-                offset = int(update["update_id"]) + 1
-                msg = update.get("message") or {}
-                if str((msg.get("chat") or {}).get("id")) != str(TELEGRAM_CHAT_ID):
-                    continue
-                content = (msg.get("text") or "").strip()
-                match = re.fullmatch(r"/publish(?:@\w+)?\s+(\d+_\d+)", content, re.I)
-                if match:
-                    pid = match.group(1)
-                    try:
-                        publish_approved_story(pid)
-                        send_telegram_message(f"✅ Đã hoàn thành lệnh /publish {pid} (xem trạng thái website ở trên).")
-                    except Exception as exc:
-                        send_telegram_message(f"⚠️ /publish {pid} chưa hoàn tất: {str(exc)[:700]}")
-        except Exception as exc:
-            print(f"[PUBLISH-TEST] Telegram polling: {exc}")
-            time.sleep(PUBLISH_APPROVAL_POLL_SECONDS)
 
 def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
     if not ENABLE_STORY_CONTINUATION or not ENABLE_PAID_GENERATION or not caption.strip():
@@ -2639,18 +2437,21 @@ def _page6_publish_chapter_batch(post_id, state):
         state["page6_chapter_started_at"] = datetime.now(timezone.utc).isoformat()
         _save_progress(post_id, state)
         # Không dùng session retry POST: kết quả timeout có thể đã tạo đủ 3 bài.
+        print(f"[PAGE6-TEST] {post_id}: POST /api/posts mode=chapter bắt đầu", flush=True)
         resp = requests.post(
             WEB_BASE_URL + "/api/posts",
             headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN,
                      "Accept": "application/json", "Content-Type": "application/json"},
             json=payload, timeout=100,
         )
+        print(f"[PAGE6-TEST] {post_id}: chapter API HTTP {resp.status_code}", flush=True)
         if resp.status_code not in (200, 201):
             raise RuntimeError(f"Chapter API HTTP {resp.status_code}: {resp.text[:400]}")
         try:
             obj = resp.json()
         except ValueError:
             raise RuntimeError("Chapter API không trả JSON; kiểm tra website, không POST lại")
+        print(f"[PAGE6-TEST] {post_id}: response chapter dạng {type(obj).__name__}; keys={list(obj) if isinstance(obj, dict) else 'list'}", flush=True)
         posts = _page6_chapter_response(obj)
         state["page6_chapter_posts"] = posts
         state["publish_target"] = WEB_BASE_URL
@@ -2686,6 +2487,20 @@ def publish_page6_bioblog_test(post_id):
     if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
         print(f"[PAGE6-TEST] {post_id}: chờ gửi đủ 3 TXT rồi mới gọi BioBlog.")
         return False
+    # Ưu tiên chapter API TRƯỚC khi tạo checkpoint legacy page6_api_posts.
+    # Bài đã đăng bằng API normal (dù chỉ Part 4) không được tự chuyển mode.
+    legacy_posts = state.get("page6_api_posts") or {}
+    if PAGE6_CHAPTER_MODE:
+        if state.get("web_publish_complete"):
+            print(f"[PAGE6-TEST] {post_id}: đã hoàn tất, bỏ qua")
+            return True
+        if legacy_posts or state.get("web_posts"):
+            print(f"[PAGE6-TEST] {post_id}: phát hiện checkpoint normal/legacy, KHÔNG đăng chapter để tránh trùng")
+            raise RuntimeError("Bài đã bắt đầu đăng theo normal mode; cần đối chiếu và khôi phục riêng, không POST chapter")
+        print(f"[PAGE6-TEST] {post_id}: CHAPTER MODE được kích hoạt, chuẩn bị gửi 3 chương trong một request", flush=True)
+        return _page6_publish_chapter_batch(post_id, state)
+    if state.get("page6_chapter_request_started"):
+        raise RuntimeError("Đã bắt đầu chapter mode; không chuyển về normal để tránh trùng")
     if state.get("web_posts") and not state.get("page6_api_posts"):
         raise RuntimeError("Đã có checkpoint web phiên bản cũ; cần đối chiếu trước khi đăng")
     if state.get("publish_target") and state["publish_target"] != WEB_BASE_URL:
