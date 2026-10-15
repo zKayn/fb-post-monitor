@@ -2321,7 +2321,7 @@ def _page6_test_reserved(post_id):
     return True
 
 def _page6_permalink(title):
-    """Slug ngắn theo tiêu đề + mã Page + AUTHOR_CODE; không thêm Facebook ID."""
+    """Slug theo tiêu đề + mã Page + mã 026; username BioBlog chỉ ở payload author."""
     value = unicodedata.normalize("NFKD", title)
     value = "".join(c for c in value if not unicodedata.combining(c))
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
