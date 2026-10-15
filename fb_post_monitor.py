@@ -130,6 +130,7 @@ ENABLE_PAGE6_WEB_TEST = os.getenv("ENABLE_PAGE6_WEB_TEST", "false").strip().lowe
 BIOBLOG_API_TOKEN = os.getenv("BIOBLOG_API_TOKEN", "").strip()
 BIOBLOG_AUTHOR_USERNAME = os.getenv("BIOBLOG_AUTHOR_USERNAME", "phi").strip().lstrip("@")
 PAGE6_TEST_MARKER = "/data/page6_web_test_one_post.json"
+PAGE6_TEST_MAX_AGE_HOURS = float(os.getenv("PAGE6_TEST_MAX_AGE_HOURS", "3"))  # nhận cả bài vừa đăng trước lúc deploy
 
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
@@ -2176,6 +2177,15 @@ def story_worker():
                 except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
                     continue
+                # Page 6: chỉ nhận bài mới trong cửa sổ test, kể cả đã đăng trước redeploy.
+                # Dành slot trước khi gọi OpenAI để không tốn phí cho nhiều bài test.
+                if ENABLE_PAGE6_WEB_TEST and _page_number(page_name, page_id) == 6:
+                    if age > timedelta(hours=PAGE6_TEST_MAX_AGE_HOURS):
+                        print(f"[PAGE6-TEST] {post_id}: cũ hơn {PAGE6_TEST_MAX_AGE_HOURS} giờ, bỏ qua.")
+                        continue
+                    if not _page6_test_reserved(post_id):
+                        print(f"[PAGE6-TEST] {post_id}: slot test đã dành cho bài khác.")
+                        continue
                 # Đã xác nhận bài mới theo thời gian Facebook: đánh dấu đủ điều kiện auto-web.
                 # Lưu trước khi gọi OpenAI để retry/redeploy không mất quyền xử lý.
                 state = _load_progress(post_id)
@@ -2227,7 +2237,9 @@ def check_all_pages():
         page_token = page["access_token"]
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
-        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS 
+        is_page6_instant = ENABLE_PAGE6_WEB_TEST and _page_number(page_name, page_id) == 6
+        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS
+        is_instant_page = is_special_page or is_page6_instant
 
         # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
         # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
@@ -2251,6 +2263,19 @@ def check_all_pages():
             and now_mono >= _post_next_check.get(str(pid), 0)
         ]
 
+        if is_page6_instant:
+            # Facebook thường trả bài mới nhất trước. Chỉ kiểm tra bài mới nhất
+            # chưa hoàn tất; thời gian đăng được xác minh lại trong story_worker.
+            if os.path.isfile(PAGE6_TEST_MARKER):
+                try:
+                    with open(PAGE6_TEST_MARKER, encoding="utf-8") as f:
+                        reserved_id = str(json.load(f).get("post_id", ""))
+                    post_ids_to_check = [pid for pid in post_ids_to_check if str(pid) == reserved_id]
+                except (OSError, ValueError, TypeError):
+                    post_ids_to_check = []  # fail closed
+            else:
+                post_ids_to_check = post_ids_to_check[:1]
+
         if not post_ids_to_check:
             continue
 
@@ -2260,7 +2285,7 @@ def check_all_pages():
             key = f"{page_id}_{post_id}"
             views, comments, link, message = stats.get(post_id, (None, None, None, ""))
 
-            if not is_special_page and (comments is None or (
+            if not is_instant_page and (comments is None or (
                 views is None and comments <= COMMENT_ONLY_THRESHOLD
             )):
                 print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
@@ -2273,7 +2298,7 @@ def check_all_pages():
             # Khi pagination hoàn tất, biến comments được thay bằng TOP_LEVEL; vì vậy cả threshold
             # VÀ dòng "Comments:" trong Telegram đều dùng cùng một số top_level sát Facebook.
             summary_comments = int(comments or 0)
-            if not is_special_page and should_deep_count_comments(views or 0, summary_comments):
+            if not is_instant_page and should_deep_count_comments(views or 0, summary_comments):
                 effective_comments, comment_debug = get_comment_count_fallback(
                     post_id, page_token, summary_comments
                 )
@@ -2284,7 +2309,7 @@ def check_all_pages():
                     )
                 comments = effective_comments
 
-            poll_seconds = _adaptive_poll_seconds(views or 0, comments)
+            poll_seconds = CHECK_INTERVAL_SECONDS if is_page6_instant else _adaptive_poll_seconds(views or 0, comments or 0)
             _post_next_check[str(post_id)] = time.monotonic() + poll_seconds
             print(
                 f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}"
@@ -2343,14 +2368,15 @@ def check_all_pages():
 
             # Little Girl: bài xuất hiện sau baseline được xử lý ngay, kể cả 0 views/comments.
             # Những Page còn lại vẫn phải đạt ngưỡng tương tác.
-            if not is_special_page and not meets_threshold(views or 0, comments):
+            if not is_instant_page and not meets_threshold(views or 0, comments or 0):
                 continue
 
-            qualified_reasons = ["Little Girl: bài mới, không cần ngưỡng"] if is_special_page else []
-            if comments > COMMENT_ONLY_THRESHOLD:
+            qualified_reasons = (["Page 6 TEST: bài mới, không cần views/comments"] if is_page6_instant
+                                 else ["Little Girl: bài mới, không cần ngưỡng"] if is_special_page else [])
+            if (comments or 0) > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
             for rule in THRESHOLD_RULES:
-                if (views or 0) >= rule["min_views"] and comments >= rule["min_comments"]:
+                if (views or 0) >= rule["min_views"] and (comments or 0) >= rule["min_comments"]:
                     qualified_reasons.append(
                         f"views>={rule['min_views']} & comments>={rule['min_comments']}"
                     )
