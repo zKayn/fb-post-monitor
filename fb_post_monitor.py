@@ -10,6 +10,7 @@ import html
 from urllib.parse import urlparse
 from io import BytesIO
 import mimetypes
+import unicodedata
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
@@ -1079,6 +1080,17 @@ def _web_part_title(base_title, n, page_number):
     return f"{prefix}{title}{page_number} {AUTHOR_CODE}"
 
 
+def _web_short_slug(title):
+    """Slug cũ: part-3-the-ledger-beneath-the-marble15-026.
+
+    AUTHOR_CODE là mã số 026, KHÔNG phải username tác giả BioBlog.
+    """
+    normalized = unicodedata.normalize("NFKD", title)
+    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
+    normalized = normalized.replace("đ", "d").replace("Đ", "D").lower()
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", normalized)).strip("-")
+
+
 def _story_body(raw, part):
     raw = _strip_program_endings(raw)
     raw = re.sub(r"(?im)^\s*PART\s+%d(?:\s*\(THE END\))?\s*$" % part, "", raw).strip()
@@ -1476,11 +1488,26 @@ def publish_approved_story(post_id):
         nav = [(f"READ PART {n+1}", web[str(n+1)]["url"])] if n < 4 and web.get(str(n+1), {}).get("url") else []
         title = _web_part_title(base_title, n, title_page_number)
         body = _to_html(_story_body(parts[key], n), nav)
-        result = _web_create_post(session, title, body, image_url)
+        slug = _web_short_slug(title)
+        print(f"[AUTO-WEB] {post_id}: chuẩn bị Part {n}, slug={slug}")
+        result = _web_create_post(session, title, body, image_url, slug=slug)
         web[key] = result
         _save_progress(post_id, state)
         print(f"[AUTO-WEB] {post_id}: đã đăng Part {n}: {result['url']}")
-    # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4.
+    # GỬI LINK NGAY khi đủ 3 URL, KHÔNG chờ API NEXT/PREV (API edit có thể lỗi).
+    # Checkpoint cũ cũng được khôi phục ở đây, tuyệt đối không tạo lại bài đã có URL.
+    if not state.get("web_links_telegram_sent"):
+        urls = [web.get(str(n), {}).get("url") for n in (2, 3, 4)]
+        if not all(urls):
+            raise RuntimeError("Chưa đủ 3 URL để gửi Telegram")
+        message = "\n".join(f"PART {n}: {web[str(n)]['url']}" for n in (2, 3, 4))
+        if not send_telegram_message(message):
+            raise RuntimeError("Telegram chưa xác nhận gửi ba link")
+        state["web_links_telegram_sent"] = True
+        _save_progress(post_id, state)
+        print(f"[AUTO-WEB-LINKS] {post_id}: đã gửi 3 link Telegram")
+
+    # NEXT/PREV giống bản cũ: cập nhật hai chiều qua API admin; có retry checkpoint.
     linked = state.setdefault("web_linked", [])
     for n in (2, 3, 4):
         if n in linked:
@@ -1489,24 +1516,24 @@ def publish_approved_story(post_id):
         if n > 2:
             nav.append((f"PREVIOUS: PART {n-1}", web[str(n-1)]["url"]))
         if n < 4:
-            nav.append((f"NEXT: PART 4(THE END):" if n + 1 == 4 else f"NEXT: PART {n+1}", web[str(n+1)]["url"]))
-        _web_update_chapter(session, web[str(n)], _web_part_title(base_title, n, title_page_number),
-                            _to_html(_story_body(parts[str(n)], n), nav), image_url,
-                            prev_slug=web[str(n-1)]["slug"] if n > 2 else "",
-                            next_slug=web[str(n+1)]["slug"] if n < 4 else "")
+            nav.append(("NEXT: PART 4 (THE END)" if n == 3 else "NEXT: PART 3", web[str(n+1)]["url"]))
+        try:
+            _web_update_chapter(
+                session, web[str(n)], _web_part_title(base_title, n, title_page_number),
+                _to_html(_story_body(parts[str(n)], n), nav), image_url,
+                prev_slug=web[str(n-1)]["slug"] if n > 2 else "",
+                next_slug=web[str(n+1)]["slug"] if n < 4 else "",
+            )
+        except Exception as exc:
+            print(f"[AUTO-WEB-NAV-ERROR] {post_id} Part {n}: {type(exc).__name__}: {exc}", flush=True)
+            raise
         linked.append(n)
         _save_progress(post_id, state)
-    # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và liên kết hoàn tất.
-    # Lưu checkpoint để các lần retry/redeploy không gửi lại thông báo.
-    if not state.get("web_links_telegram_sent"):
-        urls = [web[str(n)].get("url") for n in (2, 3, 4)]
-        if not all(urls):
-            raise RuntimeError("Chưa có đủ 3 URL công khai để gửi Telegram")
-        message = "\n".join(f"PART {n}: {web[str(n)]['url']}" for n in (2, 3, 4))
-        if send_telegram_message(message) is False:
-            raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
-        state["web_links_telegram_sent"] = True
-        _save_progress(post_id, state)
+        print(f"[AUTO-WEB-NAV] {post_id}: Part {n} linked", flush=True)
+    if not state.get("web_nav_complete_notified"):
+        if send_telegram_message(f"✅ NEXT/PREVIOUS đã nối đủ Part 2, 3, 4 — {post_id}"):
+            state["web_nav_complete_notified"] = True
+            _save_progress(post_id, state)
 
 
 
@@ -1535,6 +1562,7 @@ def _auto_publish_with_retry(post_id):
             state = _load_progress(post_id)
             state["web_publish_complete"] = True
             state.pop("web_retry_after", None)
+            state.pop("web_error_notified_signature", None)
             _save_progress(post_id, state)
             return True
         except Exception as exc:
@@ -1543,7 +1571,11 @@ def _auto_publish_with_retry(post_id):
             state["web_last_error"] = str(exc)[:800]
             _save_progress(post_id, state)
             print(f"[AUTO-WEB] {post_id}: {exc}; retry in {AUTO_PUBLISH_RETRY_SECONDS}s")
-            send_telegram_message(f"⚠️ Website chưa đăng xong bài {post_id}: {str(exc)[:500]}\nBot sẽ thử lại; các Part đã đăng được lưu checkpoint.")
+            error_signature = hashlib.sha256(str(exc).encode("utf-8")).hexdigest()[:16]
+            if state.get("web_error_notified_signature") != error_signature:
+                if send_telegram_message(f"⚠️ Website chưa hoàn tất bài {post_id}: {str(exc)[:500]}\nĐã lưu checkpoint; bot sẽ thử lại, không đăng trùng các Part có URL."):
+                    state["web_error_notified_signature"] = error_signature
+                    _save_progress(post_id, state)
             return False
 
 
