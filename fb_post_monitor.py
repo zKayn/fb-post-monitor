@@ -1274,10 +1274,12 @@ def _web_update_chapter(session, post_record, title, description, image_url, pre
     response = session.put(f"{WEB_BASE_URL}/admin/api/v1/posts/{post_id}", json=payload,
         headers={"Origin": WEB_BASE_URL, "Referer": f"{WEB_BASE_URL}/admin/posts/{post_id}/edit"}, timeout=45)
     if response.status_code != 200:
-        raise RuntimeError(f"Không cập nhật được liên kết chương: HTTP {response.status_code}: {response.text[:200]}")
+        print(f"[PAGE6-NAV-ERROR] PUT post_id={post_id} HTTP={response.status_code} body={response.text[:400]}", flush=True)
+        raise RuntimeError(f"Không cập nhật được liên kết chương post_id={post_id}: HTTP {response.status_code}: {response.text[:200]}")
     result = response.json()
     if result.get("ok") is not True:
-        raise RuntimeError("API sửa bài không xác nhận ok=true")
+        print(f"[PAGE6-NAV-ERROR] PUT post_id={post_id} JSON={str(result)[:400]}", flush=True)
+        raise RuntimeError(f"API sửa bài post_id={post_id} không xác nhận ok=true")
 
 
 def _wp_request(method, path, **kwargs):
@@ -2566,6 +2568,7 @@ def publish_page6_bioblog_test(post_id):
     if len(set(actual_urls.values())) != 3:
         raise RuntimeError("Ba chương có URL trùng; dừng liên kết")
     linked = state.setdefault("page6_linked_parts", [])
+    print(f"[PAGE6-NAV] {post_id}: created={[posts[str(n)].get('id') for n in (2,3,4)]}; linked={linked}", flush=True)
     if not all(n in linked for n in (2, 3, 4)):
         # API admin này được lấy từ code cũ. Nếu BioBlog mới đã đổi API,
         # PUT sẽ báo lỗi và bot dừng, không báo thành công giả.
@@ -2578,12 +2581,14 @@ def publish_page6_bioblog_test(post_id):
             body += "\n" + _page6_navigation(n, actual_urls)
             prev_slug = posts[str(n-1)]["slug"] if n > 2 else ""
             next_slug = posts[str(n+1)]["slug"] if n < 4 else ""
+            print(f"[PAGE6-NAV] {post_id}: PUT Part {n} prev={prev_slug!r} next={next_slug!r}", flush=True)
             _web_update_chapter(session, posts[str(n)], titles[n], body, image_url,
                                 prev_slug=prev_slug, next_slug=next_slug)
             linked.append(n)
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST] {post_id}: đã nối Part {n}: prev={prev_slug!r} next={next_slug!r}", flush=True)
     if not state.get("page6_api_links_sent"):
+        print(f"[PAGE6-NAV] {post_id}: đã nối đủ 3 Part; chuẩn bị gửi 3 URL Telegram", flush=True)
         msg = "🧪 PAGE 6 / Epic Stories — ĐÃ NỐI CHƯƠNG (author=" + BIOBLOG_AUTHOR_USERNAME + ")\n" + "\n".join(
             "PART " + str(n) + ": " + actual_urls[n] for n in (2, 3, 4))
         if not send_telegram_message(msg):
@@ -2628,6 +2633,7 @@ def _page6_try_publish_once(post_id):
         state = _load_progress(post_id)
         state["page6_test_blocked"] = str(exc)[:500]
         _save_progress(post_id, state)
+        print(f"[PAGE6-TEST-ERROR] {post_id}: {type(exc).__name__}: {exc}", flush=True)
         send_error_alert("page6_bioblog_test", "Thử đăng web Page 6 dừng để tránh trùng bài: " + str(exc)[:400])
         return False
 
@@ -2655,19 +2661,4 @@ def page6_test_recovery_worker():
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
     if PUBLISH_PLATFORM == "wordpress":
-        threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
-    threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
-    if ENABLE_PAGE6_WEB_TEST:
-        threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
-    while True:
-        scan_started = time.monotonic()
-        try:
-            check_all_pages()
-        except Exception as e:
-            print(f"[LỖI] Lỗi không xác định trong vòng quét: {e}")
-            send_error_alert("main_loop_exception", f"Lỗi không xác định trong vòng quét:\n{e}")
-        time.sleep(max(0, CHECK_INTERVAL_SECONDS - (time.monotonic() - scan_started)))
-
-
-if __name__ == "__main__":
-    main()
+        threading.Thread(target=_wp_repair_requested_once, name="w
