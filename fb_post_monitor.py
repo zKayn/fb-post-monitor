@@ -2047,6 +2047,22 @@ def story_worker():
             if not ENABLE_PAID_GENERATION:
                 print(f"[COST GUARD] {post_id}: chưa bật ENABLE_PAID_GENERATION; bỏ qua hàng đợi.")
                 continue
+            # Bảo vệ độc lập ở worker: không tin queue cũ hoặc phiên bản scanner khác.
+            # Chỉ Page 15 (Little Girl) được bỏ qua ngưỡng tương tác.
+            is_page15 = (_page_number_or_none(page_name, page_id) == 15
+                         and page_name.strip().casefold() == "little girl")
+            if not is_page15:
+                fresh = get_stats_batch([post_id], page_token).get(post_id)
+                if not fresh:
+                    print(f"[WORKER-THRESHOLD-BLOCK] {page_name} {post_id}: không có stats; bỏ qua.", flush=True)
+                    continue
+                fresh_views, fresh_comments = fresh[0], fresh[1]
+                if fresh_comments is None or (fresh_views is None and fresh_comments <= COMMENT_ONLY_THRESHOLD):
+                    print(f"[WORKER-THRESHOLD-BLOCK] {page_name} {post_id}: stats thiếu; bỏ qua.", flush=True)
+                    continue
+                if not meets_threshold(int(fresh_views or 0), int(fresh_comments or 0)):
+                    print(f"[WORKER-THRESHOLD-BLOCK] {page_name} {post_id}: views={fresh_views} comments={fresh_comments}; không đạt ngưỡng.", flush=True)
+                    continue
             # Đợi đến lượt gửi cả nhóm; scanner vẫn chạy độc lập mỗi 60 giây.
             with TELEGRAM_GROUP_LOCK:
                 link_status = post_already_has_link(post_id, page_id, page_token, message)
@@ -2065,7 +2081,7 @@ def story_worker():
                     continue
                 # Page 6: chỉ nhận bài mới trong cửa sổ test, kể cả đã đăng trước redeploy.
                 # Dành slot trước khi gọi OpenAI để không tốn phí cho nhiều bài test.
-                if ENABLE_PAGE6_WEB_TEST and _page_number_or_none(page_name, page_id) in WEB_PUBLISH_PAGE_NUMBERS:
+                if False:  # Khong gioi han 3 gio cho bai dat nguong cua 15 Page
                     if age > timedelta(hours=PAGE6_TEST_MAX_AGE_HOURS):
                         print(f"[PAGE6-TEST] {post_id}: cũ hơn {PAGE6_TEST_MAX_AGE_HOURS} giờ, bỏ qua.")
                         continue
@@ -2121,9 +2137,9 @@ def check_all_pages():
         page_token = page["access_token"]
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
-        is_page6_instant = ENABLE_PAGE6_WEB_TEST and _page_number_or_none(page_name, page_id) in WEB_PUBLISH_PAGE_NUMBERS
-        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS
-        is_instant_page = is_special_page or is_page6_instant
+        is_page6_instant = False  # Dang web cho moi Page KHONG co nghia thong bao ngay
+        is_special_page = (_page_number_or_none(page_name, page_id) == 15 and page_name.strip().casefold() == "little girl")
+        is_instant_page = is_special_page
 
         # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
         # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
@@ -2200,7 +2216,7 @@ def check_all_pages():
 
             spike_key = f"spike_{page_id}_{post_id}"
 
-            if ENABLE_SPIKE_ALERT and spike_detected and spike_key not in already_notified:
+            if ENABLE_SPIKE_ALERT and spike_detected and meets_threshold(views or 0, comments or 0) and spike_key not in already_notified:
 
                 # Spike cũng phải kiểm tra link TRƯỚC khi báo Telegram.
 
