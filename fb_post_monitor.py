@@ -203,6 +203,7 @@ PAGE6_CHAPTER_MODE = os.getenv("PAGE6_CHAPTER_MODE", "false").strip().lower() in
 PAGE6_TEST_MAX_AGE_HOURS = float(os.getenv("PAGE6_TEST_MAX_AGE_HOURS", "3"))  # nhận cả bài vừa đăng trước lúc deploy
 # Sau khi 3 Part đã tạo xong mà bước nối chương / gửi link lỗi: thử lại sau N giây (an toàn, không tạo lại bài).
 PAGE6_LINK_RETRY_SECONDS = int(os.getenv("PAGE6_LINK_RETRY_SECONDS", "300"))
+WEB_BACKFILL_HOURS = float(os.getenv("WEB_BACKFILL_HOURS", "168"))  # bài cũ trong N giờ chưa có link web sẽ được đăng bù khi chạy lại
 
 PUBLISH_PLATFORM = os.getenv("PUBLISH_PLATFORM", "bioblog").strip().lower()
 if PUBLISH_PLATFORM not in ("bioblog", "wordpress"):
@@ -1293,12 +1294,19 @@ def _web_upload_featured_image(session, post_id, page_token):
             return WEB_POST_IMAGE_URL
         raise RuntimeError("Không lấy được ảnh gốc Facebook; dừng đăng web")
     raw, content_type, ext = _download_facebook_image(image_url)
-    payload = {"fileName": f"fb_{post_id.replace('_', '-')}.{ext}",
-               "contentType": content_type, "size": len(raw),
-               "auditContext": {"record_type": "Post", "action_label": "upload_featured_image"}}
-    resp = session.post(WEB_BASE_URL + "/admin/api/v1/uploads/presigned-image-url",
-        json=payload, headers={"Origin": WEB_BASE_URL,
-                               "Referer": WEB_BASE_URL + "/admin/posts/new"}, timeout=40)
+    names = [f"fb_{post_id.replace('_', '-')}.{ext}", f"fb-{int(time.time())}.{ext}", f"img-{int(time.time())}.{ext}"]
+    resp = None
+    for attempt, fname in enumerate(names, 1):
+        payload = {"fileName": fname, "contentType": content_type, "size": len(raw),
+                   "auditContext": {"record_type": "Post", "action_label": "upload_featured_image"}}
+        resp = session.post(WEB_BASE_URL + "/admin/api/v1/uploads/presigned-image-url",
+            json=payload, headers={"Origin": WEB_BASE_URL,
+                                   "Referer": WEB_BASE_URL + "/admin/posts/new"}, timeout=40)
+        if resp.status_code < 500:
+            break
+        print(f"[WEB-IMAGE] presigned HTTP {resp.status_code} (lần {attempt}/{len(names)}): {resp.text[:160]!r}", flush=True)
+        if attempt < len(names):
+            time.sleep(4 * attempt)
     resp.raise_for_status()
     data = (resp.json().get("data") or {})
     upload = data.get("upload") or {}
@@ -1319,6 +1327,25 @@ def _web_upload_featured_image(session, post_id, page_token):
     if put.status_code not in (200, 201, 204):
         raise RuntimeError(f"R2 upload ảnh thất bại HTTP {put.status_code}")
     return public_url
+
+
+def _web_featured_image_or_fallback(post_id, page_token):
+    """Đăng nhập admin + tải ảnh lên web. Lỗi tạm thời (500/522...) thì thử lại; nếu vẫn lỗi thì dùng
+    thẳng link ảnh gốc Facebook (API chỉ cần URL) để KHÔNG chặn việc đăng bài. Trả (url, dùng_fallback)."""
+    last = None
+    for attempt in range(1, 4):
+        try:
+            session = _web_login()
+            return _web_upload_featured_image(session, post_id, page_token), False
+        except Exception as exc:
+            last = exc
+            print(f"[WEB-IMAGE] tải ảnh lên web lỗi (lần {attempt}/3): {exc}", flush=True)
+            time.sleep(6 * attempt)
+    fb_url = _facebook_original_image(post_id, page_token)
+    if not fb_url:
+        raise RuntimeError(f"Không tải được ảnh lên web và không lấy được ảnh Facebook: {last}")
+    print(f"[WEB-IMAGE] dùng tạm link ảnh Facebook vì web lỗi: {last}", flush=True)
+    return fb_url, True
 
 
 def _web_create_post(session, title, body_html, image_url, slug=""):
@@ -2649,7 +2676,6 @@ def publish_page6_bioblog_test(post_id):
 
     # ---- Tạo bài bằng API công khai (đúng author + permalink như bản đầu),
     # ---- sau đó lấy id và PUT prev/next bằng admin API, cuối cùng gửi link Telegram một lần.
-    session = _web_login()
     image_url = state.get("web_featured_image")
     if not image_url:
         if any(posts.get(str(n)) for n in (2, 3, 4)):
@@ -2658,11 +2684,13 @@ def publish_page6_bioblog_test(post_id):
         page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
         if not page or not page.get("access_token"):
             raise RuntimeError("Không có Facebook Page token để lấy ảnh gốc")
-        image_url = _web_upload_featured_image(session, post_id, page["access_token"])
+        image_url, used_fb = _web_featured_image_or_fallback(post_id, page["access_token"])
         if not isinstance(image_url, str) or not image_url.startswith("https://"):
             raise RuntimeError("Ảnh upload không có HTTPS URL")
         state["web_featured_image"] = image_url
         _save_progress(post_id, state)
+        if used_fb:
+            send_telegram_message("⚠️ Web lỗi khi tải ảnh lên (HTTP 500/đăng nhập). Bài vẫn đăng, ảnh đại diện đang dùng tạm link ảnh Facebook — có thể hết hạn, nên thay ảnh trong trang quản trị sau.")
         print(f"[PAGE6-TEST] {post_id}: đã upload ảnh đại diện dùng chung 3 Part")
 
     def _base_body(n):
@@ -2753,6 +2781,13 @@ def _page6_try_publish_once_unlocked(post_id):
             _save_progress(post_id, state)
             print(f"[PAGE6-RECOVERY] {post_id}: gỡ khóa cũ thiếu id; không POST lại", flush=True)
     if state.get("page6_test_blocked"):
+        # Khóa cũ do lỗi XẢY RA TRƯỚC KHI gọi POST tạo bài (ví dụ web 500 lúc tải ảnh) thì chưa có bài nào -> mở khóa, đăng lại.
+        _recs = state.get("page6_api_posts") or {}
+        if not any(r.get("request_started") or r.get("url") for r in _recs.values()):
+            state.pop("page6_test_blocked", None)
+            _save_progress(post_id, state)
+            print(f"[PAGE6-RECOVERY] {post_id}: gỡ khóa cũ (chưa tạo bài nào), đăng lại", flush=True)
+    if state.get("page6_test_blocked"):
         # Chỉ mở khóa lỗi 422 validation xác định được: không có bài nào tạo thành công
         # trong phần đang lỗi, và 3 TXT đã gửi. Không mở khóa lỗi mạng/timeout/5xx.
         reason = str(state.get("page6_test_blocked", ""))
@@ -2786,11 +2821,21 @@ def _page6_try_publish_once_unlocked(post_id):
             send_error_alert("page6_bioblog_link_retry",
                              "Page 6 đã đăng đủ 3 Part nhưng nối chương/gửi link chưa xong; bot sẽ tự thử lại, "
                              "không tạo lại bài: " + str(exc)[:400])
+        elif not any(r.get("request_started") or r.get("url") for r in records.values()):
+            # Lỗi trước khi tạo bất kỳ bài nào (web 500, đăng nhập, ảnh...): chưa có gì để trùng -> tự thử lại.
+            state["page6_retry_after"] = time.time() + 120
+            state["page6_last_error"] = str(exc)[:800]
+            _save_progress(post_id, state)
+            print(f"[PAGE6-TEST-RETRY] {post_id}: chưa tạo bài nào, lỗi {type(exc).__name__}: {exc}; thử lại sau 120s", flush=True)
+            send_error_alert("web_publish_retry",
+                             "Chưa đăng được bài lên web (web đang lỗi), bot tự thử lại mỗi vài phút, không tạo trùng: " + str(exc)[:300])
         else:
+            # Đã gọi POST nhưng chưa rõ kết quả -> dừng để tránh đăng trùng, cần kiểm tra tay.
             state["page6_test_blocked"] = str(exc)[:500]
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST-ERROR] {post_id}: {type(exc).__name__}: {exc}", flush=True)
-            send_error_alert("page6_bioblog_test", "Thử đăng web Page 6 dừng để tránh trùng bài: " + str(exc)[:400])
+            send_error_alert("page6_bioblog_test",
+                             "Đã gửi yêu cầu tạo bài nhưng chưa rõ kết quả; dừng để tránh đăng trùng, kiểm tra web thủ công: " + str(exc)[:400])
         return False
 
 def page6_test_recovery_worker():
@@ -2804,10 +2849,18 @@ def page6_test_recovery_worker():
                         continue
                     post_id = filename[:-5]
                     state = _load_progress(post_id)
-                    if (state.get("auto_publish_eligible")
-                            and _web_publish_allowed(_page6_number_for_post(post_id))
+                    if (_web_publish_allowed(_page6_number_for_post(post_id))
                             and not state.get("web_publish_complete")
-                            and all(n in state.get("sent", []) for n in (2, 3, 4))):
+                            and all(n in state.get("sent", []) for n in (2, 3, 4))
+                            and all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4))):
+                        if not state.get("auto_publish_eligible"):
+                            # Bài cũ đã viết + gửi TXT đủ 3 Part nhưng chưa lên web: bù đăng (trong WEB_BACKFILL_HOURS giờ gần đây).
+                            age_h = (time.time() - os.path.getmtime(os.path.join(STORY_PROGRESS_DIR, filename))) / 3600
+                            if age_h > WEB_BACKFILL_HOURS or state.get("web_posts"):
+                                continue
+                            state["auto_publish_eligible"] = True
+                            _save_progress(post_id, state)
+                            print(f"[WEB-BACKFILL] {post_id}: bài cũ chưa có link web -> đăng bù", flush=True)
                         _page6_try_publish_once(post_id)
         except Exception as exc:
             print("[PAGE6-TEST] " + str(exc))
