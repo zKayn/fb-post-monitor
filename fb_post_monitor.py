@@ -214,10 +214,10 @@ THRESHOLD_RULES = [
     {"min_views": 5000, "min_comments": 0},
     {"min_views": 3500, "min_comments": 50},
 ]
-COMMENT_ONLY_THRESHOLD = 120  # comments vượt mốc này thì báo luôn, không cần xét views
+COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, không cần xét views
 
 # Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
-ONLY_POSTS_NEWER_THAN_HOURS = 72  # Giới hạn phụ để giảm số lần gọi API
+ONLY_POSTS_NEWER_THAN_HOURS = 120  # Giới hạn phụ để giảm số lần gọi API
 # Bắt buộc gắn Railway Volume vào /data để không reset khi redeploy.
 NEW_POST_CUTOFF_FILE = "/data/new_posts_since_utc.json"
 
