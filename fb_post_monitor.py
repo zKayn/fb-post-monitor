@@ -151,14 +151,10 @@ if _page_numbers_env:
         _name, _, _num = _item.rpartition("=")
         if _name.strip() and _num.strip().isdigit():
             PAGE_NUMBER_BY_NAME[_name.strip()] = int(_num.strip())
-# Mặc định "all": mọi Page đã có mã số đều tự đăng web sau khi đủ 3 TXT. Muốn giới hạn: WEB_PUBLISH_PAGES="1,6,15".
 _web_publish_raw = os.getenv("WEB_PUBLISH_PAGES", "all").strip().lower()
-WEB_PUBLISH_ALL_PAGES = _web_publish_raw in ("", "all", "*")
-WEB_PUBLISH_PAGE_NUMBERS = set() if WEB_PUBLISH_ALL_PAGES else {int(x) for x in re.findall(r"\d+", _web_publish_raw)}
-
-
-def _web_publish_allowed(page_number):
-    return page_number is not None and (WEB_PUBLISH_ALL_PAGES or page_number in WEB_PUBLISH_PAGE_NUMBERS)
+WEB_PUBLISH_PAGE_NUMBERS = (set(PAGE_NUMBER_BY_NAME.values()) if _web_publish_raw in ("all", "*", "1-15")
+                            else {int(x) for x in re.findall(r"\d+", _web_publish_raw)})
+WEB_BACKFILL_EXISTING_TXT = os.getenv("WEB_BACKFILL_EXISTING_TXT", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _page_number_or_none(page_name, page_id):
@@ -194,7 +190,7 @@ SEND_STORY_TXT_TELEGRAM = True  # Giữ gửi đủ ba TXT trên tất cả Page
 WEB_BASE_URL = ACTIVE_WEB_BASE_URL  # lấy từ WEB_API_URL
 # Chỉ Epic Stories (Page số 6) được phép thử đăng web; tất cả Page khác chỉ TXT.
 # Tắt ngay bằng ENABLE_PAGE6_WEB_TEST=false trên Railway.
-ENABLE_PAGE6_WEB_TEST = os.getenv("ENABLE_WEB_PUBLISH", os.getenv("ENABLE_PAGE6_WEB_TEST", "false")).strip().lower() in ("1", "true", "yes", "on")  # tên cũ vẫn dùng được
+ENABLE_PAGE6_WEB_TEST = os.getenv("ENABLE_PAGE6_WEB_TEST", "false").strip().lower() in ("1", "true", "yes", "on")
 BIOBLOG_API_TOKEN = ACTIVE_WEB_TOKEN  # token tự lấy theo website đang dùng
 PAGE6_TEST_MARKER = "/data/page6_web_test_one_post.json"
 # Chỉ cho phép khôi phục lỗi validation HTTP 422 permalink thiếu của phiên bản cũ.
@@ -1128,7 +1124,7 @@ def _resume_story(page_name, post_id, caption):
         _save_progress(post_id, state)
     # Chỉ những bài được worker xác nhận mới sau mốc kích hoạt mới tự xuất bản.
     # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
-    if state.get("auto_publish_eligible") and ENABLE_PAGE6_WEB_TEST and _web_publish_allowed(_page6_number_for_post(post_id)):
+    if state.get("auto_publish_eligible") and ENABLE_PAGE6_WEB_TEST and _page6_number_for_post(post_id) in WEB_PUBLISH_PAGE_NUMBERS:
         _page6_try_publish_once(post_id)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
@@ -1517,7 +1513,7 @@ def publish_wordpress_story(post_id):
 
 
 def publish_approved_story(post_id):
-    if not _web_publish_allowed(_page6_number_for_post(post_id)):
+    if _page6_number_for_post(post_id) not in WEB_PUBLISH_PAGE_NUMBERS:
         raise RuntimeError("Page này chưa được bật đăng web (xem biến WEB_PUBLISH_PAGES)")
     return publish_page6_bioblog_test(post_id)
 
@@ -2067,6 +2063,13 @@ def story_worker():
                 except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
                     continue
+                # Page 6: chỉ nhận bài mới trong cửa sổ test, kể cả đã đăng trước redeploy.
+                # Dành slot trước khi gọi OpenAI để không tốn phí cho nhiều bài test.
+                if ENABLE_PAGE6_WEB_TEST and _page_number_or_none(page_name, page_id) in WEB_PUBLISH_PAGE_NUMBERS:
+                    if age > timedelta(hours=PAGE6_TEST_MAX_AGE_HOURS):
+                        print(f"[PAGE6-TEST] {post_id}: cũ hơn {PAGE6_TEST_MAX_AGE_HOURS} giờ, bỏ qua.")
+                        continue
+                    # Mỗi post_id có checkpoint riêng; không khóa toàn Page vào bài test cũ.
                 # Đã xác nhận bài mới theo thời gian Facebook: đánh dấu đủ điều kiện auto-web.
                 # Lưu trước khi gọi OpenAI để retry/redeploy không mất quyền xử lý.
                 state = _load_progress(post_id)
@@ -2076,13 +2079,10 @@ def story_worker():
                     _save_progress(post_id, state)
                 if notified_key not in already_notified:
                     print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN.")
-                    if send_telegram_message(alert_text):
-                        already_notified.add(notified_key)
-                        save_notified(already_notified)
-                        print(f"[ALERT-SENT] {post_id}: đã lưu notified sau khi gửi Telegram.")
-                    else:
-                        print(f"[ALERT-FAILED] {post_id}: Telegram lỗi, chưa đánh dấu đã báo.")
-                        continue
+                    send_telegram_message(alert_text)
+                    already_notified.add(notified_key)
+                    save_notified(already_notified)
+                    print(f"[ALERT-SENT] {post_id}: đã lưu notified sau khi gửi Telegram.")
                 else:
                     print(f"[WORKER] {post_id}: đã báo trước đó; không báo lặp.")
                 # Khóa được giữ xuyên suốt 3 TXT: không tin Telegram nào từ
@@ -2121,9 +2121,9 @@ def check_all_pages():
         page_token = page["access_token"]
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
-        # Chỉ Page đặc biệt (ví dụ Page 15) xử lý ngay khi có bài mới; mọi Page khác vẫn phải đạt ngưỡng.
-        is_special_page = (_page_number_or_none(page_name, page_id) == 15) or (str(page_id) in SPECIAL_INSTANT_PAGE_IDS)
-        is_instant_page = is_special_page
+        is_page6_instant = ENABLE_PAGE6_WEB_TEST and _page_number_or_none(page_name, page_id) in WEB_PUBLISH_PAGE_NUMBERS
+        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS
+        is_instant_page = is_special_page or is_page6_instant
 
         # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
         # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
@@ -2146,6 +2146,11 @@ def check_all_pages():
             and (not is_special_page or str(pid) not in special_baseline_posts)
             and now_mono >= _post_next_check.get(str(pid), 0)
         ]
+
+        if is_page6_instant:
+            # Không lọc theo marker của bài test cũ: nhận mọi bài Page 6 mới.
+            # Chỉ nhận bài trong cửa sổ thời gian ở story_worker.
+            pass
 
         if not post_ids_to_check:
             continue
@@ -2180,7 +2185,7 @@ def check_all_pages():
                     )
                 comments = effective_comments
 
-            poll_seconds = CHECK_INTERVAL_SECONDS if is_special_page else _adaptive_poll_seconds(views or 0, comments or 0)
+            poll_seconds = CHECK_INTERVAL_SECONDS if is_page6_instant else _adaptive_poll_seconds(views or 0, comments or 0)
             _post_next_check[str(post_id)] = time.monotonic() + poll_seconds
             print(
                 f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}"
@@ -2189,13 +2194,13 @@ def check_all_pages():
             )
 
             # Luôn ghi lịch sử views để khi bật công tắc spike đã có baseline 30 phút.
-            # Cảnh báo spike chỉ dành cho Page 15; các Page khác chỉ báo khi đạt ngưỡng BÀI ĐANG LÊN
+            # Cảnh báo "BÀI ĐANG DỰNG ĐỨNG" độc lập với ngưỡng BÀI ĐANG LÊN
             # và chỉ gửi đúng 1 lần/post nhờ key spike_ được lưu persistent.
             spike_detected = record_and_check_spike(post_id, int(views or 0), datetime.now())
 
             spike_key = f"spike_{page_id}_{post_id}"
 
-            if ENABLE_SPIKE_ALERT and is_special_page and spike_detected and spike_key not in already_notified:
+            if ENABLE_SPIKE_ALERT and spike_detected and spike_key not in already_notified:
 
                 # Spike cũng phải kiểm tra link TRƯỚC khi báo Telegram.
 
@@ -2242,7 +2247,8 @@ def check_all_pages():
             if not is_instant_page and not meets_threshold(views or 0, comments or 0):
                 continue
 
-            qualified_reasons = (["Page đặc biệt: bài mới, không cần ngưỡng"] if is_special_page else [])
+            qualified_reasons = (["Page 6 TEST: bài mới, không cần views/comments"] if is_page6_instant
+                                 else ["Little Girl: bài mới, không cần ngưỡng"] if is_special_page else [])
             if (comments or 0) > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
             for rule in THRESHOLD_RULES:
@@ -2335,7 +2341,7 @@ def check_all_pages():
                 changed = True
 
             msg = (
-                (f"🆕 BÀI MỚI PAGE 15! (Page: {page_name})\n" if is_special_page else f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n") +
+                f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
                 f"Views: {views}\n"
                 f"Comments: {comments}\n"
                 + (f"Link: {link}\n" if link else "")
@@ -2583,7 +2589,7 @@ def publish_page6_bioblog_test(post_id):
     if not ENABLE_PAGE6_WEB_TEST:
         raise RuntimeError("ENABLE_PAGE6_WEB_TEST chưa bật")
     page_number = _page6_number_for_post(post_id)
-    if not _web_publish_allowed(page_number):
+    if page_number not in WEB_PUBLISH_PAGE_NUMBERS:
         raise RuntimeError("Page này chưa được bật đăng web (xem biến WEB_PUBLISH_PAGES)")
     if not WEB_BASE_URL.startswith("https://"):
         raise RuntimeError("WEB_BASE_URL phải là HTTPS")
@@ -2696,15 +2702,14 @@ def publish_page6_bioblog_test(post_id):
                 _save_progress(post_id, state)
         raise RuntimeError(f"Không lấy được id để nối chương: {id_error}")
 
-    # Gửi link ngay khi ba bài đã có URL; không phụ thuộc API PUT nối chương.
-    # Checkpoint tránh gửi trùng khi retry/redeploy; giữ nguyên toàn bộ logic đăng web ổn định.
+    # Ba bài đã được tạo: gửi URL ngay, không để lỗi PUT nối chương 404 chặn Telegram.
     if not state.get("page6_api_links_sent"):
         message = "\n".join(f"PART {n}: {actual_urls[n]}" for n in (2, 3, 4))
-        if send_telegram_message(message) is False:
-            raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
+        if not send_telegram_message(message):
+            raise RuntimeError("Telegram chưa xác nhận gửi ba link")
         state["page6_api_links_sent"] = True
         _save_progress(post_id, state)
-        print(f"[PAGE6-LINKS] {post_id}: đã gửi đủ 3 URL, tiếp tục nối chương riêng", flush=True)
+        print(f"[WEB-LINKS] {post_id}: gửi đủ ba URL trước bước nối chương", flush=True)
 
     # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4 (PUT prev_chapter/next_chapter + nav HTML).
     linked = state.setdefault("page6_linked_parts", [])
@@ -2740,25 +2745,8 @@ def publish_page6_bioblog_test(post_id):
             _save_progress(post_id, state)
     return True
 
-_web_publishing_now = set()
-_web_publishing_mutex = threading.Lock()
-
-
 def _page6_try_publish_once(post_id):
-    """Mỗi bài chỉ được một luồng đăng web tại một thời điểm (tránh đăng trùng giữa worker và luồng khôi phục)."""
-    with _web_publishing_mutex:
-        if str(post_id) in _web_publishing_now:
-            return False
-        _web_publishing_now.add(str(post_id))
-    try:
-        return _page6_try_publish_once_unlocked(post_id)
-    finally:
-        with _web_publishing_mutex:
-            _web_publishing_now.discard(str(post_id))
-
-
-def _page6_try_publish_once_unlocked(post_id):
-    if not ENABLE_PAGE6_WEB_TEST or not _web_publish_allowed(_page6_number_for_post(post_id)):
+    if not ENABLE_PAGE6_WEB_TEST or _page6_number_for_post(post_id) not in WEB_PUBLISH_PAGE_NUMBERS:
         return False
     state = _load_progress(post_id)
     if state.get("web_publish_complete"):
@@ -2816,47 +2804,61 @@ def _page6_try_publish_once_unlocked(post_id):
             send_error_alert("page6_bioblog_test", "Thử đăng web Page 6 dừng để tránh trùng bài: " + str(exc)[:400])
         return False
 
+def _web_backfill_existing_txt_once():
+    """Chỉ bật quyền web cho checkpoint có đủ 3 Part + TXT đã gửi; không tạo lại OpenAI."""
+    stats = {"checked": 0, "ready": 0, "enabled": 0, "complete": 0,
+             "missing_parts": 0, "missing_sent": 0, "unknown_page": 0, "blocked": 0}
+    if not os.path.isdir(STORY_PROGRESS_DIR):
+        print(f"[WEB-BACKFILL-SUMMARY] no checkpoint dir: {STORY_PROGRESS_DIR}", flush=True)
+        return stats
+    for filename in os.listdir(STORY_PROGRESS_DIR):
+        if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
+            continue
+        post_id = filename[:-5]
+        state = _load_progress(post_id)
+        stats["checked"] += 1
+        if state.get("web_publish_complete"):
+            stats["complete"] += 1
+            continue
+        page_no = _page6_number_for_post(post_id)
+        if page_no not in WEB_PUBLISH_PAGE_NUMBERS:
+            stats["unknown_page"] += 1
+            continue
+        if not all(isinstance((state.get("parts") or {}).get(str(n)), str) and
+                   (state.get("parts") or {}).get(str(n), "").strip() for n in (2, 3, 4)):
+            stats["missing_parts"] += 1
+            continue
+        if not {2, 3, 4}.issubset({int(x) for x in state.get("sent", []) if str(x).isdigit()}):
+            stats["missing_sent"] += 1
+            continue
+        if state.get("page6_test_blocked"):
+            stats["blocked"] += 1
+        stats["ready"] += 1
+        if WEB_BACKFILL_EXISTING_TXT and not state.get("auto_publish_eligible"):
+            state["auto_publish_eligible"] = True
+            _save_progress(post_id, state)
+            stats["enabled"] += 1
+    print("[WEB-BACKFILL-SUMMARY] " + " ".join(f"{k}={v}" for k, v in stats.items()), flush=True)
+    return stats
+
+
 def page6_test_recovery_worker():
     # Khôi phục các bài Page 6 đã có checkpoint, không phụ thuộc marker một bài cũ.
     # Chỉ thử tiếp các bài đã gửi đủ 3 TXT, chưa hoàn tất web và chưa bị chặn.
     while True:
         try:
+            _web_backfill_existing_txt_once()
             if os.path.isdir(STORY_PROGRESS_DIR):
                 for filename in os.listdir(STORY_PROGRESS_DIR):
                     if not re.fullmatch(r"[A-Za-z0-9_]+\.json", filename):
                         continue
                     post_id = filename[:-5]
                     state = _load_progress(post_id)
-                    # Khôi phục bài cũ: đã gửi đủ 3 TXT nhưng chưa có link web.
-                    # Chỉ nhận checkpoint có đủ 3 Part hợp lệ + dấu vết Telegram
-                    # đã thông báo, tuyệt đối không gọi OpenAI tạo lại.
-                    if not _web_publish_allowed(_page6_number_for_post(post_id)):
-                        continue
-                    if not all(n in state.get("sent", []) for n in (2, 3, 4)):
-                        continue
-                    parts = state.get("parts") or {}
-                    if not _valid_cached_parts(parts):
-                        print(f"[WEB-BACKFILL-SKIP] {post_id}: checkpoint thiếu Part hợp lệ")
-                        continue
-                    # Với checkpoint cũ, việc đã gửi đủ TXT là chứng cứ xử lý
-                    # trước đó; không phụ thuộc mốc thời gian deploy mới.
-                    if not state.get("auto_publish_eligible"):
-                        state["auto_publish_eligible"] = True
-                        state["web_backfill_from_sent_txt"] = True
-                        _save_progress(post_id, state)
-                        print(f"[WEB-BACKFILL] {post_id}: khôi phục từ 3 TXT đã gửi, không tạo lại truyện", flush=True)
-                    if state.get("web_publish_complete"):
-                        # Trường hợp web đã hoàn tất nhưng Telegram chưa nhận URL.
-                        if not state.get("page6_api_links_sent"):
-                            records = state.get("page6_api_posts") or state.get("page6_chapter_posts") or {}
-                            if all((records.get(str(n)) or {}).get("url") for n in (2, 3, 4)):
-                                msg = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in (2, 3, 4))
-                                if send_telegram_message(msg):
-                                    state["page6_api_links_sent"] = True
-                                    _save_progress(post_id, state)
-                                    print(f"[WEB-BACKFILL-LINKS] {post_id}: gửi lại 3 URL còn thiếu", flush=True)
-                        continue
-                    _page6_try_publish_once(post_id)
+                    if (state.get("auto_publish_eligible")
+                            and _page6_number_for_post(post_id) in WEB_PUBLISH_PAGE_NUMBERS
+                            and not state.get("web_publish_complete")
+                            and all(n in state.get("sent", []) for n in (2, 3, 4))):
+                        _page6_try_publish_once(post_id)
         except Exception as exc:
             print("[PAGE6-TEST] " + str(exc))
         time.sleep(60)
@@ -2864,6 +2866,7 @@ def page6_test_recovery_worker():
 
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
+    print(f"[WEB-CONFIG] enabled={ENABLE_PAGE6_WEB_TEST} pages={sorted(WEB_PUBLISH_PAGE_NUMBERS)} backfill={WEB_BACKFILL_EXISTING_TXT} site={WEB_BASE_URL}", flush=True)
     if PUBLISH_PLATFORM == "wordpress":
         threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
     threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
