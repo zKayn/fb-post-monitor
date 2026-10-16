@@ -21,15 +21,54 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Domain link bài đọc. Có thể ghi nhiều domain trong Railway Variable ARTICLE_LINK_DOMAINS, cách nhau bằng dấu phẩy.
-ARTICLE_LINK_DOMAINS = [
-    d.strip().lower()
-    for d in os.getenv(
-        "ARTICLE_LINK_DOMAINS",
-        "puretales.idolsgift.com,storyly.chosouthrussianovcharka.com"
-    ).split(",")
-    if d.strip()
-]
+# ---------- Danh sách website của team + website đang dùng ----------
+# WEB_SITES: mỗi dòng "link API: token" (ngăn cách bằng xuống dòng hoặc dấu ;), ví dụ:
+#   https://puretales.idolsgift.com/api: qe2hmux...
+#   https://twisttales.idolsgift.com/api: eo4chw3...
+# WEB_API_URL: link của website đang dùng. Muốn đổi web chỉ cần sửa biến này (token tự lấy theo link).
+def _parse_web_sites(raw):
+    sites = {}
+    for item in re.split(r"[\n;]+", raw or ""):
+        item = item.strip()
+        if ":" not in item:
+            continue
+        url, _, token = item.rpartition(":")  # token không chứa dấu ":"
+        url, token = url.strip().rstrip("/"), token.strip()
+        if url.lower().endswith("/api"):
+            url = url[:-4].rstrip("/")
+        host = (urlparse(url).hostname or "").lower()
+        if host and token and url.lower().startswith("https://"):
+            sites[host] = {"base": url, "token": token}
+    return sites
+
+
+WEB_SITES = _parse_web_sites(os.getenv("WEB_SITES", ""))
+
+
+def _resolve_active_site():
+    raw = (os.getenv("WEB_API_URL") or os.getenv("WEB_BASE_URL") or "").strip().rstrip("/")
+    if not raw:
+        return "", ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    if raw.lower().endswith("/api"):
+        raw = raw[:-4].rstrip("/")
+    host = (urlparse(raw).hostname or "").lower()
+    token = (WEB_SITES.get(host) or {}).get("token") or os.getenv("BIOBLOG_API_TOKEN", "").strip()
+    if not token:
+        print(f"[CONFIG-WARN] Không tìm thấy token cho website {host!r}: thêm dòng 'link: token' vào WEB_SITES.", flush=True)
+    return raw, token
+
+
+ACTIVE_WEB_BASE_URL, ACTIVE_WEB_TOKEN = _resolve_active_site()
+
+# Domain link bài đọc: tự gồm mọi website trong WEB_SITES + website đang dùng + ARTICLE_LINK_DOMAINS (nếu có).
+ARTICLE_LINK_DOMAINS = sorted(set(
+    list(WEB_SITES.keys())
+    + ([urlparse(ACTIVE_WEB_BASE_URL).hostname.lower()] if ACTIVE_WEB_BASE_URL else [])
+    + [d.strip().lower() for d in os.getenv(
+        "ARTICLE_LINK_DOMAINS", "storyly.chosouthrussianovcharka.com").split(",") if d.strip()]
+))
 COMMENT_LINK_MAX_PAGES = 5  # quét tối đa 5 trang x 100 comments trước khi báo / gọi OpenAI
 COMMENT_COUNT_MAX_PAGES = 10  # fallback đếm comment thực tế khi summary có thể thấp hơn UI
 COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comment <= 15 để tiết kiệm Graph API
@@ -101,6 +140,34 @@ PAGE_NUMBER_BY_PROFILE_ID = {
     "61591782185355": 15,
 }
 
+# Mỗi người cấu hình Page của riêng mình trong env, không cần sửa code:
+#   PAGE_NUMBERS="Tên Page A=1;Tên Page B=2;..."   (mã số do chủ Page quy định; có biến này thì thay hẳn bảng mặc định)
+#   WEB_PUBLISH_PAGES="6"                           (mã số các Page được tự đăng lên web, cách nhau bằng dấu phẩy; mặc định 6)
+_page_numbers_env = os.getenv("PAGE_NUMBERS", "").strip()
+if _page_numbers_env:
+    PAGE_NUMBER_BY_NAME = {}
+    PAGE_NUMBER_BY_PROFILE_ID = {}
+    for _item in re.split(r"[;\n]+", _page_numbers_env):
+        _name, _, _num = _item.rpartition("=")
+        if _name.strip() and _num.strip().isdigit():
+            PAGE_NUMBER_BY_NAME[_name.strip()] = int(_num.strip())
+# Mặc định "all": mọi Page đã có mã số đều tự đăng web sau khi đủ 3 TXT. Muốn giới hạn: WEB_PUBLISH_PAGES="1,6,15".
+_web_publish_raw = os.getenv("WEB_PUBLISH_PAGES", "all").strip().lower()
+WEB_PUBLISH_ALL_PAGES = _web_publish_raw in ("", "all", "*")
+WEB_PUBLISH_PAGE_NUMBERS = set() if WEB_PUBLISH_ALL_PAGES else {int(x) for x in re.findall(r"\d+", _web_publish_raw)}
+
+
+def _web_publish_allowed(page_number):
+    return page_number is not None and (WEB_PUBLISH_ALL_PAGES or page_number in WEB_PUBLISH_PAGE_NUMBERS)
+
+
+def _page_number_or_none(page_name, page_id):
+    """Như _page_number nhưng trả None nếu Page chưa gán mã (không làm hỏng vòng quét)."""
+    try:
+        return _page_number(page_name, page_id)
+    except ValueError:
+        return None
+
 
 def _page_number(page_name, page_id):
     # Graph API Page ID có thể khác profile.php?id=... trong trình duyệt.
@@ -116,7 +183,7 @@ def _page_number(page_name, page_id):
 
 # --- Page đặc biệt ---
 # Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng.
-SPECIAL_INSTANT_PAGE_IDS = {"1285539704638198"}  # Chỉ Little Girl; Page khác vẫn theo ngưỡng
+SPECIAL_INSTANT_PAGE_IDS = {x for x in re.findall(r"\d+", os.getenv("INSTANT_PAGE_IDS", "1285539704638198"))}  # Mặc định chỉ Little Girl; đổi bằng env INSTANT_PAGE_IDS
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
 # Website: 
@@ -124,12 +191,11 @@ PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đ
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = False  # Chặn luồng web cũ; chỉ test qua API công khai cho Page 6
 SEND_STORY_TXT_TELEGRAM = True  # Giữ gửi đủ ba TXT trên tất cả Page
-WEB_BASE_URL = os.getenv("WEB_BASE_URL", "https://puretales.idolsgift.com").rstrip("/")
+WEB_BASE_URL = ACTIVE_WEB_BASE_URL  # lấy từ WEB_API_URL
 # Chỉ Epic Stories (Page số 6) được phép thử đăng web; tất cả Page khác chỉ TXT.
 # Tắt ngay bằng ENABLE_PAGE6_WEB_TEST=false trên Railway.
-ENABLE_PAGE6_WEB_TEST = os.getenv("ENABLE_PAGE6_WEB_TEST", "false").strip().lower() in ("1", "true", "yes", "on")
-BIOBLOG_API_TOKEN = os.getenv("BIOBLOG_API_TOKEN", "").strip()
-BIOBLOG_AUTHOR_USERNAME = os.getenv("BIOBLOG_AUTHOR_USERNAME", "phi").strip().lstrip("@")
+ENABLE_PAGE6_WEB_TEST = os.getenv("ENABLE_WEB_PUBLISH", os.getenv("ENABLE_PAGE6_WEB_TEST", "false")).strip().lower() in ("1", "true", "yes", "on")  # tên cũ vẫn dùng được
+BIOBLOG_API_TOKEN = ACTIVE_WEB_TOKEN  # token tự lấy theo website đang dùng
 PAGE6_TEST_MARKER = "/data/page6_web_test_one_post.json"
 # Chỉ cho phép khôi phục lỗi validation HTTP 422 permalink thiếu của phiên bản cũ.
 PAGE6_FIX_422_PERMALINK = os.getenv("PAGE6_FIX_422_PERMALINK", "true").strip().lower() in ("true", "1", "yes", "on")
@@ -159,6 +225,11 @@ WEB_UPDATE_METHOD = "PUT"
 AUTHOR_CODE = os.getenv("AUTHOR_CODE", "").strip()
 if not re.fullmatch(r"[0-9A-Za-z_-]{1,16}", AUTHOR_CODE):
     raise ValueError("AUTHOR_CODE không hợp lệ")
+# Server ghép "author" vào cuối slug (slug = permalink + "-" + author).
+# Dùng AUTHOR_CODE làm author để mọi link kết thúc bằng -<AUTHOR_CODE> (ví dụ ...say15-026).
+# Đổi mã cá nhân chỉ cần đổi biến AUTHOR_CODE trên Railway.
+BIOBLOG_AUTHOR_USERNAME = AUTHOR_CODE
+AUTHOR_SLUG_SUFFIX = "-" + re.sub(r"[^a-z0-9]+", "-", AUTHOR_CODE.lower()).strip("-")
 PUBLISH_APPROVAL_POLL_SECONDS = 8
 ENABLE_STORY_CACHE = os.getenv("ENABLE_STORY_CACHE", "true").lower() == "true"
 STORY_CACHE_DIR = "/data/story_cache"
@@ -1057,7 +1128,7 @@ def _resume_story(page_name, post_id, caption):
         _save_progress(post_id, state)
     # Chỉ những bài được worker xác nhận mới sau mốc kích hoạt mới tự xuất bản.
     # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
-    if state.get("auto_publish_eligible") and ENABLE_PAGE6_WEB_TEST and _page6_number_for_post(post_id) == 6:
+    if state.get("auto_publish_eligible") and ENABLE_PAGE6_WEB_TEST and _web_publish_allowed(_page6_number_for_post(post_id)):
         _page6_try_publish_once(post_id)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
@@ -1231,10 +1302,10 @@ def _web_upload_featured_image(session, post_id, page_token):
         raise RuntimeError("API cấp URL upload thiếu upload.url/fileUrl")
     signed_host = (urlparse(signed_url).hostname or "").lower()
     public_host = (urlparse(public_url).hostname or "").lower()
-    if not (signed_host.endswith(".r2.cloudflarestorage.com") and
-            public_host == "blog.igallery.blog" and
+    # Mỗi website có thể dùng kho ảnh khác nhau, nên không gắn cứng domain; chỉ bắt buộc HTTPS.
+    if not (signed_host and public_host and
             urlparse(signed_url).scheme == urlparse(public_url).scheme == "https"):
-        raise RuntimeError("API trả URL ảnh ngoài domain lưu trữ dự kiến")
+        raise RuntimeError("API trả URL ảnh không hợp lệ (thiếu domain hoặc không phải HTTPS)")
     headers = dict(upload.get("headers") or {})
     headers["Content-Type"] = content_type
     # requests tự xác định Content-Length khớp bytes; không chuyển Cookie admin lên R2.
@@ -1446,8 +1517,8 @@ def publish_wordpress_story(post_id):
 
 
 def publish_approved_story(post_id):
-    if _page6_number_for_post(post_id) != 6:
-        raise RuntimeError("Chế độ thử nghiệm chỉ cho phép Epic Stories (Page 6)")
+    if not _web_publish_allowed(_page6_number_for_post(post_id)):
+        raise RuntimeError("Page này chưa được bật đăng web (xem biến WEB_PUBLISH_PAGES)")
     return publish_page6_bioblog_test(post_id)
 
 
@@ -1996,13 +2067,6 @@ def story_worker():
                 except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                     print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
                     continue
-                # Page 6: chỉ nhận bài mới trong cửa sổ test, kể cả đã đăng trước redeploy.
-                # Dành slot trước khi gọi OpenAI để không tốn phí cho nhiều bài test.
-                if ENABLE_PAGE6_WEB_TEST and _page_number(page_name, page_id) == 6:
-                    if age > timedelta(hours=PAGE6_TEST_MAX_AGE_HOURS):
-                        print(f"[PAGE6-TEST] {post_id}: cũ hơn {PAGE6_TEST_MAX_AGE_HOURS} giờ, bỏ qua.")
-                        continue
-                    # Mỗi post_id có checkpoint riêng; không khóa toàn Page vào bài test cũ.
                 # Đã xác nhận bài mới theo thời gian Facebook: đánh dấu đủ điều kiện auto-web.
                 # Lưu trước khi gọi OpenAI để retry/redeploy không mất quyền xử lý.
                 state = _load_progress(post_id)
@@ -2012,10 +2076,13 @@ def story_worker():
                     _save_progress(post_id, state)
                 if notified_key not in already_notified:
                     print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN.")
-                    send_telegram_message(alert_text)
-                    already_notified.add(notified_key)
-                    save_notified(already_notified)
-                    print(f"[ALERT-SENT] {post_id}: đã lưu notified sau khi gửi Telegram.")
+                    if send_telegram_message(alert_text):
+                        already_notified.add(notified_key)
+                        save_notified(already_notified)
+                        print(f"[ALERT-SENT] {post_id}: đã lưu notified sau khi gửi Telegram.")
+                    else:
+                        print(f"[ALERT-FAILED] {post_id}: Telegram lỗi, chưa đánh dấu đã báo.")
+                        continue
                 else:
                     print(f"[WORKER] {post_id}: đã báo trước đó; không báo lặp.")
                 # Khóa được giữ xuyên suốt 3 TXT: không tin Telegram nào từ
@@ -2054,9 +2121,9 @@ def check_all_pages():
         page_token = page["access_token"]
 
         all_post_ids = get_recent_post_ids(page_id, page_token)
-        is_page6_instant = ENABLE_PAGE6_WEB_TEST and _page_number(page_name, page_id) == 6
-        is_special_page = str(page_id) in SPECIAL_INSTANT_PAGE_IDS
-        is_instant_page = is_special_page or is_page6_instant
+        # Chỉ Page đặc biệt (ví dụ Page 15) xử lý ngay khi có bài mới; mọi Page khác vẫn phải đạt ngưỡng.
+        is_special_page = (_page_number_or_none(page_name, page_id) == 15) or (str(page_id) in SPECIAL_INSTANT_PAGE_IDS)
+        is_instant_page = is_special_page
 
         # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
         # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
@@ -2079,11 +2146,6 @@ def check_all_pages():
             and (not is_special_page or str(pid) not in special_baseline_posts)
             and now_mono >= _post_next_check.get(str(pid), 0)
         ]
-
-        if is_page6_instant:
-            # Không lọc theo marker của bài test cũ: nhận mọi bài Page 6 mới.
-            # Chỉ nhận bài trong cửa sổ thời gian ở story_worker.
-            pass
 
         if not post_ids_to_check:
             continue
@@ -2118,7 +2180,7 @@ def check_all_pages():
                     )
                 comments = effective_comments
 
-            poll_seconds = CHECK_INTERVAL_SECONDS if is_page6_instant else _adaptive_poll_seconds(views or 0, comments or 0)
+            poll_seconds = CHECK_INTERVAL_SECONDS if is_special_page else _adaptive_poll_seconds(views or 0, comments or 0)
             _post_next_check[str(post_id)] = time.monotonic() + poll_seconds
             print(
                 f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}"
@@ -2127,13 +2189,13 @@ def check_all_pages():
             )
 
             # Luôn ghi lịch sử views để khi bật công tắc spike đã có baseline 30 phút.
-            # Cảnh báo "BÀI ĐANG DỰNG ĐỨNG" độc lập với ngưỡng BÀI ĐANG LÊN
+            # Cảnh báo spike chỉ dành cho Page 15; các Page khác chỉ báo khi đạt ngưỡng BÀI ĐANG LÊN
             # và chỉ gửi đúng 1 lần/post nhờ key spike_ được lưu persistent.
             spike_detected = record_and_check_spike(post_id, int(views or 0), datetime.now())
 
             spike_key = f"spike_{page_id}_{post_id}"
 
-            if ENABLE_SPIKE_ALERT and spike_detected and spike_key not in already_notified:
+            if ENABLE_SPIKE_ALERT and is_special_page and spike_detected and spike_key not in already_notified:
 
                 # Spike cũng phải kiểm tra link TRƯỚC khi báo Telegram.
 
@@ -2180,8 +2242,7 @@ def check_all_pages():
             if not is_instant_page and not meets_threshold(views or 0, comments or 0):
                 continue
 
-            qualified_reasons = (["Page 6 TEST: bài mới, không cần views/comments"] if is_page6_instant
-                                 else ["Little Girl: bài mới, không cần ngưỡng"] if is_special_page else [])
+            qualified_reasons = (["Page đặc biệt: bài mới, không cần ngưỡng"] if is_special_page else [])
             if (comments or 0) > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
             for rule in THRESHOLD_RULES:
@@ -2274,7 +2335,7 @@ def check_all_pages():
                 changed = True
 
             msg = (
-                f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
+                (f"🆕 BÀI MỚI PAGE 15! (Page: {page_name})\n" if is_special_page else f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n") +
                 f"Views: {views}\n"
                 f"Comments: {comments}\n"
                 + (f"Link: {link}\n" if link else "")
@@ -2332,10 +2393,9 @@ def _page6_permalink(title):
     value = unicodedata.normalize("NFKD", title)
     value = "".join(c for c in value if not unicodedata.combining(c))
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    # AUTHOR_CODE vẫn nằm trong title nhưng KHÔNG nằm trong URL.
-    suffix = "-" + AUTHOR_CODE.lower()
-    if slug.endswith(suffix):
-        slug = slug[:-len(suffix)]
+    # AUTHOR_CODE nằm trong title; bỏ khỏi permalink vì server tự thêm "-<author>" (author = AUTHOR_CODE).
+    if slug.endswith(AUTHOR_SLUG_SUFFIX):
+        slug = slug[:-len(AUTHOR_SLUG_SUFFIX)]
     return slug
 
 
@@ -2377,12 +2437,16 @@ def _page6_bioblog_create(post_id, part, title, content, image_url, permalink):
         raise RuntimeError("BioBlog trả JSON không đúng cấu trúc")
     url = data.get("link") or data.get("frontend_link") or data.get("url") or data.get("public_url")
     slug = data.get("slug")
-    # Link báo Telegram luôn theo dạng https://<domain>/blog/<slug cuối cùng do server tạo>
+    # Ưu tiên link server trả về; thiếu thì ghép https://<domain>/blog/<slug>
     # (server ghép permalink + author thành slug, ví dụ ...-collapse6-026).
-    if slug:
+    if not url and slug:
         url = WEB_BASE_URL + "/blog/" + str(slug).lstrip("/")
     if not url or urlparse(str(url)).netloc != urlparse(WEB_BASE_URL).netloc:
         raise RuntimeError("BioBlog không trả link thuộc domain đã cấu hình; cần kiểm tra thủ công")
+    if slug and not str(slug).endswith(AUTHOR_SLUG_SUFFIX):
+        print(f"[SLUG-WARN] slug server trả {slug!r} không kết thúc bằng {AUTHOR_SLUG_SUFFIX!r}", flush=True)
+        send_error_alert("slug_suffix_mismatch",
+                         f"Slug bài {slug!r} không kết thúc bằng {AUTHOR_SLUG_SUFFIX}. Kiểm tra cách server ghép author vào slug.")
     # API trả id ở trường "postId" (không phải "id").
     return {"id": data.get("postId") or data.get("post_id") or data.get("id"), "slug": slug, "url": str(url),
             "author_sent": BIOBLOG_AUTHOR_USERNAME, "permalink_sent": permalink}
@@ -2462,7 +2526,7 @@ def _page6_publish_chapter_batch(post_id, state):
         title = re.sub(r"(?i)^PART\s*2\s*[:\-–—]?\s*", "", base_title).strip()
         chapters = []
         for n in (2, 3, 4):
-            chapter_title = _web_part_title(base_title, n, 6)
+            chapter_title = _web_part_title(base_title, n, _page6_number_for_post(post_id))
             body = _to_html(_story_body(state["parts"][str(n)], n))
             body += "\n" + _to_html(PART_ENDINGS[n])
             chapters.append(f"CHAPTER {n} - {chapter_title}\n{body}")
@@ -2471,7 +2535,7 @@ def _page6_publish_chapter_batch(post_id, state):
             "title": title,
             "content": content,
             "author": BIOBLOG_AUTHOR_USERNAME,
-            "permalink": _page6_permalink(_web_part_title(base_title, 2, 6)),
+            "permalink": _page6_permalink(_web_part_title(base_title, 2, _page6_number_for_post(post_id))),
             "feature_image": image_url,
             "mode": "chapter",
             "apply_image_to_all": True,
@@ -2502,7 +2566,7 @@ def _page6_publish_chapter_batch(post_id, state):
         _save_progress(post_id, state)
     posts = state["page6_chapter_posts"]
     if not state.get("page6_api_links_sent"):
-        message = "🧪 PAGE 6 / Epic Stories — BioBlog CHAPTER TEST\n" + "\n".join(
+        message = f"🧪 PAGE {_page6_number_for_post(post_id)} — BioBlog CHAPTER TEST\n" + "\n".join(
             f"PART {n}: {posts[str(n)]['url']}" for n in (2, 3, 4))
         message += "\n⚠️ Kiểm tra nút Previous/Next trên giao diện BioBlog trước khi bật chính thức."
         if not send_telegram_message(message):
@@ -2518,12 +2582,13 @@ def _page6_publish_chapter_batch(post_id, state):
 def publish_page6_bioblog_test(post_id):
     if not ENABLE_PAGE6_WEB_TEST:
         raise RuntimeError("ENABLE_PAGE6_WEB_TEST chưa bật")
-    if _page6_number_for_post(post_id) != 6:
-        raise RuntimeError("Chỉ Page 6 (Epic Stories) được thử đăng web")
+    page_number = _page6_number_for_post(post_id)
+    if not _web_publish_allowed(page_number):
+        raise RuntimeError("Page này chưa được bật đăng web (xem biến WEB_PUBLISH_PAGES)")
     if not WEB_BASE_URL.startswith("https://"):
         raise RuntimeError("WEB_BASE_URL phải là HTTPS")
-    if not BIOBLOG_API_TOKEN or not BIOBLOG_AUTHOR_USERNAME:
-        raise RuntimeError("Thiếu BIOBLOG_API_TOKEN hoặc BIOBLOG_AUTHOR_USERNAME")
+    if not BIOBLOG_API_TOKEN:
+        raise RuntimeError("Thiếu BIOBLOG_API_TOKEN")
     state = _load_progress(post_id)
     if not state.get("auto_publish_eligible"):
         raise RuntimeError("Checkpoint chưa xác nhận bài mới đủ điều kiện")
@@ -2534,8 +2599,8 @@ def publish_page6_bioblog_test(post_id):
     # Bài đã đăng bằng normal mode (dù chỉ Part 4) không được tự chuyển mode.
     legacy_posts = state.get("page6_api_posts") or {}
     if PAGE6_CHAPTER_MODE:
-        if not BIOBLOG_API_TOKEN or not BIOBLOG_AUTHOR_USERNAME:
-            raise RuntimeError("Thiếu BIOBLOG_API_TOKEN hoặc BIOBLOG_AUTHOR_USERNAME")
+        if not BIOBLOG_API_TOKEN:
+            raise RuntimeError("Thiếu BIOBLOG_API_TOKEN")
         if state.get("web_publish_complete"):
             print(f"[PAGE6-TEST] {post_id}: đã hoàn tất, bỏ qua")
             return True
@@ -2556,7 +2621,7 @@ def publish_page6_bioblog_test(post_id):
     _save_progress(post_id, state)
     posts = state["page6_api_posts"]
     base_title = _story_title(state["parts"]["2"])
-    titles = {n: _web_part_title(base_title, n, 6) for n in (2, 3, 4)}
+    titles = {n: _web_part_title(base_title, n, page_number) for n in (2, 3, 4)}
     # Slug nguồn như bản đầu: theo tiêu đề, bỏ hậu tố AUTHOR_CODE (server ghép author vào slug cuối).
     slugs = {n: _page6_permalink(titles[n]) for n in (2, 3, 4)}
     if len(set(slugs.values())) != 3:
@@ -2665,8 +2730,25 @@ def publish_page6_bioblog_test(post_id):
             _save_progress(post_id, state)
     return True
 
+_web_publishing_now = set()
+_web_publishing_mutex = threading.Lock()
+
+
 def _page6_try_publish_once(post_id):
-    if not ENABLE_PAGE6_WEB_TEST or _page6_number_for_post(post_id) != 6:
+    """Mỗi bài chỉ được một luồng đăng web tại một thời điểm (tránh đăng trùng giữa worker và luồng khôi phục)."""
+    with _web_publishing_mutex:
+        if str(post_id) in _web_publishing_now:
+            return False
+        _web_publishing_now.add(str(post_id))
+    try:
+        return _page6_try_publish_once_unlocked(post_id)
+    finally:
+        with _web_publishing_mutex:
+            _web_publishing_now.discard(str(post_id))
+
+
+def _page6_try_publish_once_unlocked(post_id):
+    if not ENABLE_PAGE6_WEB_TEST or not _web_publish_allowed(_page6_number_for_post(post_id)):
         return False
     state = _load_progress(post_id)
     if state.get("web_publish_complete"):
@@ -2736,7 +2818,7 @@ def page6_test_recovery_worker():
                     post_id = filename[:-5]
                     state = _load_progress(post_id)
                     if (state.get("auto_publish_eligible")
-                            and _page6_number_for_post(post_id) == 6
+                            and _web_publish_allowed(_page6_number_for_post(post_id))
                             and not state.get("web_publish_complete")
                             and all(n in state.get("sent", []) for n in (2, 3, 4))):
                         _page6_try_publish_once(post_id)
