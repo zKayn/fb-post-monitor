@@ -228,7 +228,12 @@ if not re.fullmatch(r"[0-9A-Za-z_-]{1,16}", AUTHOR_CODE):
 # Server ghép "author" vào cuối slug (slug = permalink + "-" + author).
 # Dùng AUTHOR_CODE làm author để mọi link kết thúc bằng -<AUTHOR_CODE> (ví dụ ...say15-026).
 # Đổi mã cá nhân chỉ cần đổi biến AUTHOR_CODE trên Railway.
-BIOBLOG_AUTHOR_USERNAME = AUTHOR_CODE
+# author gửi lên API phải là USERNAME của tài khoản người đăng trên web (cột Username, không có @), ví dụ "phi".
+# Nếu không khớp, bài bị gán cho tài khoản chủ token. Slug lấy từ tiêu đề (đã chứa mã số AUTHOR_CODE).
+AUTHOR_USERNAME = (os.getenv("AUTHOR_USERNAME", "").strip().lstrip("@") or AUTHOR_CODE)
+if not re.fullmatch(r"[0-9A-Za-z_.-]{1,40}", AUTHOR_USERNAME):
+    raise ValueError("AUTHOR_USERNAME không hợp lệ")
+BIOBLOG_AUTHOR_USERNAME = AUTHOR_USERNAME
 AUTHOR_SLUG_SUFFIX = "-" + re.sub(r"[^a-z0-9]+", "-", AUTHOR_CODE.lower()).strip("-")
 PUBLISH_APPROVAL_POLL_SECONDS = 8
 ENABLE_STORY_CACHE = os.getenv("ENABLE_STORY_CACHE", "true").lower() == "true"
@@ -2390,9 +2395,7 @@ def _page6_permalink(title):
     value = unicodedata.normalize("NFKD", title)
     value = "".join(c for c in value if not unicodedata.combining(c))
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    # AUTHOR_CODE nằm trong title; bỏ khỏi permalink vì server tự thêm "-<author>" (author = AUTHOR_CODE).
-    if slug.endswith(AUTHOR_SLUG_SUFFIX):
-        slug = slug[:-len(AUTHOR_SLUG_SUFFIX)]
+    # Slug lấy thẳng từ tiêu đề (đã gồm mã Page + AUTHOR_CODE, ví dụ ...door15-026).
     return slug
 
 
@@ -2442,13 +2445,31 @@ def _page6_bioblog_create(post_id, part, title, content, image_url, permalink, p
         url = WEB_BASE_URL + "/blog/" + str(slug).lstrip("/")
     if not url or urlparse(str(url)).netloc != urlparse(WEB_BASE_URL).netloc:
         raise RuntimeError("BioBlog không trả link thuộc domain đã cấu hình; cần kiểm tra thủ công")
-    if slug and not str(slug).endswith(AUTHOR_SLUG_SUFFIX):
-        print(f"[SLUG-WARN] slug server trả {slug!r} không kết thúc bằng {AUTHOR_SLUG_SUFFIX!r}", flush=True)
-        send_error_alert("slug_suffix_mismatch",
-                         f"Slug bài {slug!r} không kết thúc bằng {AUTHOR_SLUG_SUFFIX}. Kiểm tra cách server ghép author vào slug.")
+    print(f"[SLUG] permalink gửi={permalink!r}, slug server trả={slug!r}", flush=True)
     # API trả id ở trường "postId" (không phải "id").
     return {"id": data.get("postId") or data.get("post_id") or data.get("id"), "slug": slug, "url": str(url),
             "author_sent": BIOBLOG_AUTHOR_USERNAME, "permalink_sent": permalink}
+
+
+def _page6_check_author(post_id, rec):
+    """Kiểm tra (chỉ đọc) bài thuộc đúng tài khoản. API: author phải là USERNAME có sẵn trên web, nếu không
+    bài bị gán cho tài khoản chủ token và người làm sẽ KHÔNG thấy bài trong tài khoản của mình."""
+    try:
+        resp = requests.get(WEB_BASE_URL + "/api/posts/" + str(rec["slug"]).lstrip("/"),
+            headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN, "Accept": "application/json"}, timeout=40)
+        obj = resp.json() if resp.status_code == 200 else {}
+        data = obj.get("data", obj) if isinstance(obj, dict) else {}
+        if isinstance(data, dict) and isinstance(data.get("post"), dict):
+            data = data["post"]
+        author = data.get("author") if isinstance(data, dict) else None
+        print(f"[AUTHOR-CHECK] {post_id}: gửi author={BIOBLOG_AUTHOR_USERNAME!r}, server ghi author={author!r}", flush=True)
+        uname = author.get("username") if isinstance(author, dict) else (author if isinstance(author, str) else None)
+        if uname and str(uname).strip().lstrip("@").lower() != AUTHOR_USERNAME.lower():
+            send_error_alert("author_mismatch",
+                f"Bài đăng lên web đang thuộc tài khoản {uname!r}, KHÔNG phải {AUTHOR_USERNAME!r}. "
+                f"Kiểm tra biến AUTHOR_USERNAME phải đúng cột Username của tài khoản bạn trên web.")
+    except Exception as exc:
+        print(f"[AUTHOR-CHECK] {post_id}: không kiểm tra được: {exc}", flush=True)
 
 
 def _page6_bioblog_lookup_id(slug):
@@ -2673,52 +2694,14 @@ def publish_page6_bioblog_test(post_id):
     if len(set(actual_urls.values())) != 3:
         raise RuntimeError("Ba chương có URL trùng; dừng liên kết")
 
-    # Previous đã nối ngay khi tạo (prev_chapter). Bước dưới chỉ bổ sung Next + nút điều hướng qua admin API;
-    # nếu lỗi (Cloudflare/id) vẫn gửi đủ 3 link, KHÔNG tạo lại bài.
-    nav_error = None
-    try:
-        # Bổ sung id còn thiếu qua GET /api/posts/{slug} (chỉ đọc), rồi lưu checkpoint.
-        id_error = None
-        for n in (2, 3, 4):
-            rec = posts[str(n)]
-            if rec.get("id"):
-                continue
-            try:
-                rec["id"] = _page6_bioblog_lookup_id(rec["slug"])
-                _save_progress(post_id, state)
-                print(f"[PAGE6-NAV] {post_id}: lấy id Part {n} qua slug -> {rec['id']}", flush=True)
-            except Exception as exc:
-                id_error = exc
-                break
-        if id_error is not None:
-            raise RuntimeError(f"Không lấy được id để nối chương: {id_error}")
-
-        # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4 (PUT prev_chapter/next_chapter + nav HTML).
-        linked = state.setdefault("page6_linked_parts", [])
-        for n in (2, 3, 4):
-            if n in linked:
-                continue
-            prev_slug = posts[str(n - 1)]["slug"] if n > 2 else ""
-            next_slug = posts[str(n + 1)]["slug"] if n < 4 else ""
-            body = _base_body(n) + "\n" + _page6_navigation(n, actual_urls)
-            print(f"[PAGE6-NAV] {post_id}: PUT Part {n} prev={prev_slug!r} next={next_slug!r}", flush=True)
-            _web_update_chapter(session, posts[str(n)], titles[n], body, image_url,
-                                prev_slug=prev_slug, next_slug=next_slug)
-            linked.append(n)
-            _save_progress(post_id, state)
-            print(f"[PAGE6-TEST] {post_id}: đã nối Part {n}: prev={prev_slug!r} next={next_slug!r}", flush=True)
-
-
-    except Exception as exc:
-        nav_error = exc
-        print(f"[PAGE6-NAV] {post_id}: lỗi nối Next/nút điều hướng (Previous đã nối qua API): {exc}", flush=True)
+    # Chuỗi chương do SERVER tự đồng bộ 2 chiều: gửi prev_chapter=slug bài trước khi tạo thì bài trước
+    # tự có next_chapter trỏ lại (theo tài liệu API). Không cần PUT admin nữa.
+    _page6_check_author(post_id, posts["2"])
 
     # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và nối chương xong.
     # Lưu checkpoint để retry/redeploy không gửi lại.
     if not state.get("page6_api_links_sent"):
         message = "\n".join(f"PART {n}: {actual_urls[n]}" for n in (2, 3, 4))
-        if nav_error is not None:
-            message += "\n⚠️ Previous đã nối; chưa nối được Next (admin API lỗi)."
         if send_telegram_message(message) is False:
             raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
         state["page6_api_links_sent"] = True
