@@ -2696,6 +2696,16 @@ def publish_page6_bioblog_test(post_id):
                 _save_progress(post_id, state)
         raise RuntimeError(f"Không lấy được id để nối chương: {id_error}")
 
+    # Gửi link ngay khi ba bài đã có URL; không phụ thuộc API PUT nối chương.
+    # Checkpoint tránh gửi trùng khi retry/redeploy; giữ nguyên toàn bộ logic đăng web ổn định.
+    if not state.get("page6_api_links_sent"):
+        message = "\n".join(f"PART {n}: {actual_urls[n]}" for n in (2, 3, 4))
+        if send_telegram_message(message) is False:
+            raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
+        state["page6_api_links_sent"] = True
+        _save_progress(post_id, state)
+        print(f"[PAGE6-LINKS] {post_id}: đã gửi đủ 3 URL, tiếp tục nối chương riêng", flush=True)
+
     # Liên kết đủ 2 chiều Part 2 <-> Part 3 <-> Part 4 (PUT prev_chapter/next_chapter + nav HTML).
     linked = state.setdefault("page6_linked_parts", [])
     for n in (2, 3, 4):
@@ -2817,11 +2827,36 @@ def page6_test_recovery_worker():
                         continue
                     post_id = filename[:-5]
                     state = _load_progress(post_id)
-                    if (state.get("auto_publish_eligible")
-                            and _web_publish_allowed(_page6_number_for_post(post_id))
-                            and not state.get("web_publish_complete")
-                            and all(n in state.get("sent", []) for n in (2, 3, 4))):
-                        _page6_try_publish_once(post_id)
+                    # Khôi phục bài cũ: đã gửi đủ 3 TXT nhưng chưa có link web.
+                    # Chỉ nhận checkpoint có đủ 3 Part hợp lệ + dấu vết Telegram
+                    # đã thông báo, tuyệt đối không gọi OpenAI tạo lại.
+                    if not _web_publish_allowed(_page6_number_for_post(post_id)):
+                        continue
+                    if not all(n in state.get("sent", []) for n in (2, 3, 4)):
+                        continue
+                    parts = state.get("parts") or {}
+                    if not _valid_cached_parts(parts):
+                        print(f"[WEB-BACKFILL-SKIP] {post_id}: checkpoint thiếu Part hợp lệ")
+                        continue
+                    # Với checkpoint cũ, việc đã gửi đủ TXT là chứng cứ xử lý
+                    # trước đó; không phụ thuộc mốc thời gian deploy mới.
+                    if not state.get("auto_publish_eligible"):
+                        state["auto_publish_eligible"] = True
+                        state["web_backfill_from_sent_txt"] = True
+                        _save_progress(post_id, state)
+                        print(f"[WEB-BACKFILL] {post_id}: khôi phục từ 3 TXT đã gửi, không tạo lại truyện", flush=True)
+                    if state.get("web_publish_complete"):
+                        # Trường hợp web đã hoàn tất nhưng Telegram chưa nhận URL.
+                        if not state.get("page6_api_links_sent"):
+                            records = state.get("page6_api_posts") or state.get("page6_chapter_posts") or {}
+                            if all((records.get(str(n)) or {}).get("url") for n in (2, 3, 4)):
+                                msg = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in (2, 3, 4))
+                                if send_telegram_message(msg):
+                                    state["page6_api_links_sent"] = True
+                                    _save_progress(post_id, state)
+                                    print(f"[WEB-BACKFILL-LINKS] {post_id}: gửi lại 3 URL còn thiếu", flush=True)
+                        continue
+                    _page6_try_publish_once(post_id)
         except Exception as exc:
             print("[PAGE6-TEST] " + str(exc))
         time.sleep(60)
