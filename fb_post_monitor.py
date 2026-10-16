@@ -105,7 +105,7 @@ Requirements:
 PART_ENDINGS = {
     2: '-END OF PART 2, –PRESS NEX PART IN BOTTOM OF PAGE TO READ NEXT PART',
     3: '-END OF PART 3–PRESS NEX PART IN BOTTOM OF PAGE TO READ NEXT PART',
-    4: '- END OF PART 4 ​​- LET SAY YES AND LIKE, SHARE THIS POST IN FACEBOOK SO THAT WE HAVE THE MOTIVATION TO SHARE MORE STORIES',
+    4: '- END OF PART 4 - LET SAY YES AND LIKE, SHARE THIS POST IN FACEBOOK SO THAT WE HAVE THE MOTIVATION TO SHARE MORE STORIES',
 }
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
@@ -235,8 +235,7 @@ AUTHOR_USERNAME = (os.getenv("AUTHOR_USERNAME", "").strip().lstrip("@") or AUTHO
 if not re.fullmatch(r"[0-9A-Za-z_.-]{1,40}", AUTHOR_USERNAME):
     raise ValueError("AUTHOR_USERNAME không hợp lệ")
 BIOBLOG_AUTHOR_USERNAME = AUTHOR_USERNAME
-# Server tự thêm "-<author>" vào cuối slug; permalink gửi lên phải bỏ đoạn đó để mã số không bị lặp (...door15-026, không phải ...-026-026).
-AUTHOR_SLUG_SUFFIX = "-" + re.sub(r"[^a-z0-9]+", "-", AUTHOR_USERNAME.lower()).strip("-")
+AUTHOR_SLUG_SUFFIX = "-" + re.sub(r"[^a-z0-9]+", "-", AUTHOR_CODE.lower()).strip("-")
 PUBLISH_APPROVAL_POLL_SECONDS = 8
 ENABLE_STORY_CACHE = os.getenv("ENABLE_STORY_CACHE", "true").lower() == "true"
 STORY_CACHE_DIR = "/data/story_cache"
@@ -2423,9 +2422,12 @@ def _page6_permalink(title):
     value = unicodedata.normalize("NFKD", title)
     value = "".join(c for c in value if not unicodedata.combining(c))
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    # Slug lấy từ tiêu đề; bỏ đuôi trùng với username vì server tự thêm "-<author>" (tránh lặp mã số).
-    if slug.endswith(AUTHOR_SLUG_SUFFIX):
-        slug = slug[:-len(AUTHOR_SLUG_SUFFIX)]
+    # Slug lấy thẳng từ tiêu đề (đã gồm mã Page + AUTHOR_CODE, ví dụ ...door15-026).
+    # Server tự ghép "-<username>" vào cuối. Nếu username chính là mã nhân viên (ví dụ 026)
+    # thì bỏ mã ở cuối permalink để link không bị lặp "...-026-026" mà thành "...door15-026".
+    author = re.sub(r"[^a-z0-9]+", "-", AUTHOR_USERNAME.lower()).strip("-")
+    if author and slug.endswith("-" + author):
+        slug = slug[: -len(author) - 1]
     return slug
 
 
@@ -2434,10 +2436,17 @@ def _page6_navigation(part, urls):
     if part > 2:
         links.append((f"PREVIOUS: PART {part-1}", urls[part-1]))
     if part < 4:
-        links.append(("NEXT: PART 4 (THE END)" if part == 3 else "NEXT: PART 3", urls[part+1]))
+        links.append(("NEXT: PART 4(THE END)" if part == 3 else "NEXT: PART 3", urls[part+1]))
     return ('<hr><nav aria-label="Story chapters">' + ' | '.join(
         '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
         for label, url in links) + '</nav>') if links else ''
+
+
+def _bioblog_predicted_url(permalink):
+    """Đoán trước link bài: server ghép slug = permalink + "-" + author (ví dụ ...-026-phi).
+    Dùng để chèn link PREVIOUS/NEXT vào nội dung ngay lúc tạo; sau khi tạo xong sẽ đối chiếu với link thật."""
+    author = re.sub(r"[^a-z0-9]+", "-", AUTHOR_USERNAME.lower()).strip("-")
+    return f"{WEB_BASE_URL}/blog/{permalink}-{author}"
 
 
 def _page6_nav_html(links):
@@ -2709,10 +2718,14 @@ def publish_page6_bioblog_test(post_id):
         prev_slug = posts[str(n - 1)]["slug"] if n > 2 else ""
         if n > 2 and not prev_slug:
             raise RuntimeError(f"Part {n-1} thiếu slug để làm prev_chapter")
-        body = _base_body(n)
+        # Link chữ PREVIOUS/NEXT cuối bài (như "PREVIOUS: PART 2 | NEXT: PART 4(THE END)"):
+        # Part đã tạo thì dùng link thật, Part chưa tạo thì dùng link đoán trước theo quy tắc slug.
+        nav_urls = {m: (posts.get(str(m)) or {}).get("url") or _bioblog_predicted_url(slugs[m]) for m in (2, 3, 4)}
+        body = _base_body(n) + "\n" + _page6_navigation(n, nav_urls)
         posts[k] = {"request_started": True, "started_at": datetime.now(timezone.utc).isoformat()}
         _save_progress(post_id, state)
         result = _page6_bioblog_create(post_id, n, titles[n], body, image_url, slugs[n], prev_slug)
+        result["nav_used"] = {str(m): nav_urls[m] for m in (2, 3, 4) if m != n}
         posts[k] = result
         _save_progress(post_id, state)
         print(f"[PAGE6-TEST] {post_id}: đã đăng Part {n}: {result.get('url')} id={result.get('id')} slug={result.get('slug')}", flush=True)
@@ -2724,6 +2737,8 @@ def publish_page6_bioblog_test(post_id):
     actual_urls = {n: posts[str(n)]["url"] for n in (2, 3, 4)}
     if len(set(actual_urls.values())) != 3:
         raise RuntimeError("Ba chương có URL trùng; dừng liên kết")
+
+    _page6_fix_text_nav(post_id, state, titles, image_url, _base_body)
 
     # Chuỗi chương do SERVER tự đồng bộ 2 chiều: gửi prev_chapter=slug bài trước khi tạo thì bài trước
     # tự có next_chapter trỏ lại (theo tài liệu API). Không cần PUT admin nữa.
@@ -2747,6 +2762,43 @@ def publish_page6_bioblog_test(post_id):
             state["page6_422_recovery_notified"] = True
             _save_progress(post_id, state)
     return True
+
+def _page6_fix_text_nav(post_id, state, titles, image_url, base_body):
+    """Đối chiếu link PREVIOUS/NEXT đã chèn với link thật. Nếu web đặt slug khác dự đoán (ví dụ trùng tên),
+    thử sửa nội dung qua trang quản trị; không sửa được thì báo Telegram để sửa tay. Không tạo lại bài."""
+    if state.get("page6_text_nav_checked"):
+        return
+    posts = state["page6_api_posts"]
+    actual = {m: posts[str(m)]["url"] for m in (2, 3, 4)}
+    wrong = []
+    for n in (2, 3, 4):
+        used = posts[str(n)].get("nav_used")
+        if not used:
+            continue  # bài tạo từ bản cũ, chưa có link chữ
+        needed = [m for m in ((n - 1,) if n > 2 else ()) + ((n + 1,) if n < 4 else ())]
+        if any(used.get(str(m)) != actual[m] for m in needed):
+            wrong.append(n)
+    if wrong:
+        print(f"[TEXT-NAV] {post_id}: link chữ sai ở Part {wrong}; thử sửa qua trang quản trị", flush=True)
+        try:
+            session = _web_login()
+            for n in wrong:
+                rec = posts[str(n)]
+                if not rec.get("id"):
+                    rec["id"] = _page6_bioblog_lookup_id(rec["slug"])
+                _web_update_chapter(session, rec, titles[n], base_body(n) + "\n" + _page6_navigation(n, actual), image_url,
+                                    prev_slug=posts[str(n - 1)]["slug"] if n > 2 else "",
+                                    next_slug=posts[str(n + 1)]["slug"] if n < 4 else "")
+                rec["nav_used"] = {str(m): actual[m] for m in (2, 3, 4) if m != n}
+                _save_progress(post_id, state)
+        except Exception as exc:
+            send_error_alert("text_nav_wrong",
+                f"Bài {post_id}: link chữ PREVIOUS/NEXT ở Part {', '.join(map(str, wrong))} có thể trỏ sai "
+                f"(web đặt link khác dự đoán) và không tự sửa được: {str(exc)[:200]}. "
+                f"Link đúng: " + " | ".join(f"PART {m}: {actual[m]}" for m in (2, 3, 4)))
+    state["page6_text_nav_checked"] = True
+    _save_progress(post_id, state)
+
 
 _web_publishing_now = set()
 _web_publishing_mutex = threading.Lock()
