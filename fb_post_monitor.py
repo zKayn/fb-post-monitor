@@ -580,6 +580,7 @@ def _send_telegram_document_unlocked(file_path: str, caption: str = ""):
             with open(file_path, "rb") as f:
                 resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}, files={"document": f}, timeout=180)
             if resp.status_code == 200:
+                resolve_error_alert("telegram_document_failed", "Gửi file TXT qua Telegram đã hoạt động lại.")
                 return True
             last_error = f"HTTP {resp.status_code}: {resp.text[:1000]}"
         except Exception as e:
@@ -864,6 +865,9 @@ def generate_valid_part(story_context: str, part_number: int):
 
     ok, reason = _validate_part(raw, part_number)
     if ok:
+        resolve_error_alert(f"openai_api_part_{part_number}_failed", f"OpenAI đã viết được Part {part_number} trở lại.")
+        resolve_error_alert(f"openai_part_{part_number}_generation_failed", f"Đã tạo được Part {part_number}.")
+        resolve_error_alert(f"openai_part_{part_number}_validation_failed", f"Part {part_number} đã đạt kiểm tra nội dung.")
         print(f"[OPENAI] Part {part_number} validation: {reason}")
         return raw
 
@@ -1106,6 +1110,8 @@ def _resume_story(page_name, post_id, caption):
         _page6_try_publish_once(post_id)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
+    resolve_error_alert("story_resume_" + str(post_id), f"Bài {post_id} đã gửi đủ 3 file TXT.")
+    resolve_error_alert(f"worker_{post_id}", f"Bài {post_id} đã xử lý xong.")
     print(f"[OPENAI] Bài {post_id}: đã hoàn tất Part 2/3/4, không tạo lại.")
     return True
 
@@ -1546,26 +1552,141 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
                 print(f"[STORY] Không lưu được lịch thử lại {post_id}: {exc}")
 
 
-ERROR_COOLDOWN_MINUTES = 30
-_last_error_sent_at = {}
+# ==================== BÁO LỖI TELEGRAM ====================
+# Mỗi lỗi chỉ báo MỘT lần khi phát sinh (kể cả sau khi restart/redeploy).
+# Khi lỗi được sửa: báo "✅ ĐÃ KHẮC PHỤC" một lần. Nếu sau đó lỗi xảy ra lại thì mới báo lại.
+ERROR_STATUS_FILE = "/data/error_status.json"
+_ERROR_LOCK = threading.RLock()
+
+
+def _load_error_status():
+    try:
+        with open(ERROR_STATUS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError, TypeError):
+        pass
+    # Lần đầu chạy bản mới: lỗi đã báo ở bản cũ coi như đang mở (không báo lại),
+    # đánh dấu "legacy" để khi hết lỗi thì đóng im lặng, không gửi tin khắc phục cho lỗi cũ.
+    return {k: "legacy" for k in error_once_keys if not str(k).startswith("recovered_")}
+
+
+_error_status = _load_error_status()
+
+
+def _save_error_status():
+    try:
+        os.makedirs(os.path.dirname(ERROR_STATUS_FILE), exist_ok=True)
+        tmp = ERROR_STATUS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_error_status, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ERROR_STATUS_FILE)
+    except OSError as exc:
+        print(f"[CẢNH BÁO] Không lưu được trạng thái lỗi: {exc}")
+
+
+def _mask_secrets(text):
+    """Không bao giờ để lộ token/key trong tin Telegram hay log."""
+    text = str(text)
+    text = re.sub(r"(access_token=|input_token=)[^&\s\"']+", r"\1***", text)
+    text = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1***", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_\-]{10,}", "sk-***", text)
+    text = re.sub(r"\bEAA[A-Za-z0-9]{20,}", "EAA***", text)
+    text = re.sub(r"bot\d{6,}:[A-Za-z0-9_\-]{20,}", "bot***", text)
+    return text
 
 
 def send_error_alert(error_key: str, text: str):
-    now = datetime.now()
-    # Chỉ gửi một lần cho mỗi loại lỗi, kể cả sau khi restart.
-    error_key = re.sub(r"\b\d{10,}_\d{10,}\b", "POST_ID", error_key)
-    if error_key in error_once_keys:
-        return
-    last_sent = _last_error_sent_at.get(error_key)
-    if last_sent and (now - last_sent).total_seconds() < ERROR_COOLDOWN_MINUTES * 60:
-        return
-    send_telegram_message(f"⚠️ LỖI SCRIPT!\n{text}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
-    _last_error_sent_at[error_key] = now
-    error_once_keys.add(error_key)
-    try:
-        _save_keys(ERROR_ONCE_FILE, error_once_keys)
-    except OSError as exc:
-        print(f"[CẢNH BÁO] Không lưu được error-once: {exc}")
+    error_key = str(error_key)
+    with _ERROR_LOCK:
+        if _error_status.get(error_key) in ("active", "legacy"):
+            print(f"[LỖI-ĐÃ-BÁO] {error_key}: {_mask_secrets(text)[:300]}")
+            return False
+        now = datetime.now()
+        message = f"⚠️ LỖI SCRIPT!\n{_mask_secrets(text)}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}"
+        if not send_telegram_message(message):
+            print(f"[CẢNH BÁO] Gửi báo lỗi {error_key} chưa thành công; sẽ thử lại lần lỗi sau.")
+            return False
+        _error_status[error_key] = "active"
+        _save_error_status()
+        return True
+
+
+def resolve_error_alert(error_key: str, description: str = ""):
+    """Gọi khi phần việc đó chạy lại bình thường. Chỉ gửi tin nếu lỗi từng được báo."""
+    error_key = str(error_key)
+    with _ERROR_LOCK:
+        state = _error_status.get(error_key)
+        if state not in ("active", "legacy"):
+            return False
+        if state == "active":
+            now = datetime.now()
+            text = f"✅ ĐÃ KHẮC PHỤC: {_mask_secrets(description or error_key)}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}"
+            if not send_telegram_message(text):
+                return False
+        _error_status.pop(error_key, None)
+        _save_error_status()
+        return True
+
+
+def resolve_error_prefix(prefix: str, description: str):
+    """Đóng mọi lỗi có mã bắt đầu bằng prefix (ví dụ các lỗi riêng của một bài)."""
+    for key in [k for k in list(_error_status) if k.startswith(prefix)]:
+        resolve_error_alert(key, description)
+
+
+# ==================== CHI TIẾT LỖI FACEBOOK ====================
+_FB_ERROR_HINTS = {
+    190: "Token hết hạn hoặc không còn hợp lệ — lấy token mới và cập nhật USER_ACCESS_TOKEN.",
+    102: "Phiên đăng nhập Facebook hết hạn — lấy token mới.",
+    10: "Thiếu quyền — token chưa được cấp quyền cần thiết cho Page này.",
+    200: "Thiếu quyền — tài khoản có thể không còn quyền quản lý Page này.",
+    100: "Facebook không cho đọc Page này — kiểm tra tài khoản còn quyền quản lý Page, Page có bị hạn chế/ẩn/xóa không.",
+    368: "Page hoặc tài khoản đang bị Facebook tạm chặn tính năng.",
+    4: "Gọi API quá nhiều (giới hạn của ứng dụng) — bot sẽ tự thử lại.",
+    17: "Gọi API quá nhiều (giới hạn của tài khoản) — bot sẽ tự thử lại.",
+    32: "Gọi API quá nhiều cho Page này — bot sẽ tự thử lại.",
+    613: "Gọi API quá nhiều — bot sẽ tự thử lại.",
+    80001: "Gọi API quá nhiều cho Page này — bot sẽ tự thử lại.",
+}
+_FB_SUBCODE_HINTS = {
+    458: "Ứng dụng đã bị gỡ khỏi tài khoản.",
+    459: "Tài khoản Facebook đang bị checkpoint — đăng nhập Facebook để xác minh.",
+    460: "Mật khẩu Facebook đã đổi — lấy token mới.",
+    463: "Token đã hết hạn — lấy token mới.",
+    464: "Tài khoản chưa xác minh.",
+    467: "Token không hợp lệ (đã đăng xuất hoặc bị thu hồi) — lấy token mới.",
+    492: "Tài khoản không còn vai trò hợp lệ trên Page.",
+}
+
+
+def _fb_error_detail(resp=None, data=None):
+    """Lấy lý do lỗi Facebook trả về (message, code, subcode) + gợi ý cách sửa bằng tiếng Việt."""
+    if data is None and resp is not None:
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+    err = (data or {}).get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        status = getattr(resp, "status_code", "?")
+        body = (getattr(resp, "text", "") or "")[:200]
+        return f"HTTP {status}: {_mask_secrets(body) or 'không có nội dung'}"
+    code, sub = err.get("code"), err.get("error_subcode")
+    parts = [f"Facebook báo: {_mask_secrets(err.get('message', 'không rõ'))}"]
+    parts.append(f"(code={code}" + (f", subcode={sub}" if sub else "") + (f", type={err.get('type')}" if err.get("type") else "") + ")")
+    hint = _FB_SUBCODE_HINTS.get(sub) or _FB_ERROR_HINTS.get(code)
+    if hint:
+        parts.append(f"\n👉 Cách xử lý: {hint}")
+    return " ".join(parts)
+
+
+def _page_label(page_id):
+    page = next((p for p in (_managed_pages_cache.get("pages") or []) if str(p.get("id")) == str(page_id)), None)
+    return f"{page.get('name')} ({page_id})" if page and page.get("name") else str(page_id)
 
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
@@ -1581,6 +1702,8 @@ def check_token_expiry():
         print(f"[CẢNH BÁO] Không kiểm tra được hạn token: {e}")
         return
 
+    if data.get("is_valid", True):
+        resolve_error_alert("token_invalid", "USER_ACCESS_TOKEN đã hợp lệ trở lại.")
     if not data.get("is_valid", True):
         send_error_alert(
             "token_invalid",
@@ -1595,6 +1718,8 @@ def check_token_expiry():
 
     expire_dt = datetime.fromtimestamp(expires_at)
     days_left = (expire_dt - datetime.now()).days
+    if days_left > TOKEN_EXPIRY_WARNING_DAYS:
+        resolve_error_alert("token_expiry_warning", "USER_ACCESS_TOKEN đã được gia hạn.")
     if days_left <= TOKEN_EXPIRY_WARNING_DAYS:
         send_error_alert(
             "token_expiry_warning",
@@ -1611,31 +1736,21 @@ _fb_network_failures = {}
 _fb_network_alerted = set()
 
 def note_fb_network_failure(error_key: str, text: str):
-    """Chỉ Telegram sau 3 vòng lỗi liên tiếp; lỗi thoáng qua chỉ log."""
+    """Chỉ Telegram sau 3 vòng lỗi liên tiếp; lỗi thoáng qua chỉ log. Đã báo thì không báo lại tới khi sửa xong."""
     count = _fb_network_failures.get(error_key, 0) + 1
     _fb_network_failures[error_key] = count
-    print(f"[FACEBOOK NETWORK] {error_key}: lỗi liên tiếp {count}/{FB_NETWORK_ALERT_AFTER_FAILURES} - {text}")
-    if count >= FB_NETWORK_ALERT_AFTER_FAILURES and error_key not in _fb_network_alerted:
-        send_error_alert(error_key, f"Facebook mất kết nối {count} lần liên tiếp.\n{text}")
-        _fb_network_alerted.add(error_key)
+    print(f"[FACEBOOK] {error_key}: lỗi liên tiếp {count}/{FB_NETWORK_ALERT_AFTER_FAILURES} - {_mask_secrets(text)}")
+    if count >= FB_NETWORK_ALERT_AFTER_FAILURES:
+        send_error_alert(error_key, f"Facebook lỗi {count} lần liên tiếp.\n{text}")
 
-def note_fb_network_success(error_key: str):
-    """Reset bộ đếm khi request Facebook thành công."""
+
+def note_fb_network_success(error_key: str, description: str = ""):
+    """Request Facebook chạy lại được: reset bộ đếm và báo đã khắc phục (nếu lỗi từng được báo)."""
     had_failures = _fb_network_failures.get(error_key, 0)
-    was_alerted = error_key in _fb_network_alerted
     _fb_network_failures[error_key] = 0
-    _fb_network_alerted.discard(error_key)
-    if was_alerted:
-        recovery_key = f"recovered_{error_key}"
-        if recovery_key not in error_once_keys:
-            send_telegram_message("✅ FACEBOOK API ĐÃ KẾT NỐI LẠI. Hệ thống tiếp tục quét bình thường.")
-            error_once_keys.add(recovery_key)
-            try:
-                _save_keys(ERROR_ONCE_FILE, error_once_keys)
-            except OSError as exc:
-                print(f"[CẢNH BÁO] Không lưu được recovery-once: {exc}")
-    elif had_failures:
-        print(f"[FACEBOOK NETWORK] {error_key}: kết nối đã phục hồi sau {had_failures} lần lỗi.")
+    if had_failures:
+        print(f"[FACEBOOK] {error_key}: đã phục hồi sau {had_failures} lần lỗi.")
+    resolve_error_alert(error_key, description or f"Facebook ({error_key}) đã chạy lại bình thường.")
 
 # -------------------- Facebook API --------------------
 _managed_pages_cache = {"at": 0.0, "pages": []}
@@ -1682,13 +1797,14 @@ def get_managed_pages():
         note_fb_network_success("get_managed_pages_network")
 
         if "error" in data:
-            err_msg = data["error"].get("message", "Không rõ nguyên nhân")
-            print(f"[LỖI] Không lấy được danh sách Page: {err_msg}")
+            detail = _fb_error_detail(data=data)
+            print(f"[LỖI] Không lấy được danh sách Page: {_mask_secrets(detail)}")
             send_error_alert(
                 "get_managed_pages",
-                f"Không lấy được danh sách Page từ USER_ACCESS_TOKEN. Chi tiết: {err_msg}",
+                f"Không lấy được danh sách Page từ USER_ACCESS_TOKEN.\n{detail}",
             )
             break
+        resolve_error_alert("get_managed_pages", "Đã lấy lại được danh sách Page Facebook.")
 
         pages.extend(data.get("data", []))
         url = data.get("paging", {}).get("next")
@@ -1726,14 +1842,17 @@ def get_recent_post_ids(page_id: str, page_token: str):
     for page_no in range(POSTS_MAX_PAGES):
         try:
             r = api_get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-            if "error" in data:
-                raise ValueError(data["error"].get("message", "Facebook API error"))
         except Exception as e:
-            note_fb_network_failure(f"posts_{page_id}", f"Page {page_id}: không lấy được trang {page_no+1}: {e}")
+            note_fb_network_failure(f"posts_{page_id}", f"Page {_page_label(page_id)}: không kết nối được Facebook khi lấy danh sách bài: {type(e).__name__}: {e}")
             return found  # các trang trước vẫn được kiểm tra; trang thiếu sẽ thử lại vòng sau
-        note_fb_network_success(f"posts_{page_id}")
+        try:
+            data = r.json()
+        except ValueError:
+            data = None
+        if r.status_code != 200 or not isinstance(data, dict) or "error" in data:
+            note_fb_network_failure(f"posts_{page_id}", f"Page {_page_label(page_id)}: không lấy được danh sách bài.\n{_fb_error_detail(r, data)}")
+            return found
+        note_fb_network_success(f"posts_{page_id}", f"Page {_page_label(page_id)} đã đọc được danh sách bài bình thường.")
         oldest = None
         for post in data.get("data", []):
             pid, created = post.get("id"), post.get("created_time")
@@ -1805,10 +1924,11 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             continue
 
         if not isinstance(batch_resp, list):
-            err = batch_resp.get("error", {}).get("message", str(batch_resp)) if isinstance(batch_resp, dict) else str(batch_resp)
-            print(f"[LỖI] Batch request thất bại: {err}")
-            send_error_alert("batch_request_error", f"Batch request thất bại: {err}")
+            err = _fb_error_detail(resp, batch_resp if isinstance(batch_resp, dict) else None)
+            print(f"[LỖI] Batch request thất bại: {_mask_secrets(err)}")
+            send_error_alert("batch_request_error", f"Lấy số liệu bài (Batch API) thất bại.\n{err}")
             continue
+        resolve_error_alert("batch_request_error", "Facebook Batch API đã trả số liệu bình thường.")
 
         n_metrics = len(METRIC_FALLBACKS)
         items_per_post = n_metrics + 1  # 2 insights + 1 fields
@@ -2257,6 +2377,8 @@ def check_all_pages():
             # làm notified bị lẫn giữa "đã gửi Telegram" và "chỉ bị skip vì có link".
             # Vì vậy notified cũ không được phép chặn một bài đạt ngưỡng trước khi link được xác minh.
             link_status = post_already_has_link(post_id, page_id, page_token, message)
+            if link_status is not None:
+                resolve_error_alert(f"qualified_link_check_{post_id}", f"Bài {post_id} đã kiểm tra được comment/link.")
             if link_status is None:
                 print(
                     f"[QUALIFIED-BUT-BLOCKED] [{page_name}] {post_id}: "
@@ -2722,6 +2844,8 @@ def publish_page6_bioblog_test(post_id):
     state["web_publish_complete"] = True
     state.pop("page6_retry_after", None)
     _save_progress(post_id, state)
+    resolve_error_alert(f"web_link_retry_{post_id}", f"Bài {post_id}: đã nối chương và gửi đủ 3 link.")
+    resolve_error_alert(f"web_publish_retry_{post_id}", f"Bài {post_id}: đã đăng lên web thành công.")
     if state.get("page6_422_recovered") and not state.get("page6_422_recovery_notified"):
         if send_telegram_message("✅ ĐÃ KHẮC PHỤC: Page 6 đăng BioBlog thành công sau lỗi HTTP 422 thiếu permalink."):
             state["page6_422_recovery_notified"] = True
@@ -2838,7 +2962,7 @@ def _page6_try_publish_once_unlocked(post_id):
             state["page6_last_error"] = str(exc)[:800]
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST-RETRY] {post_id}: {type(exc).__name__}: {exc}; thử lại sau {PAGE6_LINK_RETRY_SECONDS}s", flush=True)
-            send_error_alert("page6_bioblog_link_retry",
+            send_error_alert(f"web_link_retry_{post_id}",
                              "Page 6 đã đăng đủ 3 Part nhưng nối chương/gửi link chưa xong; bot sẽ tự thử lại, "
                              "không tạo lại bài: " + str(exc)[:400])
         elif not any(r.get("request_started") or r.get("url") for r in records.values()):
@@ -2847,15 +2971,15 @@ def _page6_try_publish_once_unlocked(post_id):
             state["page6_last_error"] = str(exc)[:800]
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST-RETRY] {post_id}: chưa tạo bài nào, lỗi {type(exc).__name__}: {exc}; thử lại sau 120s", flush=True)
-            send_error_alert("web_publish_retry",
-                             "Chưa đăng được bài lên web (web đang lỗi), bot tự thử lại mỗi vài phút, không tạo trùng: " + str(exc)[:300])
+            send_error_alert(f"web_publish_retry_{post_id}",
+                             f"Bài {post_id}: chưa đăng được lên web (web đang lỗi), bot tự thử lại mỗi vài phút, không tạo trùng: " + str(exc)[:300])
         else:
             # Đã gọi POST nhưng chưa rõ kết quả -> dừng để tránh đăng trùng, cần kiểm tra tay.
             state["page6_test_blocked"] = str(exc)[:500]
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST-ERROR] {post_id}: {type(exc).__name__}: {exc}", flush=True)
-            send_error_alert("page6_bioblog_test",
-                             "Đã gửi yêu cầu tạo bài nhưng chưa rõ kết quả; dừng để tránh đăng trùng, kiểm tra web thủ công: " + str(exc)[:400])
+            send_error_alert(f"web_publish_unknown_{post_id}",
+                             f"Bài {post_id}: đã gửi yêu cầu tạo bài nhưng chưa rõ kết quả; dừng để tránh đăng trùng, kiểm tra web thủ công: " + str(exc)[:400])
         return False
 
 def page6_test_recovery_worker():
@@ -2898,6 +3022,7 @@ def main():
         scan_started = time.monotonic()
         try:
             check_all_pages()
+            resolve_error_alert("main_loop_exception", "Vòng quét Facebook đã chạy lại bình thường.")
         except Exception as e:
             print(f"[LỖI] Lỗi không xác định trong vòng quét: {e}")
             send_error_alert("main_loop_exception", f"Lỗi không xác định trong vòng quét:\n{e}")
