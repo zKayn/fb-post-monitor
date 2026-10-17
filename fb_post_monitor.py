@@ -2213,6 +2213,144 @@ def story_worker():
                 _story_pending.discard(post_id)
             STORY_QUEUE.task_done()
 
+# ==================== NHẮC GẮN LINK ====================
+# Bài đã báo + đã gửi TXT/link nhưng sau đó vẫn CHƯA gắn link mà views/comments tăng mạnh so với lúc báo
+# -> nhắc lại MỘT lần trên Telegram (chỉ tin nhắc, KHÔNG gửi lại TXT hay link truyện).
+# Tùy chỉnh bằng env (không bắt buộc):
+#   ENABLE_LINK_REMINDER=true            bật/tắt (mặc định bật)
+#   REMIND_MIN_VIEW_INCREASE=5000        views tăng thêm ít nhất bao nhiêu so với lúc báo
+#   REMIND_MIN_VIEW_PERCENT=100          hoặc views tăng ít nhất bao nhiêu % (và tối thiểu +2000)
+#   REMIND_MIN_COMMENT_INCREASE=30       hoặc comments tăng thêm ít nhất bao nhiêu
+#   REMIND_MIN_MINUTES=15                chỉ xét sau khi báo ít nhất N phút
+#   REMIND_POLL_SECONDS=300              bao lâu kiểm tra lại 1 bài đã báo
+ENABLE_LINK_REMINDER = os.getenv("ENABLE_LINK_REMINDER", "true").strip().lower() in ("1", "true", "yes", "on")
+REMIND_MIN_VIEW_INCREASE = int(os.getenv("REMIND_MIN_VIEW_INCREASE", "5000"))
+REMIND_MIN_VIEW_PERCENT = float(os.getenv("REMIND_MIN_VIEW_PERCENT", "100"))
+REMIND_MIN_COMMENT_INCREASE = int(os.getenv("REMIND_MIN_COMMENT_INCREASE", "30"))
+REMIND_MIN_MINUTES = float(os.getenv("REMIND_MIN_MINUTES", "15"))
+REMIND_POLL_SECONDS = int(os.getenv("REMIND_POLL_SECONDS", "300"))
+LINK_REMIND_FILE = "/data/link_reminders.json"
+
+
+def _load_link_reminders():
+    try:
+        with open(LINK_REMIND_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+_link_reminders = _load_link_reminders()
+_remind_next_check = {}
+
+
+def _save_link_reminders():
+    try:
+        os.makedirs(os.path.dirname(LINK_REMIND_FILE), exist_ok=True)
+        tmp = LINK_REMIND_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_link_reminders, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, LINK_REMIND_FILE)
+    except OSError as exc:
+        print(f"[REMIND] Không lưu được {LINK_REMIND_FILE}: {exc}")
+
+
+def _record_alert_baseline(post_id, views, comments):
+    """Ghi số liệu lúc báo BÀI ĐANG LÊN làm mốc so sánh (chỉ ghi lần đầu)."""
+    if str(post_id) in _link_reminders:
+        return
+    _link_reminders[str(post_id)] = {
+        "views": int(views or 0), "comments": int(comments or 0),
+        "at": datetime.now(timezone.utc).isoformat(), "status": "watching"}
+    _save_link_reminders()
+
+
+def _surge_reason(base, views, comments, minutes):
+    if minutes < REMIND_MIN_MINUTES:
+        return None
+    dv = int(views or 0) - int(base.get("views") or 0)
+    dc = int(comments or 0) - int(base.get("comments") or 0)
+    base_views = int(base.get("views") or 0)
+    pct = (100.0 * dv / base_views) if base_views > 0 else 0.0
+    if dv >= REMIND_MIN_VIEW_INCREASE:
+        return f"views +{dv:,}"
+    if dv >= 2000 and pct >= REMIND_MIN_VIEW_PERCENT:
+        return f"views +{pct:.0f}%"
+    if dc >= REMIND_MIN_COMMENT_INCREASE:
+        return f"comments +{dc}"
+    return None
+
+
+def check_link_reminders(page_id, page_name, page_token, all_post_ids):
+    """Theo dõi bài đã gửi đủ TXT nhưng chưa gắn link; tăng mạnh thì nhắc đúng 1 lần."""
+    if not ENABLE_LINK_REMINDER:
+        return
+    now_mono = time.monotonic()
+    candidates = [
+        str(pid) for pid in all_post_ids
+        if str(pid) in story_completed
+        and (_link_reminders.get(str(pid)) or {}).get("status") not in ("reminded", "has_link")
+        and now_mono >= _remind_next_check.get(str(pid), 0)
+    ]
+    if not candidates:
+        return
+    for pid in candidates:
+        _remind_next_check[pid] = now_mono + REMIND_POLL_SECONDS
+    stats = get_stats_batch(candidates, page_token)
+    changed = False
+    for pid in candidates:
+        views, comments, link, message = stats.get(pid, (None, None, None, ""))
+        if comments is None and views is None:
+            continue
+        base = _link_reminders.get(pid)
+        if not base:
+            # Bài đã báo từ trước khi có chức năng này: lấy số hiện tại làm mốc, theo dõi từ bây giờ.
+            _link_reminders[pid] = {"views": int(views or 0), "comments": int(comments or 0),
+                                    "at": datetime.now(timezone.utc).isoformat(), "status": "watching"}
+            changed = True
+            continue
+        try:
+            minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(base["at"])).total_seconds() / 60
+        except (KeyError, ValueError, TypeError):
+            minutes = REMIND_MIN_MINUTES
+        reason = _surge_reason(base, views, comments, minutes)
+        if not reason:
+            continue
+        link_status = post_already_has_link(pid, page_id, page_token, message)
+        if link_status is True:
+            base["status"] = "has_link"
+            changed = True
+            print(f"[REMIND] [{page_name}] {pid}: đã gắn link -> ngừng theo dõi.")
+            continue
+        if link_status is None:
+            print(f"[REMIND] [{page_name}] {pid}: chưa xác minh được link, thử lại lần sau.")
+            continue
+        try:
+            alert_time = datetime.fromisoformat(base["at"]).astimezone(timezone(timedelta(hours=7))).strftime("%H:%M %d/%m")  # giờ Việt Nam
+        except (KeyError, ValueError, TypeError):
+            alert_time = "trước đó"
+        dv = int(views or 0) - int(base.get("views") or 0)
+        dc = int(comments or 0) - int(base.get("comments") or 0)
+        text = (
+            f"⏰ NHẮC GẮN LINK! (Page: {page_name})\n"
+            f"Bài đã báo lúc {alert_time} nhưng VẪN CHƯA có link mà đang tăng mạnh ({reason}):\n"
+            f"Views: {int(base.get('views') or 0):,} → {int(views or 0):,} ({dv:+,})\n"
+            f"Comments: {int(base.get('comments') or 0):,} → {int(comments or 0):,} ({dc:+,})\n"
+            + (f"Link: {link}\n" if link else "")
+            + "=> Gắn link ngay!"
+        )
+        if send_telegram_message(text):
+            base["status"] = "reminded"
+            base["reminded_at"] = datetime.now(timezone.utc).isoformat()
+            changed = True
+            print(f"[REMIND] [{page_name}] {pid}: đã nhắc gắn link ({reason}).")
+    if changed:
+        _save_link_reminders()
+
+
 def check_all_pages():
     global _special_baseline_ready, special_baseline_posts
     # Token expiry được kiểm tra theo ngày để vòng quét nhanh hơn.
@@ -2263,6 +2401,11 @@ def check_all_pages():
             and (not is_special_page or str(pid) not in special_baseline_posts)
             and now_mono >= _post_next_check.get(str(pid), 0)
         ]
+
+        try:
+            check_link_reminders(page_id, page_name, page_token, all_post_ids)
+        except Exception as exc:
+            print(f"[REMIND] [{page_name}] lỗi: {exc}")
 
         if not post_ids_to_check:
             continue
@@ -2467,6 +2610,7 @@ def check_all_pages():
             # Worker gửi thông báo ngay trước khi tạo/gửi 3 TXT; scanner không gửi chen.
             queued = enqueue_story(page_name, post_id, message, page_id, page_token, msg, key)
             if queued:
+                _record_alert_baseline(post_id, views, summary_comments)
                 print(f"[QUEUE] [{page_name}] {post_id}: đã xếp hàng thông báo + TXT.")
             else:
                 print(
