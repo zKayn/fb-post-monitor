@@ -251,10 +251,16 @@ NEW_POSTS_SINCE_UTC = _load_or_create_new_post_cutoff()
 # Railway Variable: ENABLE_SPIKE_ALERT=true để BẬT, false để TẮT.
 # Mặc định false để không tự phát sinh cảnh báo ngoài ý muốn sau khi deploy.
 ENABLE_SPIKE_ALERT = os.getenv("ENABLE_SPIKE_ALERT", "false").strip().lower() in ("1", "true", "yes", "on")
-SPIKE_LOOKBACK_MINUTES = 30  # mốc tham chiếu; baseline thực tế chỉ lấy trong 15–40 phút
-SPIKE_MIN_VIEW_INCREASE = 3000
-SPIKE_MIN_PERCENT_INCREASE = 80
-SPIKE_MIN_VIEWS_TO_CHECK = 2000
+# Thuật toán "ĐANG DỰNG ĐỨNG": so TỐC ĐỘ tăng views hiện tại với TỐC ĐỘ NỀN của chính bài đó
+# (không dùng số tuyệt đối, nên bắt được cả bài nhỏ). Có thể chỉnh bằng biến Railway nếu cần:
+VERTICAL_SHORT_MINUTES = float(os.getenv("VERTICAL_SHORT_MINUTES", "30"))     # cửa sổ tốc độ hiện tại
+VERTICAL_BASE_MAX_MINUTES = float(os.getenv("VERTICAL_BASE_MAX_MINUTES", "360"))  # tốc độ nền: tới 6 giờ trước
+VERTICAL_BASE_MIN_SPAN = float(os.getenv("VERTICAL_BASE_MIN_SPAN", "60"))     # nền phải có ít nhất 60 phút dữ liệu
+VERTICAL_MIN_RATIO = float(os.getenv("VERTICAL_MIN_RATIO", "3"))              # tốc độ hiện tại >= 3 lần tốc độ nền
+VERTICAL_MIN_RATE = float(os.getenv("VERTICAL_MIN_RATE", "1.5"))              # và >= 1,5 views/phút (90 views/giờ)
+VERTICAL_SUSTAIN_MINUTES = float(os.getenv("VERTICAL_SUSTAIN_MINUTES", "20")) # giữ được >= 20 phút mới báo
+VERTICAL_MIN_VIEWS = int(os.getenv("VERTICAL_MIN_VIEWS", "2000"))             # chỉ báo khi bài đã có >= 2.000 views
+VIEW_HISTORY_KEEP_MINUTES = VERTICAL_SHORT_MINUTES + VERTICAL_BASE_MAX_MINUTES + 30
 VIEW_HISTORY_FILE = "/data/view_history.json"
 STORY_COMPLETED_FILE = "/data/story_completed_posts.json"
 STORY_CLAIMED_FILE = "/data/story_claimed_posts.json"
@@ -465,87 +471,119 @@ view_history = load_view_history()
 
 # Thông tin lần đo gần nhất, chỉ dùng để giải thích cảnh báo; không ảnh hưởng checkpoint.
 spike_evidence = {}
+_vertical_since = {}   # post_id -> thời điểm (epoch) bắt đầu thỏa điều kiện dựng đứng
+_vertical_miss = {}    # post_id -> số lần trượt liên tiếp (cho phép trượt 1 lần do Facebook cập nhật số theo đợt)
+_vertical_base = {}    # post_id -> tốc độ nền CHỐT lúc bắt đầu dựng (so với lúc trước khi dựng, không bị chính đợt dựng kéo lên)
 
 
-def record_and_check_spike(post_id: str, current_views: int, now: datetime):
-    """Phát hiện tăng views nhanh trong cửa sổ THỰC 15–40 phút.
+def _sample_epoch(stamp):
+    if isinstance(stamp, (int, float)):
+        return float(stamp)
+    dt = datetime.fromisoformat(str(stamp))
+    return dt.timestamp()
 
-    Chế độ cân bằng: kết hợp tăng tuyệt đối, tỷ lệ và tốc độ/phút; nếu có
-    lịch sử giai đoạn trước thì yêu cầu tăng tốc để giảm cảnh báo sai.
-    Không so sánh với mẫu cũ hàng giờ như thuật toán trước.
+
+def _slope_per_minute(points):
+    """Tốc độ views/phút bằng đường thẳng khớp qua nhiều mẫu (bình phương tối thiểu),
+    để một lần Facebook trả số giật không làm báo nhầm."""
+    if len(points) < 2:
+        return None
+    n = len(points)
+    mx = sum(t for t, _ in points) / n
+    my = sum(v for _, v in points) / n
+    den = sum((t - mx) ** 2 for t, _ in points)
+    if den <= 0:
+        return None
+    return sum((t - mx) * (v - my) for t, v in points) / den
+
+
+def record_and_check_spike(post_id: str, current_views, now: datetime):
+    """Ghi mẫu views và kiểm tra bài có ĐANG DỰNG ĐỨNG không.
+
+    Vs = tốc độ 30 phút gần nhất, Vb = tốc độ nền (30 phút → 6 giờ trước, hoặc từ lúc có dữ liệu).
+    Dựng đứng khi Vs >= VERTICAL_MIN_RATE views/phút VÀ Vs >= VERTICAL_MIN_RATIO × Vb,
+    giữ liên tục >= VERTICAL_SUSTAIN_MINUTES phút (qua ít nhất 2 lần đo).
     """
     post_id = str(post_id)
-    current_views = int(current_views)
     spike_evidence.pop(post_id, None)
-    raw = view_history.get(post_id, [])
+    if current_views is None:
+        return False
+    current_views = int(current_views)
+    now_ts = now.timestamp()
+
     samples = []
-    for entry in raw:
+    for entry in view_history.get(post_id, []):
         try:
-            stamp = datetime.fromisoformat(entry[0])
-            if stamp.tzinfo is None and now.tzinfo is not None:
-                stamp = stamp.replace(tzinfo=now.tzinfo)
-            if stamp.tzinfo is not None and now.tzinfo is None:
-                stamp = stamp.replace(tzinfo=None)
-            value = int(entry[1])
-            age = (now - stamp).total_seconds() / 60
-            if 0 <= age <= 90 and value >= 0:
-                samples.append((stamp, value, age))
+            ts, value = _sample_epoch(entry[0]), int(entry[1])
         except (ValueError, TypeError, IndexError, OverflowError):
             continue
-    samples.sort(key=lambda item: item[0])
+        age_min = (now_ts - ts) / 60
+        if 0 <= age_min <= VIEW_HISTORY_KEEP_MINUTES and value >= 0:
+            samples.append((ts, value))
+    samples.sort()
+    samples.append((now_ts, current_views))
 
-    # Luôn ghi mẫu mới kể cả khi cảnh báo tắt, để có baseline khi bật lại.
-    samples.append((now, current_views, 0.0))
-    view_history[post_id] = [[stamp.isoformat(), value] for stamp, value, _ in samples[-200:]]
+    # Lưu gọn: giữ đủ mẫu trong 60 phút gần nhất, cũ hơn thì 1 mẫu / 5 phút.
+    kept, last_bucket = [], None
+    for ts, value in samples:
+        if (now_ts - ts) / 60 <= 60:
+            kept.append((ts, value))
+            continue
+        bucket = int(ts // 300)
+        if bucket != last_bucket:
+            kept.append((ts, value))
+            last_bucket = bucket
+    view_history[post_id] = [[round(ts), value] for ts, value in kept]
 
-    if current_views < SPIKE_MIN_VIEWS_TO_CHECK:
+    short = [((ts - now_ts) / 60, v) for ts, v in kept if (now_ts - ts) / 60 <= VERTICAL_SHORT_MINUTES]
+    base = [((ts - now_ts) / 60, v) for ts, v in kept
+            if VERTICAL_SHORT_MINUTES <= (now_ts - ts) / 60 <= VERTICAL_SHORT_MINUTES + VERTICAL_BASE_MAX_MINUTES]
+    short_span = (short[-1][0] - short[0][0]) if len(short) >= 2 else 0
+    base_span = (base[-1][0] - base[0][0]) if len(base) >= 2 else 0
+    if len(short) < 3 or short_span < 10 or len(base) < 3 or base_span < VERTICAL_BASE_MIN_SPAN:
+        _vertical_since.pop(post_id, None)
+        _vertical_base.pop(post_id, None)
+        return False  # chưa đủ dữ liệu để so
+
+    vs = _slope_per_minute(short) or 0.0
+    vb = max(_slope_per_minute(base) or 0.0, 0.3)  # sàn 0,3 views/phút để bài gần như đứng im không bị chia cho ~0
+    if post_id in _vertical_since and post_id in _vertical_base:
+        vb = _vertical_base[post_id]  # đang trong đợt dựng: so với tốc độ nền trước khi dựng
+    ratio = vs / vb
+    # 12 phút gần nhất vẫn phải đang tăng nhanh: loại cú giật ngắn đã qua (vẫn nằm trong cửa sổ 30 phút).
+    tail = [p for p in short if p[0] >= -12]
+    vt = _slope_per_minute(tail) if len(tail) >= 2 and (tail[-1][0] - tail[0][0]) >= 5 else vs
+    hit = (vs >= VERTICAL_MIN_RATE and ratio >= VERTICAL_MIN_RATIO
+           and (vt or 0) >= max(VERTICAL_MIN_RATE, 0.5 * vs, VERTICAL_MIN_RATIO * vb * 0.7))
+
+    if hit:
+        _vertical_miss.pop(post_id, None)
+        if post_id not in _vertical_since:
+            _vertical_since[post_id] = now_ts
+            _vertical_base[post_id] = vb
+    else:
+        misses = _vertical_miss.get(post_id, 0) + 1
+        _vertical_miss[post_id] = misses
+        if misses >= 2 or post_id not in _vertical_since:
+            _vertical_since.pop(post_id, None)
+            _vertical_base.pop(post_id, None)
         return False
 
-    # Chọn mẫu gần mốc 25 phút nhất, nhưng tuyệt đối không cũ hơn 40 phút.
-    candidates = [sample for sample in samples[:-1] if 15 <= sample[2] <= 40]
-    if not candidates:
+    held_min = (now_ts - _vertical_since[post_id]) / 60
+    if current_views < VERTICAL_MIN_VIEWS:
+        # Vẫn theo dõi để tính thời gian giữ, nhưng chưa báo khi bài còn ít views.
+        print(f"[VERTICAL] {post_id}: đang dựng ({ratio:.1f} lần) nhưng mới {current_views} views < {VERTICAL_MIN_VIEWS}; chưa báo.")
         return False
-    base_time, base_views, minutes = min(candidates, key=lambda sample: abs(sample[2] - 25))
-    increase = current_views - base_views
-    if increase <= 0:
+    print(f"[VERTICAL] {post_id}: views={current_views} | tốc độ={vs * 60:.0f}/giờ | nền={vb * 60:.0f}/giờ "
+          f"| gấp {ratio:.1f} lần | đã giữ {held_min:.0f}/{VERTICAL_SUSTAIN_MINUTES:.0f} phút")
+    if held_min < VERTICAL_SUSTAIN_MINUTES:
         return False
-    pct = (100.0 * increase / base_views) if base_views > 0 else 0.0
-    rate = increase / minutes
-
-    # Hai nhánh: tăng tương đối rõ rệt, hoặc tăng tuyệt đối rất mạnh.
-    strong_relative = increase >= 1200 and pct >= 65 and rate >= 40
-    strong_absolute = increase >= 2500 and rate >= 55
-    if not (strong_relative or strong_absolute):
-        return False
-
-    # Có dữ liệu giai đoạn trước: yêu cầu tốc độ hiện tại cao hơn ít nhất 20%.
-    # Không bắt buộc khi mới bắt đầu thu thập, để vẫn phát hiện sớm.
-    earlier = [sample for sample in samples[:-1]
-               if 15 <= (base_time - sample[0]).total_seconds() / 60 <= 40]
-    if earlier:
-        old_time, old_views, _ = min(
-            earlier, key=lambda sample: abs((base_time - sample[0]).total_seconds() / 60 - 25)
-        )
-        previous_minutes = (base_time - old_time).total_seconds() / 60
-        previous_rate = max(0.0, (base_views - old_views) / previous_minutes)
-        if previous_rate > 0 and rate < previous_rate * 1.20:
-            return False
-
-    # Nếu có mẫu rất gần đây, tránh báo khi views đã chững lại.
-    recent = [sample for sample in samples[:-1] if 4 <= sample[2] <= 12]
-    if recent:
-        _, recent_views, recent_minutes = min(recent, key=lambda sample: abs(sample[2] - 8))
-        recent_rate = (current_views - recent_views) / recent_minutes
-        if recent_rate < max(20.0, rate * 0.45):
-            return False
 
     spike_evidence[post_id] = {
-        "baseline_views": base_views,
-        "current_views": current_views,
-        "minutes": round(minutes, 1),
-        "increase": increase,
-        "percent": round(pct, 1),
-        "rate": round(rate, 1),
+        "rate_per_hour": round(vs * 60),
+        "base_per_hour": round(vb * 60),
+        "ratio": round(ratio, 1),
+        "held_minutes": round(held_min),
     }
     return True
 
@@ -2230,17 +2268,12 @@ def story_worker():
 # -> nhắc lại MỘT lần trên Telegram (chỉ tin nhắc, KHÔNG gửi lại TXT hay link truyện).
 # Tùy chỉnh bằng env (không bắt buộc):
 #   ENABLE_LINK_REMINDER=true            bật/tắt (mặc định bật)
-#   REMIND_MIN_VIEW_INCREASE=5000        views tăng thêm ít nhất bao nhiêu so với lúc báo
-#   REMIND_MIN_VIEW_PERCENT=100          hoặc views tăng ít nhất bao nhiêu % (và tối thiểu +2000)
-#   REMIND_MIN_COMMENT_INCREASE=30       hoặc comments tăng thêm ít nhất bao nhiêu
+#   Điều kiện nhắc: bài ĐANG DỰNG ĐỨNG theo đúng thuật toán ở trên (VERTICAL_...).
 #   REMIND_MIN_MINUTES=15                chỉ xét sau khi báo ít nhất N phút
-#   REMIND_POLL_SECONDS=300              bao lâu kiểm tra lại 1 bài đã báo
+#   REMIND_POLL_SECONDS=180              bao lâu kiểm tra lại 1 bài đã báo
 ENABLE_LINK_REMINDER = os.getenv("ENABLE_LINK_REMINDER", "true").strip().lower() in ("1", "true", "yes", "on")
-REMIND_MIN_VIEW_INCREASE = int(os.getenv("REMIND_MIN_VIEW_INCREASE", "5000"))
-REMIND_MIN_VIEW_PERCENT = float(os.getenv("REMIND_MIN_VIEW_PERCENT", "100"))
-REMIND_MIN_COMMENT_INCREASE = int(os.getenv("REMIND_MIN_COMMENT_INCREASE", "30"))
 REMIND_MIN_MINUTES = float(os.getenv("REMIND_MIN_MINUTES", "15"))
-REMIND_POLL_SECONDS = int(os.getenv("REMIND_POLL_SECONDS", "300"))
+REMIND_POLL_SECONDS = int(os.getenv("REMIND_POLL_SECONDS", "180"))  # đo dày hơn để thuật toán dựng đứng chính xác
 LINK_REMIND_FILE = "/data/link_reminders.json"
 
 
@@ -2280,22 +2313,6 @@ def _record_alert_baseline(post_id, views, comments):
     _save_link_reminders()
 
 
-def _surge_reason(base, views, comments, minutes):
-    if minutes < REMIND_MIN_MINUTES:
-        return None
-    dv = int(views or 0) - int(base.get("views") or 0)
-    dc = int(comments or 0) - int(base.get("comments") or 0)
-    base_views = int(base.get("views") or 0)
-    pct = (100.0 * dv / base_views) if base_views > 0 else 0.0
-    if dv >= REMIND_MIN_VIEW_INCREASE:
-        return f"views +{dv:,}"
-    if dv >= 2000 and pct >= REMIND_MIN_VIEW_PERCENT:
-        return f"views +{pct:.0f}%"
-    if dc >= REMIND_MIN_COMMENT_INCREASE:
-        return f"comments +{dc}"
-    return None
-
-
 def check_link_reminders(page_id, page_name, page_token, all_post_ids):
     """Theo dõi bài đã gửi đủ TXT nhưng chưa gắn link; tăng mạnh thì nhắc đúng 1 lần."""
     if not ENABLE_LINK_REMINDER:
@@ -2328,9 +2345,13 @@ def check_link_reminders(page_id, page_name, page_token, all_post_ids):
             minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(base["at"])).total_seconds() / 60
         except (KeyError, ValueError, TypeError):
             minutes = REMIND_MIN_MINUTES
-        reason = _surge_reason(base, views, comments, minutes)
-        if not reason:
+        # Dùng chung thuật toán "đang dựng đứng" (ghi mẫu views mỗi lần đo).
+        vertical = record_and_check_spike(pid, views, datetime.now())
+        if not vertical or minutes < REMIND_MIN_MINUTES:
             continue
+        ev = spike_evidence.get(pid, {})
+        reason = (f"tốc độ ~{ev.get('rate_per_hour', '?'):,} views/giờ, gấp {ev.get('ratio', '?')} lần trước đó, "
+                  f"đã giữ {ev.get('held_minutes', '?')} phút")
         link_status = post_already_has_link(pid, page_id, page_token, message)
         if link_status is True:
             base["status"] = "has_link"
@@ -2348,7 +2369,7 @@ def check_link_reminders(page_id, page_name, page_token, all_post_ids):
         dc = int(comments or 0) - int(base.get("comments") or 0)
         text = (
             f"⏰ NHẮC GẮN LINK! (Page: {page_name})\n"
-            f"Bài đã báo lúc {alert_time} nhưng VẪN CHƯA có link mà đang tăng mạnh ({reason}):\n"
+            f"Bài đã báo lúc {alert_time} nhưng VẪN CHƯA có link mà đang DỰNG ĐỨNG ({reason}):\n"
             f"Views: {int(base.get('views') or 0):,} → {int(views or 0):,} ({dv:+,})\n"
             f"Comments: {int(base.get('comments') or 0):,} → {int(comments or 0):,} ({dc:+,})\n"
             + (f"Link: {link}\n" if link else "")
@@ -2361,6 +2382,7 @@ def check_link_reminders(page_id, page_name, page_token, all_post_ids):
             print(f"[REMIND] [{page_name}] {pid}: đã nhắc gắn link ({reason}).")
     if changed:
         _save_link_reminders()
+    save_view_history(view_history)
 
 
 def check_all_pages():
@@ -2463,7 +2485,7 @@ def check_all_pages():
             # Luôn ghi lịch sử views để khi bật công tắc spike đã có baseline 30 phút.
             # Cảnh báo "BÀI ĐANG DỰNG ĐỨNG" độc lập với ngưỡng BÀI ĐANG LÊN
             # và chỉ gửi đúng 1 lần/post nhờ key spike_ được lưu persistent.
-            spike_detected = record_and_check_spike(post_id, int(views or 0), datetime.now())
+            spike_detected = record_and_check_spike(post_id, views, datetime.now())
 
             spike_key = f"spike_{page_id}_{post_id}"
 
@@ -2491,11 +2513,9 @@ def check_all_pages():
                         f"Views: {views}\n"
                         f"Comments: {comments}\n"
                         + (f"Link: {link}\n" if link else "")
-                        + f"Đo thực tế: {evidence.get('baseline_views', '?'):,} → {views:,} views "
-                          f"trong {evidence.get('minutes', '?')} phút.\n"
-                        + f"Tăng: +{evidence.get('increase', '?'):,} "
-                          f"({evidence.get('percent', '?')}%), "
-                          f"{evidence.get('rate', '?')} views/phút.\n"
+                        + f"Tốc độ hiện tại: ~{evidence.get('rate_per_hour', '?'):,} views/giờ "
+                          f"(trước đó ~{evidence.get('base_per_hour', '?'):,} views/giờ, "
+                          f"gấp {evidence.get('ratio', '?')} lần), đã giữ {evidence.get('held_minutes', '?')} phút.\n"
                         + "=> Kiểm tra bài ngay!"
                     )
 
