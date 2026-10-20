@@ -69,7 +69,7 @@ ARTICLE_LINK_DOMAINS = sorted(set(
     + [d.strip().lower() for d in os.getenv(
         "ARTICLE_LINK_DOMAINS", "storyly.chosouthrussianovcharka.com").split(",") if d.strip()]
 ))
-COMMENT_LINK_MAX_PAGES = 5  # quét tối đa 5 trang x 100 comments trước khi báo / gọi OpenAI
+COMMENT_LINK_MAX_PAGES = 30  # quét tối đa 30 trang x 100 comments trước khi báo / gọi OpenAI
 COMMENT_COUNT_MAX_PAGES = 10  # fallback đếm comment thực tế khi summary có thể thấp hơn UI
 COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comment <= 15 để tiết kiệm Graph API
 
@@ -1082,7 +1082,84 @@ def _cache_write(caption, parts):
     os.replace(temp, path)
 
 
-def _resume_story(page_name, post_id, caption):
+def _story_links_for_alert(state):
+    """3 link thật đã đăng web (API thường hoặc chapter). Thiếu bất kỳ link nào -> None."""
+    posts = state.get("page6_api_posts") or state.get("page6_chapter_posts") or {}
+    links = {n: (posts.get(str(n)) or {}).get("url") for n in (2, 3, 4)}
+    return links if state.get("web_publish_complete") and all(links.values()) else None
+
+
+def _alert_with_note(alert_text, note):
+    """Thay dòng "⏳ Đang tạo file TXT..." / "🔄 Tiếp tục..." bằng 3 link (hoặc ghi chú)."""
+    lines = alert_text.split("\n")
+    out, replaced = [], False
+    for line in lines:
+        if line.startswith("⏳ Đang tạo file TXT") or line.startswith("🔄 Tiếp tục tạo/gửi"):
+            if note and not replaced:
+                out.append(note)
+            replaced = True
+            continue
+        out.append(line)
+    if note and not replaced:
+        out.append(note)
+    return "\n".join(out)
+
+
+def _send_pending_alert(post_id, alert_text, note, links_included=False):
+    """Gửi thông báo BÀI ĐANG LÊN đang chờ (đúng 1 lần). Trả False nếu Telegram chưa nhận."""
+    state = _load_progress(post_id)
+    if not state.get("alert_pending"):
+        return True
+    if not alert_text:
+        return True
+    with TELEGRAM_GROUP_LOCK:
+        print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN" + (" kèm 3 link." if links_included else "."))
+        if not send_telegram_message(_alert_with_note(alert_text, note)):
+            return False
+        key = state.get("alert_key")
+        if key:
+            already_notified.add(key)
+            save_notified(already_notified)
+        state = _load_progress(post_id)
+        state.pop("alert_pending", None)
+        if links_included:
+            state["page6_api_links_sent"] = True
+        _save_progress(post_id, state)
+        print(f"[ALERT-SENT] {post_id}: đã lưu notified sau khi gửi Telegram.")
+    return True
+
+
+def _links_deferred(post_id):
+    st = _load_progress(post_id)
+    return bool(st.get("defer_links_to_alert") and st.get("alert_pending"))
+
+
+def _telegram_or_defer(post_id, text, state=None):
+    """Khi thông báo bài còn đang chờ: dời tin phụ (ảnh tạm, kho truyện...) ra SAU thông báo + TXT.
+    Truyền state đang dùng để không bị bản lưu sau ghi đè mất ghi chú."""
+    if state is None:
+        state = _load_progress(post_id)
+    if state.get("alert_pending"):
+        state.setdefault("deferred_notes", []).append(text)
+        _save_progress(post_id, state)
+        return True
+    return send_telegram_message(text)
+
+
+def _flush_deferred_notes(post_id):
+    state = _load_progress(post_id)
+    notes = state.get("deferred_notes") or []
+    while notes:
+        if not send_telegram_message(notes[0]):
+            break
+        notes.pop(0)
+        _save_progress(post_id, state)
+    if not notes and "deferred_notes" in state:
+        state.pop("deferred_notes", None)
+        _save_progress(post_id, state)
+
+
+def _resume_story(page_name, post_id, caption, alert_text=""):
     """Persist each successful part; only generate missing parts. Never re-buy saved parts."""
     state = _load_progress(post_id)
     if state.get("caption") and state["caption"] != caption:
@@ -1103,7 +1180,7 @@ def _resume_story(page_name, post_id, caption):
             parts.update(cached)
             state["cache_reused"] = True
             _save_progress(post_id, state)
-            send_telegram_message(f"♻️ Bài {post_id}: tái sử dụng Part 2/3/4 từ kho truyện; không gọi OpenAI.")
+            _telegram_or_defer(post_id, f"♻️ Bài {post_id}: tái sử dụng Part 2/3/4 từ kho truyện; không gọi OpenAI.", state)
     for n in (2, 3, 4):
         key = str(n)
         if key in parts:
@@ -1126,6 +1203,54 @@ def _resume_story(page_name, post_id, caption):
     ))
     # Vẫn kiểm tra nội dung 3 phần trước khi xuất bản web.
     outputs = split_story_into_parts(story)
+    # Đăng web TRƯỚC khi gửi thông báo để chèn 3 link vào thông báo BÀI ĐANG LÊN.
+    web_on = bool(state.get("auto_publish_eligible") and ENABLE_PAGE6_WEB_TEST
+                  and _web_publish_allowed(_page6_number_for_post(post_id)))
+    if state.get("alert_pending"):
+        if web_on:
+            state["defer_links_to_alert"] = True
+            _save_progress(post_id, state)
+            try:
+                _page6_try_publish_once(post_id)
+            except Exception as exc:  # web lỗi không được chặn thông báo/TXT
+                print(f"[PAGE6] {post_id}: đăng web lỗi trước thông báo: {exc}", flush=True)
+        state = _load_progress(post_id)
+    links = _story_links_for_alert(state) if web_on else None
+    group_lock_held = False
+    if state.get("alert_pending"):
+        TELEGRAM_GROUP_LOCK.acquire()  # giữ khóa xuyên suốt: thông báo + 3 TXT liền nhau
+        group_lock_held = True
+        if links:
+            note = "\n".join(f"PART {n}: {links[n]}" for n in (2, 3, 4))
+        elif web_on:
+            note = "⚠️ Web chưa đăng xong — 3 link truyện sẽ gửi riêng ngay khi bot đăng được."
+        else:
+            note = ""
+        if not _send_pending_alert(post_id, alert_text, note, links_included=bool(links)):
+            TELEGRAM_GROUP_LOCK.release()
+            return False
+        state = _load_progress(post_id)
+    try:
+        if not _resume_send_txt(page_name, post_id, state, outputs):
+            return False
+    finally:
+        if group_lock_held:
+            TELEGRAM_GROUP_LOCK.release()
+    _flush_deferred_notes(post_id)
+    state = _load_progress(post_id)
+    if state.pop("defer_links_to_alert", None):
+        _save_progress(post_id, state)
+    # Web xong nhưng link chưa nằm trong thông báo (ví dụ luồng khác đăng xong cùng lúc) -> gửi tin link riêng.
+    if (web_on and state.get("web_publish_complete") and not state.get("page6_api_links_sent")
+            and _story_links_for_alert(state)):
+        links = _story_links_for_alert(state)
+        if send_telegram_message("\n".join(f"PART {n}: {links[n]}" for n in (2, 3, 4))):
+            state["page6_api_links_sent"] = True
+            _save_progress(post_id, state)
+    return _resume_finish(post_id, state)
+
+
+def _resume_send_txt(page_name, post_id, state, outputs):
     sent = state.setdefault("sent", [])
     for n in (2, 3, 4):
         if n in sent:
@@ -1142,10 +1267,15 @@ def _resume_story(page_name, post_id, caption):
         # 'sent' là checkpoint đã xử lý phần, để web publishing không bị chặn.
         sent.append(n)
         _save_progress(post_id, state)
+    return True
+
+
+def _resume_finish(post_id, state):
     # Chỉ những bài được worker xác nhận mới sau mốc kích hoạt mới tự xuất bản.
     # Không backfill những checkpoint cũ đã hoàn thành trước bản nâng cấp.
     if state.get("auto_publish_eligible") and ENABLE_PAGE6_WEB_TEST and _web_publish_allowed(_page6_number_for_post(post_id)):
-        _page6_try_publish_once(post_id)
+        if not state.get("web_publish_complete"):
+            _page6_try_publish_once(post_id)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
     resolve_error_alert("story_resume_" + str(post_id), f"Bài {post_id} đã gửi đủ 3 file TXT.")
@@ -1566,21 +1696,28 @@ def publish_approved_story(post_id):
     return publish_page6_bioblog_test(post_id)
 
 
-def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str):
+def generate_and_send_story_continuation(page_name: str, post_id: str, caption: str, alert_text: str = ""):
     if not ENABLE_STORY_CONTINUATION or not ENABLE_PAID_GENERATION or not caption.strip():
         return False
     if str(post_id) in story_completed:
         return True
     if not _retry_due(post_id):
         return False
+    ok = False
     try:
         # Old claimed keys are no longer permanent locks; checkpoint is authoritative.
-        return _resume_story(page_name, post_id, caption)
+        ok = _resume_story(page_name, post_id, caption, alert_text)
+        return ok
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         print(f"[STORY] {post_id}: {exc}")
         send_error_alert("story_resume_" + str(post_id), f"Bài {post_id}: tạm hoãn tiếp tục truyện: {exc}")
         return False
     finally:
+        if not ok and alert_text and not all(
+                str(n) in (_load_progress(post_id).get("parts") or {}) for n in (2, 3, 4)):
+            # Viết truyện lỗi: KHÔNG giữ thông báo lại mãi -> vẫn báo bài đang lên (chưa có link).
+            _send_pending_alert(post_id, alert_text,
+                                "⚠️ Tạo truyện chưa xong (bot tự thử lại) — file TXT và 3 link sẽ gửi sau.")
         state = _load_progress(post_id)
         if state and str(post_id) not in story_completed:
             state["retry_after"] = time.time() + STORY_RETRY_SECONDS
@@ -2221,40 +2358,41 @@ def story_worker():
             if not ENABLE_PAID_GENERATION:
                 print(f"[COST GUARD] {post_id}: chưa bật ENABLE_PAID_GENERATION; bỏ qua hàng đợi.")
                 continue
-            # Đợi đến lượt gửi cả nhóm; scanner vẫn chạy độc lập mỗi 60 giây.
-            with TELEGRAM_GROUP_LOCK:
-                link_status = post_already_has_link(post_id, page_id, page_token, message)
-                if link_status is not False:
-                    print(f"[WORKER] {post_id}: đã có link hoặc không xác minh được; không gọi OpenAI.")
+            # Kiểm tra link/ngày đăng. KHÔNG giữ khóa Telegram lúc viết truyện + đăng web (mất vài phút);
+            # khóa chỉ giữ lúc gửi cả nhóm "thông báo + 3 TXT" để nhóm tin vẫn liền nhau.
+            link_status = post_already_has_link(post_id, page_id, page_token, message)
+            if link_status is not False:
+                print(f"[WORKER] {post_id}: đã có link hoặc không xác minh được; không gọi OpenAI.")
+                continue
+            try:
+                verify = api_get(f"{GRAPH_URL}/{post_id}", params={"fields": "created_time", "access_token": page_token}).json()
+                published = datetime.strptime(verify["created_time"], "%Y-%m-%dT%H:%M:%S%z")
+                age = datetime.now(timezone.utc) - published
+                if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
+                    print(f"[COST GUARD] {post_id}: bài ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
                     continue
-                try:
-                    verify = api_get(f"{GRAPH_URL}/{post_id}", params={"fields": "created_time", "access_token": page_token}).json()
-                    published = datetime.strptime(verify["created_time"], "%Y-%m-%dT%H:%M:%S%z")
-                    age = datetime.now(timezone.utc) - published
-                    if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
-                        print(f"[COST GUARD] {post_id}: bài ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
-                        continue
-                except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
-                    print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
-                    continue
-                # Đã xác nhận bài mới theo thời gian Facebook: đánh dấu đủ điều kiện auto-web.
-                # Lưu trước khi gọi OpenAI để retry/redeploy không mất quyền xử lý.
-                state = _load_progress(post_id)
-                if not state.get("auto_publish_eligible"):
-                    state["auto_publish_eligible"] = True
-                    state["page_name"] = page_name
-                    _save_progress(post_id, state)
-                if notified_key not in already_notified:
-                    print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN.")
-                    send_telegram_message(alert_text)
-                    already_notified.add(notified_key)
-                    save_notified(already_notified)
-                    print(f"[ALERT-SENT] {post_id}: đã lưu notified sau khi gửi Telegram.")
-                else:
-                    print(f"[WORKER] {post_id}: đã báo trước đó; không báo lặp.")
-                # Khóa được giữ xuyên suốt 3 TXT: không tin Telegram nào từ
-                # cùng tiến trình này có thể chen vào giữa nhóm bài.
-                generate_and_send_story_continuation(page_name, post_id, message)
+            except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
+                print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
+                continue
+            # Đã xác nhận bài mới theo thời gian Facebook: đánh dấu đủ điều kiện auto-web.
+            # Lưu trước khi gọi OpenAI để retry/redeploy không mất quyền xử lý.
+            state = _load_progress(post_id)
+            changed_state = False
+            if not state.get("auto_publish_eligible"):
+                state["auto_publish_eligible"] = True
+                state["page_name"] = page_name
+                changed_state = True
+            if notified_key not in already_notified and not state.get("alert_pending"):
+                # Chưa báo: KHOAN gửi. Thông báo sẽ gửi sau khi có 3 link truyện (kèm 3 link).
+                state["alert_pending"] = True
+                state["alert_key"] = notified_key
+                changed_state = True
+                print(f"[ALERT-WAIT] {post_id}: chờ viết truyện + đăng web để gửi thông báo kèm 3 link.")
+            elif not state.get("alert_pending"):
+                print(f"[WORKER] {post_id}: đã báo trước đó; không báo lặp.")
+            if changed_state:
+                _save_progress(post_id, state)
+            generate_and_send_story_continuation(page_name, post_id, message, alert_text)
         except Exception as exc:
             print(f"[WORKER] Bài {post_id} lỗi: {exc}")
             send_error_alert(f"worker_{post_id}", f"Bài {post_id}: {exc}")
@@ -2639,7 +2777,7 @@ def check_all_pages():
             # Chặn bài đã bắt đầu tạo và không xếp hàng khi chế độ trả phí đang tắt.
             if not _retry_due(post_id) or not ENABLE_PAID_GENERATION:
                 continue
-            # Worker gửi thông báo ngay trước khi tạo/gửi 3 TXT; scanner không gửi chen.
+            # Worker gửi thông báo SAU khi đã viết truyện + có 3 link web (kèm 3 link), rồi 3 TXT.
             queued = enqueue_story(page_name, post_id, message, page_id, page_token, msg, key)
             if queued:
                 _record_alert_baseline(post_id, views, summary_comments)
@@ -2887,7 +3025,7 @@ def _page6_publish_chapter_batch(post_id, state):
         state["publish_platform"] = "bioblog_api_page6_chapter_test"
         _save_progress(post_id, state)
     posts = state["page6_chapter_posts"]
-    if not state.get("page6_api_links_sent"):
+    if not state.get("page6_api_links_sent") and not _links_deferred(post_id):
         message = f"🧪 PAGE {_page6_number_for_post(post_id)} — BioBlog CHAPTER TEST\n" + "\n".join(
             f"PART {n}: {posts[str(n)]['url']}" for n in (2, 3, 4))
         message += "\n⚠️ Kiểm tra nút Previous/Next trên giao diện BioBlog trước khi bật chính thức."
@@ -2914,7 +3052,9 @@ def publish_page6_bioblog_test(post_id):
     state = _load_progress(post_id)
     if not state.get("auto_publish_eligible"):
         raise RuntimeError("Checkpoint chưa xác nhận bài mới đủ điều kiện")
-    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
+    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not (
+            all(n in state.get("sent", []) for n in (2, 3, 4))
+            or (state.get("defer_links_to_alert") and state.get("alert_pending"))):
         print(f"[PAGE6-TEST] {post_id}: chờ gửi đủ 3 TXT rồi mới đăng web.")
         return False
     # Ưu tiên chapter API TRƯỚC khi tạo checkpoint legacy page6_api_posts.
@@ -2965,7 +3105,7 @@ def publish_page6_bioblog_test(post_id):
         state["web_featured_image"] = image_url
         _save_progress(post_id, state)
         if used_fb:
-            send_telegram_message("⚠️ Web lỗi khi tải ảnh lên (HTTP 500/đăng nhập). Bài vẫn đăng, ảnh đại diện đang dùng tạm link ảnh Facebook — có thể hết hạn, nên thay ảnh trong trang quản trị sau.")
+            _telegram_or_defer(post_id, state=state, text="⚠️ Web lỗi khi tải ảnh lên (HTTP 500/đăng nhập). Bài vẫn đăng, ảnh đại diện đang dùng tạm link ảnh Facebook — có thể hết hạn, nên thay ảnh trong trang quản trị sau.")
         print(f"[PAGE6-TEST] {post_id}: đã upload ảnh đại diện dùng chung 3 Part")
 
     def _base_body(n):
@@ -3009,7 +3149,7 @@ def publish_page6_bioblog_test(post_id):
 
     # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và nối chương xong.
     # Lưu checkpoint để retry/redeploy không gửi lại.
-    if not state.get("page6_api_links_sent"):
+    if not state.get("page6_api_links_sent") and not _links_deferred(post_id):
         message = "\n".join(f"PART {n}: {actual_urls[n]}" for n in (2, 3, 4))
         if send_telegram_message(message) is False:
             raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
