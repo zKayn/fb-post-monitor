@@ -157,7 +157,7 @@ SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = False  # Chặn luồng web cũ; chỉ test qua API công khai cho Page 6
-SEND_STORY_TXT_TELEGRAM = True  # Giữ gửi đủ ba TXT trên tất cả Page
+SEND_STORY_TXT_TELEGRAM = False  # Ẩn 3 file TXT trên Telegram (truyện vẫn viết + đăng web, link nằm trong thông báo)
 WEB_BASE_URL = ACTIVE_WEB_BASE_URL  # lấy từ WEB_API_URL
 # Chỉ Epic Stories (Page số 6) được phép thử đăng web; tất cả Page khác chỉ TXT.
 # Tắt ngay bằng ENABLE_PAGE6_WEB_TEST=false trên Railway.
@@ -1717,7 +1717,8 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
                 str(n) in (_load_progress(post_id).get("parts") or {}) for n in (2, 3, 4)):
             # Viết truyện lỗi: KHÔNG giữ thông báo lại mãi -> vẫn báo bài đang lên (chưa có link).
             _send_pending_alert(post_id, alert_text,
-                                "⚠️ Tạo truyện chưa xong (bot tự thử lại) — file TXT và 3 link sẽ gửi sau.")
+                                ("⚠️ Tạo truyện chưa xong (bot tự thử lại) — 3 link sẽ gửi sau." if not SEND_STORY_TXT_TELEGRAM
+                                 else "⚠️ Tạo truyện chưa xong (bot tự thử lại) — file TXT và 3 link sẽ gửi sau."))
         state = _load_progress(post_id)
         if state and str(post_id) not in story_completed:
             state["retry_after"] = time.time() + STORY_RETRY_SECONDS
@@ -2371,6 +2372,11 @@ def story_worker():
                 if not (timedelta(0) <= age <= timedelta(hours=ONLY_POSTS_NEWER_THAN_HOURS)):
                     print(f"[COST GUARD] {post_id}: bài ngoài {ONLY_POSTS_NEWER_THAN_HOURS} giờ; bỏ qua.")
                     continue
+                # Ngày giờ đăng bài (giờ Việt Nam) chèn ngay dưới dòng tiêu đề thông báo.
+                posted_at = published.astimezone(timezone(timedelta(hours=7))).strftime("%H:%M %d/%m/%Y")
+                if alert_text and "🕒 Đăng lúc:" not in alert_text:
+                    head, _, rest = alert_text.partition("\n")
+                    alert_text = f"{head}\n🕒 Đăng lúc: {posted_at}\n{rest}" if rest else f"{head}\n🕒 Đăng lúc: {posted_at}"
             except (KeyError, ValueError, TypeError, requests.RequestException) as exc:
                 print(f"[COST GUARD] {post_id}: không xác minh được ngày đăng: {exc}; bỏ qua.")
                 continue
