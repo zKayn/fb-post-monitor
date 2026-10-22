@@ -259,7 +259,12 @@ VERTICAL_BASE_MIN_SPAN = float(os.getenv("VERTICAL_BASE_MIN_SPAN", "60"))     # 
 VERTICAL_MIN_RATIO = float(os.getenv("VERTICAL_MIN_RATIO", "3"))              # tốc độ hiện tại >= 3 lần tốc độ nền
 VERTICAL_MIN_RATE = float(os.getenv("VERTICAL_MIN_RATE", "1.5"))              # và >= 1,5 views/phút (90 views/giờ)
 VERTICAL_SUSTAIN_MINUTES = float(os.getenv("VERTICAL_SUSTAIN_MINUTES", "20")) # giữ được >= 20 phút mới báo
-VERTICAL_MIN_VIEWS = int(os.getenv("VERTICAL_MIN_VIEWS", "2000"))             # chỉ báo khi bài đã có >= 2.000 views
+VERTICAL_MIN_VIEWS = int(os.getenv("VERTICAL_MIN_VIEWS", "1000"))             # chỉ báo khi bài đã có >= 1.000 views
+VERTICAL_STALE_MINUTES = 25   # Facebook cập nhật views theo đợt: số đứng yên tới 25 phút chưa coi là "chậm lại"
+# Bài dựng đứng MẠNH (chưa có link) được xử lý như BÀI ĐANG LÊN luôn (viết truyện + đăng web + báo kèm link),
+# không đợi đủ ngưỡng views/comments. Đặt False để tắt.
+VERTICAL_TRIGGERS_ALERT = True
+VERTICAL_ALERT_MIN_RATE_PER_HOUR = 240   # tốc độ tối thiểu để tính là BÀI ĐANG LÊN (views/giờ)
 VIEW_HISTORY_KEEP_MINUTES = VERTICAL_SHORT_MINUTES + VERTICAL_BASE_MAX_MINUTES + 30
 VIEW_HISTORY_FILE = "/data/view_history.json"
 STORY_COMPLETED_FILE = "/data/story_completed_posts.json"
@@ -474,6 +479,7 @@ spike_evidence = {}
 _vertical_since = {}   # post_id -> thời điểm (epoch) bắt đầu thỏa điều kiện dựng đứng
 _vertical_miss = {}    # post_id -> số lần trượt liên tiếp (cho phép trượt 1 lần do Facebook cập nhật số theo đợt)
 _vertical_base = {}    # post_id -> tốc độ nền CHỐT lúc bắt đầu dựng (so với lúc trước khi dựng, không bị chính đợt dựng kéo lên)
+_vertical_last = {}    # post_id -> (vs, ratio) lần đo có số mới gần nhất (dùng khi Facebook chưa cập nhật số)
 
 
 def _sample_epoch(stamp):
@@ -535,29 +541,61 @@ def record_and_check_spike(post_id: str, current_views, now: datetime):
             last_bucket = bucket
     view_history[post_id] = [[round(ts), value] for ts, value in kept]
 
-    short = [((ts - now_ts) / 60, v) for ts, v in kept if (now_ts - ts) / 60 <= VERTICAL_SHORT_MINUTES]
-    base = [((ts - now_ts) / 60, v) for ts, v in kept
-            if VERTICAL_SHORT_MINUTES <= (now_ts - ts) / 60 <= VERTICAL_SHORT_MINUTES + VERTICAL_BASE_MAX_MINUTES]
-    short_span = (short[-1][0] - short[0][0]) if len(short) >= 2 else 0
-    base_span = (base[-1][0] - base[0][0]) if len(base) >= 2 else 0
-    if len(short) < 3 or short_span < 10 or len(base) < 3 or base_span < VERTICAL_BASE_MIN_SPAN:
-        _vertical_since.pop(post_id, None)
-        _vertical_base.pop(post_id, None)
-        return False  # chưa đủ dữ liệu để so
+    # Facebook thường cập nhật views theo đợt (vài phút đến ~20 phút): chỉ dùng các mẫu mà số views THAY ĐỔI,
+    # tránh đoạn "đứng yên" giả làm tốc độ tụt rồi lại vọt.
+    pts = []
+    for ts, value in kept:
+        if not pts or value != pts[-1][1]:
+            pts.append((ts, value))
+    fresh = pts[-1][0] == now_ts
+    stale_min = (now_ts - pts[-1][0]) / 60
+    stale_hold = False
+    if not fresh and post_id in _vertical_since and stale_min <= VERTICAL_STALE_MINUTES:
+        # Lần đo này Facebook chưa cập nhật số: KHÔNG đánh giá lại (không tính trượt, cũng không tính đạt).
+        # Chỉ giữ trạng thái nếu lần có số mới gần nhất vẫn đang dựng.
+        if _vertical_miss.get(post_id) or post_id not in _vertical_last:
+            return False
+        vs, ratio = _vertical_last[post_id]
+        vb = _vertical_base.get(post_id, 0.3)
+        hit = stale_hold = True
+    else:
+        win = VERTICAL_SHORT_MINUTES
+        short = [((ts - now_ts) / 60, v) for ts, v in pts if (now_ts - ts) / 60 <= win]
+        if len(short) < 3:  # cập nhật thưa: nới cửa sổ tốc độ hiện tại lên tối đa 60 phút
+            win = 2 * VERTICAL_SHORT_MINUTES
+            short = [((ts - now_ts) / 60, v) for ts, v in pts if (now_ts - ts) / 60 <= win]
+        base = [((ts - now_ts) / 60, v) for ts, v in pts
+                if win <= (now_ts - ts) / 60 <= win + VERTICAL_BASE_MAX_MINUTES]
+        short_span = (short[-1][0] - short[0][0]) if len(short) >= 2 else 0
+        base_span = (base[-1][0] - base[0][0]) if len(base) >= 2 else 0
+        if len(short) < 3 or short_span < 10 or len(base) < 2 or base_span < VERTICAL_BASE_MIN_SPAN:
+            if post_id not in _vertical_since:
+                return False  # chưa đủ dữ liệu để so
+            # Đang trong đợt dựng mà thiếu mẫu: giữ trạng thái tới khi đủ dữ liệu / hết hạn đứng yên.
+            if stale_min > VERTICAL_STALE_MINUTES:
+                _vertical_since.pop(post_id, None)
+                _vertical_base.pop(post_id, None)
+            return False
 
-    vs = _slope_per_minute(short) or 0.0
-    vb = max(_slope_per_minute(base) or 0.0, 0.3)  # sàn 0,3 views/phút để bài gần như đứng im không bị chia cho ~0
-    if post_id in _vertical_since and post_id in _vertical_base:
-        vb = _vertical_base[post_id]  # đang trong đợt dựng: so với tốc độ nền trước khi dựng
-    ratio = vs / vb
-    # 12 phút gần nhất vẫn phải đang tăng nhanh: loại cú giật ngắn đã qua (vẫn nằm trong cửa sổ 30 phút).
-    tail = [p for p in short if p[0] >= -12]
-    vt = _slope_per_minute(tail) if len(tail) >= 2 and (tail[-1][0] - tail[0][0]) >= 5 else vs
-    hit = (vs >= VERTICAL_MIN_RATE and ratio >= VERTICAL_MIN_RATIO
-           and (vt or 0) >= max(VERTICAL_MIN_RATE, 0.5 * vs, VERTICAL_MIN_RATIO * vb * 0.7))
+        vs = _slope_per_minute(short) or 0.0
+        vb = max(_slope_per_minute(base) or 0.0, 0.3)  # sàn 0,3 views/phút để bài gần như đứng im không bị chia cho ~0
+        if post_id in _vertical_since and post_id in _vertical_base:
+            vb = _vertical_base[post_id]  # đang trong đợt dựng: so với tốc độ nền trước khi dựng
+        ratio = vs / vb
+        # Đoạn cuối vẫn phải đang tăng nhanh: loại cú giật ngắn đã qua (vẫn nằm trong cửa sổ).
+        # Ưu tiên ~6 phút cuối; Facebook cập nhật thưa thì dùng 3 lần đổi số gần nhất.
+        tail = [p for p in short if p[0] >= -6]
+        if len(tail) < 2 or (tail[-1][0] - tail[0][0]) < 4:
+            tail = short[-3:]
+        vt = _slope_per_minute(tail) if len(tail) >= 2 and (tail[-1][0] - tail[0][0]) >= 4 else vs
+        hit = (vs >= VERTICAL_MIN_RATE and ratio >= VERTICAL_MIN_RATIO
+               and (vt or 0) >= max(VERTICAL_MIN_RATE, 0.5 * vs, VERTICAL_MIN_RATIO * vb * 0.7))
+        if hit:
+            _vertical_last[post_id] = (vs, ratio)
 
     if hit:
-        _vertical_miss.pop(post_id, None)
+        if not stale_hold:
+            _vertical_miss.pop(post_id, None)
         if post_id not in _vertical_since:
             _vertical_since[post_id] = now_ts
             _vertical_base[post_id] = vb
@@ -567,6 +605,7 @@ def record_and_check_spike(post_id: str, current_views, now: datetime):
         if misses >= 2 or post_id not in _vertical_since:
             _vertical_since.pop(post_id, None)
             _vertical_base.pop(post_id, None)
+            _vertical_last.pop(post_id, None)
         return False
 
     held_min = (now_ts - _vertical_since[post_id]) / 60
@@ -2633,7 +2672,13 @@ def check_all_pages():
 
             spike_key = f"spike_{page_id}_{post_id}"
 
-            if ENABLE_SPIKE_ALERT and spike_detected and spike_key not in already_notified:
+            spike_ev = spike_evidence.get(str(post_id), {}) if spike_detected else {}
+            # Dựng đứng MẠNH: xử lý như BÀI ĐANG LÊN (viết truyện + link) thay vì chỉ báo riêng.
+            vertical_alert = bool(VERTICAL_TRIGGERS_ALERT and spike_detected
+                                  and (views or 0) >= VERTICAL_MIN_VIEWS
+                                  and (spike_ev.get("rate_per_hour") or 0) >= VERTICAL_ALERT_MIN_RATE_PER_HOUR)
+
+            if ENABLE_SPIKE_ALERT and spike_detected and not vertical_alert and spike_key not in already_notified:
 
                 # Spike cũng phải kiểm tra link TRƯỚC khi báo Telegram.
 
@@ -2675,10 +2720,13 @@ def check_all_pages():
 
             # Little Girl: bài xuất hiện sau baseline được xử lý ngay, kể cả 0 views/comments.
             # Những Page còn lại vẫn phải đạt ngưỡng tương tác.
-            if not is_instant_page and not meets_threshold(views or 0, comments or 0):
+            if not is_instant_page and not meets_threshold(views or 0, comments or 0) and not vertical_alert:
                 continue
 
             qualified_reasons = (["Page đặc biệt: bài mới, không cần ngưỡng"] if is_special_page else [])
+            if vertical_alert:
+                qualified_reasons.append(
+                    f"dựng đứng ~{spike_ev.get('rate_per_hour')}/giờ, gấp {spike_ev.get('ratio')} lần")
             if (comments or 0) > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
             for rule in THRESHOLD_RULES:
@@ -2776,6 +2824,8 @@ def check_all_pages():
                 f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
                 f"Views: {views}\n"
                 f"Comments: {comments}\n"
+                + (f"🚀 Đang dựng đứng: ~{spike_ev.get('rate_per_hour', 0):,} views/giờ "
+                   f"(gấp {spike_ev.get('ratio', '?')} lần trước đó)\n" if spike_ev else "")
                 + (f"Link: {link}\n" if link else "")
                 + "=> Gắn link ngay!\n"
                 + "⏳ Đang tạo file TXT Part 2, 3 & 4 cho chính bài này..."
