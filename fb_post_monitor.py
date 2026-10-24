@@ -2453,10 +2453,10 @@ def story_worker():
 #   ENABLE_LINK_REMINDER=true            bật/tắt (mặc định bật)
 #   Điều kiện nhắc: bài ĐANG DỰNG ĐỨNG theo đúng thuật toán ở trên (VERTICAL_...).
 #   REMIND_MIN_MINUTES=15                chỉ xét sau khi báo ít nhất N phút
-#   REMIND_POLL_SECONDS=180              bao lâu kiểm tra lại 1 bài đã báo
+#   REMIND_POLL_SECONDS=60               bao lâu kiểm tra lại 1 bài đã báo
 ENABLE_LINK_REMINDER = os.getenv("ENABLE_LINK_REMINDER", "true").strip().lower() in ("1", "true", "yes", "on")
 REMIND_MIN_MINUTES = float(os.getenv("REMIND_MIN_MINUTES", "15"))
-REMIND_POLL_SECONDS = int(os.getenv("REMIND_POLL_SECONDS", "180"))  # đo dày hơn để thuật toán dựng đứng chính xác
+REMIND_POLL_SECONDS = int(os.getenv("REMIND_POLL_SECONDS", "60"))  # đo dày hơn để thuật toán dựng đứng chính xác
 LINK_REMIND_FILE = "/data/link_reminders.json"
 
 
@@ -2484,6 +2484,79 @@ def _save_link_reminders():
         os.replace(tmp, LINK_REMIND_FILE)
     except OSError as exc:
         print(f"[REMIND] Không lưu được {LINK_REMIND_FILE}: {exc}")
+
+
+# Luật "BẺ LÊN" cho nhắc gắn link: bắt ngay đầu đợt tăng vọt.
+JUMP_WINDOW_MINUTES = 10          # đo tốc độ ~10 phút gần nhất (Facebook cập nhật thưa thì nới tới 30 phút)
+JUMP_MIN_RATIO = 4                # nhanh gấp >= 4 lần tốc độ trước đó
+JUMP_MIN_RATE_PER_HOUR = 1800     # và >= 1.800 views/giờ
+JUMP_MIN_GAIN = 300               # và đã tăng >= 300 views trong đoạn đo
+JUMP_SURE_GAIN = 1000             # tăng >= 1.000 views thì nhắc luôn, không cần đo xác nhận
+_jump_pending = {}                # post_id -> thời điểm lần đo đầu tiên thấy bẻ lên (chờ xác nhận)
+
+
+def _jump_check(pid, alert_base):
+    """Trả (True, mô tả) nếu bài VỪA BẺ LÊN. Dùng lịch sử views đã ghi (chỉ các lần số views thay đổi)."""
+    now_ts = time.time()
+    pts = []
+    for entry in view_history.get(str(pid), []):
+        try:
+            ts, v = _sample_epoch(entry[0]), int(entry[1])
+        except (ValueError, TypeError, IndexError, OverflowError):
+            continue
+        if not pts or v != pts[-1][1]:
+            pts.append((ts, v))
+    if len(pts) < 2:
+        return False, ""
+    last_t, last_v = pts[-1]
+    fresh = (now_ts - last_t) <= 90  # lần đo này có số mới
+    if (now_ts - last_t) / 60 > 30:
+        return False, ""
+    # Điểm đầu đoạn đo: lần đổi số gần nhất cách điểm cuối >= ~8 phút (tối đa 30 phút).
+    start = None
+    for t, v in reversed(pts[:-1]):
+        if (last_t - t) / 60 >= JUMP_WINDOW_MINUTES * 0.8:
+            start = (t, v)
+            break
+    if not start or (last_t - start[0]) / 60 > 30:
+        return False, ""
+    span = (last_t - start[0]) / 60
+    gain = last_v - start[1]
+    rate = gain / span  # views/phút
+    # Tốc độ trước đó: đoạn 60 phút trước điểm đầu; thiếu dữ liệu thì tính từ lúc báo.
+    before = [(t, v) for t, v in pts if 0 <= (start[0] - t) / 60 <= 60]
+    if len(before) >= 2 and (before[-1][0] - before[0][0]) / 60 >= 20:
+        base_rate = (before[-1][1] - before[0][1]) / ((before[-1][0] - before[0][0]) / 60)
+    else:
+        try:
+            alert_ts = datetime.fromisoformat(alert_base["at"]).timestamp()
+            mins = (start[0] - alert_ts) / 60
+            base_rate = (start[1] - int(alert_base.get("views") or 0)) / mins if mins >= 10 else None
+        except (KeyError, ValueError, TypeError):
+            base_rate = None
+        if base_rate is None:
+            return False, ""
+    base_rate = max(base_rate, 0.5)  # sàn 30 views/giờ
+    hit = (rate * 60 >= JUMP_MIN_RATE_PER_HOUR and rate >= JUMP_MIN_RATIO * base_rate and gain >= JUMP_MIN_GAIN)
+    desc = (f"vừa BẺ LÊN: +{gain:,} views trong {span:.0f} phút (~{rate * 60:,.0f} views/giờ, "
+            f"gấp {rate / base_rate:.1f} lần trước đó)")
+    if not hit:
+        if fresh:
+            _jump_pending.pop(str(pid), None)
+        return False, ""
+    if gain >= JUMP_SURE_GAIN:
+        return True, desc
+    first = _jump_pending.get(str(pid))
+    if first is None:
+        _jump_pending[str(pid)] = (last_t, last_v)
+        return False, ""
+    # Xác nhận: từ lần thấy bẻ lên đến lần đổi số mới, bài VẪN tăng nhanh (loại cú giật số 1 lần rồi đứng).
+    dt = (last_t - first[0]) / 60
+    if dt >= 1 and (last_v - first[1]) / dt * 60 >= JUMP_MIN_RATE_PER_HOUR / 2:
+        return True, desc
+    if dt >= 1 and fresh:
+        _jump_pending.pop(str(pid), None)
+    return False, ""
 
 
 def _record_alert_baseline(post_id, views, comments):
@@ -2528,13 +2601,16 @@ def check_link_reminders(page_id, page_name, page_token, all_post_ids):
             minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(base["at"])).total_seconds() / 60
         except (KeyError, ValueError, TypeError):
             minutes = REMIND_MIN_MINUTES
-        # Dùng chung thuật toán "đang dựng đứng" (ghi mẫu views mỗi lần đo).
+        # Ghi mẫu views + thuật toán "đang dựng đứng" (cho bài nhỏ tăng chậm).
         vertical = record_and_check_spike(pid, views, datetime.now())
-        if not vertical or minutes < REMIND_MIN_MINUTES:
+        # Luật BẺ LÊN: bắt ngay mấy phút đầu của đợt tăng vọt (trước khi dựng xong).
+        jump, jump_desc = _jump_check(pid, base)
+        if not (jump or vertical) or minutes < REMIND_MIN_MINUTES:
             continue
         ev = spike_evidence.get(pid, {})
-        reason = (f"tốc độ ~{ev.get('rate_per_hour', '?'):,} views/giờ, gấp {ev.get('ratio', '?')} lần trước đó, "
-                  f"đã giữ {ev.get('held_minutes', '?')} phút")
+        reason = jump_desc if jump else (
+            f"tốc độ ~{ev.get('rate_per_hour', '?'):,} views/giờ, gấp {ev.get('ratio', '?')} lần trước đó, "
+            f"đã giữ {ev.get('held_minutes', '?')} phút")
         link_status = post_already_has_link(pid, page_id, page_token, message)
         if link_status is True:
             base["status"] = "has_link"
@@ -2548,11 +2624,12 @@ def check_link_reminders(page_id, page_name, page_token, all_post_ids):
             alert_time = datetime.fromisoformat(base["at"]).astimezone(timezone(timedelta(hours=7))).strftime("%H:%M %d/%m")  # giờ Việt Nam
         except (KeyError, ValueError, TypeError):
             alert_time = "trước đó"
+        headline = reason if jump else f"đang DỰNG ĐỨNG ({reason})"
         dv = int(views or 0) - int(base.get("views") or 0)
         dc = int(comments or 0) - int(base.get("comments") or 0)
         text = (
             f"⏰ NHẮC GẮN LINK! (Page: {page_name})\n"
-            f"Bài đã báo lúc {alert_time} nhưng VẪN CHƯA có link mà đang DỰNG ĐỨNG ({reason}):\n"
+            f"Bài đã báo lúc {alert_time} nhưng VẪN CHƯA có link mà {headline}:\n"
             f"Views: {int(base.get('views') or 0):,} → {int(views or 0):,} ({dv:+,})\n"
             f"Comments: {int(base.get('comments') or 0):,} → {int(comments or 0):,} ({dc:+,})\n"
             + (f"Link: {link}\n" if link else "")
@@ -2677,6 +2754,11 @@ def check_all_pages():
             vertical_alert = bool(VERTICAL_TRIGGERS_ALERT and spike_detected
                                   and (views or 0) >= VERTICAL_MIN_VIEWS
                                   and (spike_ev.get("rate_per_hour") or 0) >= VERTICAL_ALERT_MIN_RATE_PER_HOUR)
+            jump_desc = ""
+            if VERTICAL_TRIGGERS_ALERT and not vertical_alert and (views or 0) >= VERTICAL_MIN_VIEWS:
+                # Vọt lên gắt (cả đợt chỉ 30-40 phút): báo ngay mấy phút đầu, không đợi giữ đủ 20 phút.
+                jumped, jump_desc = _jump_check(post_id, {})
+                vertical_alert = bool(jumped)
 
             if ENABLE_SPIKE_ALERT and spike_detected and not vertical_alert and spike_key not in already_notified:
 
@@ -2725,7 +2807,7 @@ def check_all_pages():
 
             qualified_reasons = (["Page đặc biệt: bài mới, không cần ngưỡng"] if is_special_page else [])
             if vertical_alert:
-                qualified_reasons.append(
+                qualified_reasons.append(jump_desc or
                     f"dựng đứng ~{spike_ev.get('rate_per_hour')}/giờ, gấp {spike_ev.get('ratio')} lần")
             if (comments or 0) > COMMENT_ONLY_THRESHOLD:
                 qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
@@ -2826,6 +2908,7 @@ def check_all_pages():
                 f"Comments: {comments}\n"
                 + (f"🚀 Đang dựng đứng: ~{spike_ev.get('rate_per_hour', 0):,} views/giờ "
                    f"(gấp {spike_ev.get('ratio', '?')} lần trước đó)\n" if spike_ev else "")
+                + (f"🚀 Bài {jump_desc}\n" if jump_desc and not spike_ev else "")
                 + (f"Link: {link}\n" if link else "")
                 + "=> Gắn link ngay!\n"
                 + "⏳ Đang tạo file TXT Part 2, 3 & 4 cho chính bài này..."
