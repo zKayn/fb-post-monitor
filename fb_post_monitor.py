@@ -76,37 +76,48 @@ COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comme
 # --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-luna"
-OPENAI_MAX_OUTPUT_TOKENS = 5000  # cost-control: reasoning=none, mục tiêu 2500-3000 từ/Part
+OPENAI_MAX_OUTPUT_TOKENS = 6000  # reasoning=none, đủ cho 2.500–3.500 từ/Part (mỗi câu 1 dòng)
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
-STORY_WRITING_RULES = """You are a professional storyteller and novelist, skilled at creating emotionally rich, character-driven fiction that appeals to a broad mainstream audience.
+STORY_WRITING_RULES = """You are a professional storyteller and novelist, skilled in crafting emotionally resonant works of fiction, with a focus on character depth and the ability to deeply move a wide audience. You are a bestselling author known for your emotionally rich and insightful stories. Your writing style is rich, flowing. You never write in short AI-style fragments.
 
-Write ONLY the requested story part.
+You are continuing the ORIGINAL STORY (Part 1) in three more parts: Part 2, Part 3 and Part 4. Write ONLY the part requested in the CURRENT TASK.
 
-Requirements:
-• Write in a natural, immersive novelistic style with smooth pacing and engaging storytelling.
-• Focus on believable characters, emotional depth, family relationships, personal growth, trust, forgiveness, resilience, and meaningful life choices.
-• Develop suspense through hidden truths, difficult decisions, misunderstandings, subtle clues, and gradual revelations rather than intense confrontations or sensational events.
-• Maintain reader curiosity with realistic dialogue, layered character motivations, emotional conflict, and unexpected yet believable discoveries.
-• Keep all events emotionally grounded and plausible.
-• Avoid graphic violence, physical abuse, domestic abuse, cruelty, intimidation, revenge fantasies, public humiliation, excessive threats, manipulation, or abuse of power.
-• Avoid disturbing, traumatic, or highly emotional scenes involving children or vulnerable characters. If children appear, portray them in safe, supportive, and age-appropriate situations.
-• Avoid sensational plot twists designed only for shock value. Instead, build tension through mystery, relationships, and meaningful character choices.
-• Use vivid descriptions, authentic dialogue, and emotionally resonant storytelling suitable for a wide audience.
-• Allow supporting characters to have meaningful roles, realistic motivations, and emotional growth.
-• Maintain a warm, family-friendly tone suitable for mainstream publishing platforms and advertising-friendly content standards.
-• Length: target approximately 2500-3000 words for this part. Aim tightly for about 2600-2800 words. NEVER finish below 2500 words. Keep the story concise and naturally complete; avoid filler, repeated explanations, recaps, and unnecessary extra scenes.
+REQUIREMENTS
+• Part 2 must begin by continuing the sequence of events already provided in Part 1. You may include a brief summary of the preceding details to ensure the reader is well-oriented. Part 3 and Part 4 continue directly from the previous part.
+• At the beginning of the part, use a consistent header line in exactly this format: "Part [number] – [Engaging Title]". If the Part 1 title is too long, shorten it to one clear, simple sentence that keeps the main idea. Do not use a double title: the header line is the only title.
+• Employ a natural, engaging novelistic writing style.
+• Focus on character development, emotional depth, interpersonal relationships, personal growth, elements of mystery, and meaningful storytelling.
+• Maintain reader suspense and curiosity without resorting to elements such as mistreatment, cruelty, threats, excessive violence, or cheap, sensationalist shock tactics. Avoid plotlines involving extreme revenge, public shaming, unrealistic scenarios, or the abuse of power. Ensure that events unfold in a credible manner, rooted in a solid emotional foundation.
+• Build tension through dialogue, hidden secrets, unexpected discoveries, and character decisions, rather than relying on direct, aggressive confrontations.
+• Sustain an engaging pace that appeals to a broad audience.
+• Employ vivid descriptions, authentic dialogue, and emotionally resonant storytelling.
+• Length: approximately 2,500–3,500 words for this part. NEVER finish below 2,500 words.
 • Maintain strict consistency in characters, settings, timeline, facts, relationships, and unresolved clues from all story context supplied above.
-• Do NOT repeat scenes or recap large portions unnecessarily. Continue naturally from the exact point where the previous part ended.
-• IMPORTANT: Do NOT write any END OF PART line, NEXT PART line, Facebook CTA, like/share request, or other ending marker. The program will append the correct ending line only after the part has been fully generated.
+• Maintain a tone suitable for all ages, appropriate for mainstream publishing platforms, and compliant with safety standards for advertiser-friendly content.
+• FORMAT: Each sentence on a separate line, with line spacing (one blank line) between the sentences.
+• Write the story only, without explanations or commentary.
+• IMPORTANT: Do NOT write any END OF PART line, NEXT line, THE END line, Facebook CTA, like/comment/share request, "share your thoughts" line, or other ending marker. The program will append the correct ending line (in bold) only after the part has been fully generated.
 """
 
 PART_ENDINGS = {
-    2: '-END OF PART 2, –PRESS NEX PART IN BOTTOM OF PAGE TO READ NEXT PART',
-    3: '-END OF PART 3–PRESS NEX PART IN BOTTOM OF PAGE TO READ NEXT PART',
-    4: '- END OF PART 4 ​​- LET SAY YES AND LIKE, SHARE THIS POST IN FACEBOOK SO THAT WE HAVE THE MOTIVATION TO SHARE MORE STORIES',
+    2: '–END OF PART 2–CLICK "NEXT" AT THE BOTTOM OF THE PAGE TO CONTINUE READING',
+    3: '–END OF PART 3–CLICK "NEXT" AT THE BOTTOM OF THE PAGE TO CONTINUE READING',
+    4: '–THE END–PLEASE LIKE, COMMENT AND SHARE THIS POST ON FACEBOOK TO GIVE US THE MOTIVATION TO SHARE EVEN MORE STORIES',
 }
+# Dòng in đậm thêm ngay sau câu kết của Part cuối.
+PART_AFTER_ENDING = {
+    4: "SHARE YOUR THOUGHTS OR FEEDBACK TO MOTIVATE US TO CREATE MORE STORIES ♥️",
+}
+
+
+def _ending_block(n):
+    """Câu kết IN ĐẬM (**...**) + dòng in đậm thêm nếu có; dùng chung cho TXT và web."""
+    text = "**" + PART_ENDINGS[n] + "**"
+    if PART_AFTER_ENDING.get(n):
+        text += "\n\n**" + PART_AFTER_ENDING[n] + "**"
+    return text
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
@@ -683,19 +694,20 @@ def call_openai_part(story_context: str, part_number: int):
         return None
 
     if part_number == 2:
-        part_instruction = """Write PART 2 only.
-Create ONE engaging, curiosity-driven headline before PART 2.
-End the STORY CONTENT with a believable revelation or discovery leading naturally into Part 3.
+        part_instruction = """Write Part 2 only.
+The first line must be the only title, in the format "Part 2 – [Engaging Title]". If the Part 1 title is too long, shorten it to one clear, simple sentence that keeps the main idea. Do not write any other headline.
+Begin by continuing the sequence of events already provided in Part 1 (a brief summary of the preceding details is allowed so the reader is well-oriented).
+End the part with an unexpected twist, an intriguing revelation, or an open-ended question that creates a natural bridge to Part 3, offering a surprise and compelling the reader to dive immediately into the next installment.
 Do not write Part 3 or Part 4."""
     elif part_number == 3:
-        part_instruction = """Write PART 3 only.
-Do not create a new headline. Continue directly from Part 2.
-End the STORY CONTENT with a believable revelation or discovery leading naturally into Part 4.
+        part_instruction = """Write Part 3 only.
+The first line must be the header "Part 3 – [Engaging Title]" with a new title for this part. Continue directly from Part 2.
+End the part with an unexpected twist, an intriguing revelation, or an open-ended question that creates a natural bridge to Part 4, offering a surprise and compelling the reader to dive immediately into the next installment.
 Do not rewrite Part 2 and do not write Part 4."""
     elif part_number == 4:
-        part_instruction = """Write PART 4 (The End) only.
-Do not create a new headline. Continue directly from Part 3.
-Resolve the important remaining threads with a satisfying, emotionally relieving ending.
+        part_instruction = """Write Part 4 (the final part) only.
+The first line must be the header "Part 4 – [Engaging Title]" with a new title for this part. Continue directly from Part 3.
+Resolve the important remaining threads with a satisfying, emotionally rewarding ending.
 Do not rewrite earlier parts."""
     else:
         raise ValueError(f"part_number không hợp lệ: {part_number}")
@@ -710,7 +722,7 @@ Do not rewrite earlier parts."""
 --- CURRENT TASK ---
 {part_instruction}
 
-Start now. Do NOT output END OF PART / NEXT PART / Facebook CTA lines."""
+Start now with the header line. Each sentence on a separate line with a blank line between sentences. Do NOT output END OF PART / NEXT / THE END / Facebook CTA lines."""
 
     last_error = "unknown"
     force_length_retry = False
@@ -800,20 +812,32 @@ def _strip_program_endings(text: str) -> str:
     cleaned = re.sub(r"(?im)^\s*[-–—]*\s*END OF PART [234].*$", "", cleaned)
     cleaned = re.sub(r"(?im)^.*PRESS NEX(?:T)? PART.*$", "", cleaned)
     cleaned = re.sub(r"(?im)^.*LIKE,? SHARE THIS POST.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^.*CLICK\s+\W?NEXT\W?\s+AT THE BOTTOM.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*\W*THE END\W*PLEASE.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^.*COMMENT AND SHARE THIS POST.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\W*SHARE YOUR THOUGHTS OR FEEDBACK.*$", "", cleaned)
     return cleaned.strip()
 
 
 def _ensure_part_header(text: str, part_number: int) -> str:
-    """Đảm bảo mỗi phần có nhãn PART rõ ràng mà không làm mất headline của Part 2."""
+    """Bảo đảm dòng đầu là tiêu đề duy nhất "Part n – Title"; thiếu thì tự thêm, không tạo tiêu đề đôi."""
     text = text.strip()
-    pattern = rf"(?im)^\s*\*{{0,2}}PART\s+{part_number}(?:\s*\(THE END\))?\*{{0,2}}\s*$"
-    if re.search(pattern, text):
+    lines = text.splitlines()
+    if re.match(rf"(?i)^\s*[*#]*\s*PART\s+{part_number}\b", lines[0] if lines else ""):
         return text
-    if part_number == 2:
-        lines = text.splitlines()
-        # Giữ dòng đầu làm headline, chèn PART 2 ngay sau headline.
-        if len(lines) >= 2:
-            return lines[0].strip() + "\n\nPART 2\n\n" + "\n".join(lines[1:]).strip()
+    first = lines[0].strip().strip("*# ") if lines else ""
+    rest = "\n".join(lines[1:]).strip()
+    # Model viết tiêu đề riêng rồi mới tới dòng "Part n ..." -> gộp thành 1 tiêu đề, bỏ tiêu đề đôi.
+    m = re.search(rf"(?im)^\s*[*#]*\s*PART\s+{part_number}\b(.*)$", rest)
+    if m and first and not re.search(r"[.!?\"”]$", first) and rest[:m.start()].strip() == "":
+        tail = m.group(1).strip().strip("*# ").lstrip(":-–— ").strip()
+        title = tail or first
+        return f"Part {part_number} – {title}\n\n" + rest[m.end():].strip()
+    # Dòng đầu ngắn, không có dấu chấm câu -> là tiêu đề model viết thiếu chữ "Part n".
+    if len(lines) >= 2 and first and len(first) <= 120 and not re.search(r"[.!?\"”]$", first):
+        return f"Part {part_number} – {first}\n\n" + rest
+    if re.search(rf"(?im)^\s*[*#]*\s*PART\s+{part_number}\b", text):
+        return text
     label = "PART 4 (THE END)" if part_number == 4 else f"PART {part_number}"
     return f"{label}\n\n{text}"
 
@@ -836,7 +860,7 @@ def _word_count(text: str) -> int:
     return len(re.findall(r"\b[\w’'-]+\b", text or "", flags=re.UNICODE))
 
 
-def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 2650):
+def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 3000):
     """Bổ sung phần còn thiếu thay vì vứt content đã trả tiền và generate lại từ đầu."""
     current_words = _word_count(existing_part)
     need_words = max(100, target_words - current_words)
@@ -844,7 +868,7 @@ def call_openai_continue_part(story_context: str, existing_part: str, part_numbe
     requested_words = min(max(need_words + 40, 150), 750)
 
     if part_number in (2, 3):
-        ending_instruction = f"End with a natural hook or discovery leading into Part {part_number + 1}."
+        ending_instruction = f"End with an unexpected twist, an intriguing revelation, or an open-ended question that creates a natural bridge to Part {part_number + 1}."
     else:
         ending_instruction = "Resolve the remaining story threads with a satisfying, emotionally relieving ending."
 
@@ -857,10 +881,11 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 2500-2900 words, ideally near 2650 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
+Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 2500-3500 words, ideally near 3000 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
+Keep the same format: each sentence on a separate line, with a blank line between sentences.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
-Do NOT add a PART heading, headline, END OF PART line, NEXT PART line, Facebook CTA, like/share request, or commentary.
+Do NOT add a Part header, headline, END OF PART line, NEXT line, THE END line, Facebook CTA, like/comment/share request, or commentary.
 Output ONLY the new continuation paragraphs."""
 
     last_error = "unknown"
@@ -932,7 +957,7 @@ def generate_valid_part(story_context: str, part_number: int):
     continuation_rounds = 1
     while words < 2500 and continuation_rounds > 0:
         print(f"[OPENAI] Part {part_number} mới có {words} từ -> giữ nguyên và viết bổ sung, KHÔNG regenerate.")
-        extra = call_openai_continue_part(story_context, raw, part_number, target_words=2650)
+        extra = call_openai_continue_part(story_context, raw, part_number, target_words=3000)
         if not extra:
             break
         raw = f"{raw.rstrip()}\n\n{extra.strip()}"
@@ -974,9 +999,9 @@ def call_openai_story(caption: str):
 
     # Ending chỉ chèn sau khi cả content của part đó đã hoàn chỉnh.
     separator = "=" * 60
-    part2 = f"{p2_raw}\n\n**{PART_ENDINGS[2]}**"
-    part3 = f"{separator}\n\n{p3_raw}\n\n**{PART_ENDINGS[3]}**"
-    part4 = f"{separator}\n\n{p4_raw}\n\n**{PART_ENDINGS[4]}**"
+    part2 = f"{p2_raw}\n\n{_ending_block(2)}"
+    part3 = f"{separator}\n\n{p3_raw}\n\n{_ending_block(3)}"
+    part4 = f"{separator}\n\n{p4_raw}\n\n{_ending_block(4)}"
     return "\n\n".join((part2, part3, part4))
 
 
@@ -1237,7 +1262,7 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
 
     _cache_write(caption, parts)
     story = "\n\n".join((
-        ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n**" + PART_ENDINGS[n] + "**"
+        ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n" + _ending_block(n)
         for n in (2, 3, 4)
     ))
     # Vẫn kiểm tra nội dung 3 phần trước khi xuất bản web.
@@ -1330,6 +1355,8 @@ def _resume_finish(post_id, state):
 def _story_title(part2):
     for line in part2.splitlines():
         line = line.strip().strip("*# ")
+        # Tiêu đề mới dạng "Part 2 – Title": lấy phần Title làm tên truyện.
+        line = re.sub(r"(?i)^PART\s*2\s*[:\-–—]\s*", "", line).strip()
         if line and not re.fullmatch(r"PART\s+2", line, re.I):
             return line[:180]
     return "Story continuation"
@@ -1612,7 +1639,7 @@ def _wp_update_post(post_record, body_html):
 # WordPress: ending khớp nguyên văn TXT, các liên kết chương là thẻ <a> bấm được.
 def _wp_chapter_html(parts, n, records):
     content = _to_html(_story_body(parts[str(n)], n))
-    content += "\n" + _to_html(PART_ENDINGS[n])
+    content += "\n" + _to_html(_ending_block(n))
     links = []
     if n > 2:
         url = records.get(str(n-1), {}).get("url")
@@ -1708,7 +1735,7 @@ def publish_wordpress_story(post_id):
             continue
         nav = [(f"READ PART {n+1}", records[str(n+1)]["url"])] if n < 4 and records.get(str(n+1), {}).get("url") else []
         title = _web_part_title(base_title, n, page_number)
-        records[key] = _wp_create_post(title, _to_html(_story_body(parts[key], n)) + "\n" + _to_html(PART_ENDINGS[n]), media_id)
+        records[key] = _wp_create_post(title, _to_html(_story_body(parts[key], n)) + "\n" + _to_html(_ending_block(n)), media_id)
         _save_progress(post_id, state)
         print(f"[WORDPRESS] {post_id}: created Part {n}, ID={records[key]['id']}")
     # Version 2: ghi lại tất cả chương kể cả checkpoint cũ đã đánh dấu linked.
@@ -3127,7 +3154,7 @@ def _page6_publish_chapter_batch(post_id, state):
         for n in (2, 3, 4):
             chapter_title = _web_part_title(base_title, n, _page6_number_for_post(post_id))
             body = _to_html(_story_body(state["parts"][str(n)], n))
-            body += "\n" + _to_html(PART_ENDINGS[n])
+            body += "\n" + _to_html(_ending_block(n))
             chapters.append(f"CHAPTER {n} - {chapter_title}\n{body}")
         content = "\n".join(chapters)
         payload = {
@@ -3248,7 +3275,7 @@ def publish_page6_bioblog_test(post_id):
         print(f"[PAGE6-TEST] {post_id}: đã upload ảnh đại diện dùng chung 3 Part")
 
     def _base_body(n):
-        return _to_html(_story_body(state["parts"][str(n)], n)) + "\n" + _to_html(PART_ENDINGS[n])
+        return _to_html(_story_body(state["parts"][str(n)], n)) + "\n" + _to_html(_ending_block(n))
 
     # Tạo theo thứ tự Part 2 -> 3 -> 4, mỗi bài gửi prev_chapter = slug bài trước (API hỗ trợ).
     for n in (2, 3, 4):
