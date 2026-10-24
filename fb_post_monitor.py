@@ -73,51 +73,74 @@ COMMENT_LINK_MAX_PAGES = 30  # quét tối đa 30 trang x 100 comments trước 
 COMMENT_COUNT_MAX_PAGES = 10  # fallback đếm comment thực tế khi summary có thể thấp hơn UI
 COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comment <= 15 để tiết kiệm Graph API
 
-# --- Tự viết Part 2 + Part 3 + Part 4 bằng 3 OpenAI API request liên tiếp ---
+# --- Tự viết Part 2 → Part 6 (5 Part), mỗi Part 1 request OpenAI liên tiếp ---
+STORY_PARTS = (2, 3, 4, 5, 6)   # Part 1 là bài gốc trên Facebook
+LAST_PART = STORY_PARTS[-1]     # Part cuối = THE END
+STORY_MIN_WORDS = 2000          # mỗi Part tối thiểu 2.000 từ
+STORY_TARGET_WORDS = 2500       # mục tiêu ~2.000–3.000 từ
 ENABLE_STORY_CONTINUATION = True
 OPENAI_MODEL = "gpt-5.6-luna"
-OPENAI_MAX_OUTPUT_TOKENS = 6000  # reasoning=none, đủ cho 2.500–3.500 từ/Part (mỗi câu 1 dòng)
+OPENAI_MAX_OUTPUT_TOKENS = 5500  # đủ cho 2.000–3.000 từ/Part (mỗi câu 1 dòng)
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
 STORY_WRITING_RULES = """You are a professional storyteller and novelist, skilled in crafting emotionally resonant works of fiction, with a focus on character depth and the ability to deeply move a wide audience. You are a bestselling author known for your emotionally rich and insightful stories. Your writing style is rich, flowing. You never write in short AI-style fragments.
 
-You are continuing the ORIGINAL STORY (Part 1) in three more parts: Part 2, Part 3 and Part 4. Write ONLY the part requested in the CURRENT TASK.
+You are continuing the ORIGINAL STORY (Part 1) in five more parts: Part 2, Part 3, Part 4, Part 5 and Part 6. Write ONLY the part requested in the CURRENT TASK.
 
 REQUIREMENTS
-• Part 2 must begin by continuing the sequence of events already provided in Part 1. You may include a brief summary of the preceding details to ensure the reader is well-oriented. Part 3 and Part 4 continue directly from the previous part.
-• At the beginning of the part, use a consistent header line in exactly this format: "Part [number] – [Engaging Title]". If the Part 1 title is too long, shorten it to one clear, simple sentence that keeps the main idea. Do not use a double title: the header line is the only title.
+• Part 2 must begin by continuing the sequence of events already provided in Part 1. Every later part continues directly from the previous part.
+• At the beginning of the part, use a consistent header line in exactly this format: "Part [number] – [Title]" (for example: "Part 3 – The Letter in the Drawer").
 • Employ a natural, engaging novelistic writing style.
 • Focus on character development, emotional depth, interpersonal relationships, personal growth, elements of mystery, and meaningful storytelling.
 • Maintain reader suspense and curiosity without resorting to elements such as mistreatment, cruelty, threats, excessive violence, or cheap, sensationalist shock tactics. Avoid plotlines involving extreme revenge, public shaming, unrealistic scenarios, or the abuse of power. Ensure that events unfold in a credible manner, rooted in a solid emotional foundation.
 • Build tension through dialogue, hidden secrets, unexpected discoveries, and character decisions, rather than relying on direct, aggressive confrontations.
 • Sustain an engaging pace that appeals to a broad audience.
 • Employ vivid descriptions, authentic dialogue, and emotionally resonant storytelling.
-• Length: approximately 2,500–3,500 words for this part. NEVER finish below 2,500 words.
-• Maintain strict consistency in characters, settings, timeline, facts, relationships, and unresolved clues from all story context supplied above.
+• Length: approximately 2,000–3,000 words for this part. NEVER finish below 2,000 words.
+• Preserve 100% of Part 1's characters, relationships, events, timeline, personalities, and story logic, and stay consistent with every earlier part supplied above.
+• Follow the STORY PLAN (if provided) so every clue and revelation connects logically to the final resolution. Never print the plan.
 • Maintain a tone suitable for all ages, appropriate for mainstream publishing platforms, and compliant with safety standards for advertiser-friendly content.
 • FORMAT: Each sentence on a separate line, with line spacing (one blank line) between the sentences.
 • Write the story only, without explanations or commentary.
-• IMPORTANT: Do NOT write any END OF PART line, NEXT line, THE END line, Facebook CTA, like/comment/share request, "share your thoughts" line, or other ending marker. The program will append the correct ending line (in bold) only after the part has been fully generated.
+• IMPORTANT: Do NOT write any END OF PART line, NEXT line, THE END line, Facebook CTA, comment/like/share request, or other ending marker. The program will append the correct ending line (in bold) only after the part has been fully generated.
 """
+
+# Vai trò từng Part theo cấu trúc truyện
+PART_ROLES = {
+    2: "Deepen emotional connections and reveal the first meaningful secret.",
+    3: "Complicate relationships through unexpected but believable discoveries.",
+    4: "Reveal a major hidden truth that changes the characters' understanding of the past.",
+    5: "Reach the emotional climax through a difficult, meaningful choice, ending with powerful anticipation.",
+    6: "Resolve everything with an emotionally rewarding, unforgettable happy ending.",
+}
 
 PART_ENDINGS = {
     2: '–END OF PART 2–CLICK "NEXT" AT THE BOTTOM OF THE PAGE TO CONTINUE READING',
     3: '–END OF PART 3–CLICK "NEXT" AT THE BOTTOM OF THE PAGE TO CONTINUE READING',
-    4: '–THE END–PLEASE LIKE, COMMENT AND SHARE THIS POST ON FACEBOOK TO GIVE US THE MOTIVATION TO SHARE EVEN MORE STORIES',
+    4: '–END OF PART 4–CLICK "NEXT" AT THE BOTTOM OF THE PAGE TO CONTINUE READING',
+    5: '–END OF PART 5–CLICK "NEXT" AT THE BOTTOM OF THE PAGE TO CONTINUE READING',
+    6: '–THE END–PLEASE COMMENT "YES," AND LIKE AND SHARE THIS POST ON FACEBOOK TO GIVE US THE MOTIVATION TO SHARE EVEN MORE STORIES',
 }
-# Dòng in đậm thêm ngay sau câu kết của Part cuối.
+# Dòng thêm (không in đậm) ngay sau câu kết của Part cuối.
 PART_AFTER_ENDING = {
-    4: "SHARE YOUR THOUGHTS OR FEEDBACK TO MOTIVATE US TO CREATE MORE STORIES ♥️",
+    6: "Share your thoughts or feedback to motivate us to create more stories ♥️",
 }
 
 
 def _ending_block(n):
-    """Câu kết IN ĐẬM (**...**) + dòng in đậm thêm nếu có; dùng chung cho TXT và web."""
+    """Câu kết IN ĐẬM (**...**) + dòng thêm nếu có; dùng chung cho TXT và web."""
     text = "**" + PART_ENDINGS[n] + "**"
     if PART_AFTER_ENDING.get(n):
-        text += "\n\n**" + PART_AFTER_ENDING[n] + "**"
+        text += "\n\n" + PART_AFTER_ENDING[n]
     return text
+
+
+def _part_label(n):
+    """Nhãn Part: Part cuối có (THE END)."""
+    return f"PART {n} (THE END)" if n == LAST_PART else f"PART {n}"
+
+
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
 INCLUDE_PAGE_NAMES = []
@@ -690,27 +713,31 @@ def send_telegram_document(file_path: str, caption: str = ""):
 def call_openai_part(story_context: str, part_number: int):
     """Sinh đúng 1 part. Chỉ trả content; ending được nối đúng 1 lần sau khi part thành công."""
     if not OPENAI_API_KEY:
-        print("[CẢNH BÁO] Chưa cấu hình OPENAI_API_KEY, bỏ qua bước viết Part 2/3/4.")
+        print("[CẢNH BÁO] Chưa cấu hình OPENAI_API_KEY, bỏ qua bước viết truyện.")
         return None
 
-    if part_number == 2:
-        part_instruction = """Write Part 2 only.
-The first line must be the only title, in the format "Part 2 – [Engaging Title]". If the Part 1 title is too long, shorten it to one clear, simple sentence that keeps the main idea. Do not write any other headline.
-Begin by continuing the sequence of events already provided in Part 1 (a brief summary of the preceding details is allowed so the reader is well-oriented).
-End the part with an unexpected twist, an intriguing revelation, or an open-ended question that creates a natural bridge to Part 3, offering a surprise and compelling the reader to dive immediately into the next installment.
-Do not write Part 3 or Part 4."""
-    elif part_number == 3:
-        part_instruction = """Write Part 3 only.
-The first line must be the header "Part 3 – [Engaging Title]" with a new title for this part. Continue directly from Part 2.
-End the part with an unexpected twist, an intriguing revelation, or an open-ended question that creates a natural bridge to Part 4, offering a surprise and compelling the reader to dive immediately into the next installment.
-Do not rewrite Part 2 and do not write Part 4."""
-    elif part_number == 4:
-        part_instruction = """Write Part 4 (the final part) only.
-The first line must be the header "Part 4 – [Engaging Title]" with a new title for this part. Continue directly from Part 3.
-Resolve the important remaining threads with a satisfying, emotionally rewarding ending.
-Do not rewrite earlier parts."""
-    else:
+    if part_number not in STORY_PARTS:
         raise ValueError(f"part_number không hợp lệ: {part_number}")
+    role = PART_ROLES.get(part_number, "")
+    if part_number == STORY_PARTS[0]:
+        part_instruction = f"""Write Part {part_number} only.
+The first line must be the header "Part {part_number} – [Title]", where the title is an engaging, curiosity-driven headline for this story.
+Begin by continuing the sequence of events already provided in Part 1.
+Purpose of this part: {role}
+End the part with an unexpected twist, an intriguing revelation, or an open-ended question that creates a natural bridge to Part {part_number + 1}, offering a surprise and compelling the reader to dive immediately into the next installment.
+Do not write any later part."""
+    elif part_number < LAST_PART:
+        part_instruction = f"""Write Part {part_number} only.
+The first line must be the header "Part {part_number} – [Title]" with a new title for this part. Continue directly from Part {part_number - 1}.
+Purpose of this part: {role}
+End the part with an unexpected twist, an intriguing revelation, or an open-ended question that creates a natural bridge to Part {part_number + 1}, offering a surprise and compelling the reader to dive immediately into the next installment.
+Do not rewrite earlier parts and do not write any later part."""
+    else:
+        part_instruction = f"""Write Part {part_number} (the final part) only.
+The first line must be the header "Part {part_number} – [Title]" with a new title for this part. Continue directly from Part {part_number - 1}.
+Purpose of this part: {role}
+Deliver a deeply satisfying, heartwarming ending that resolves all major mysteries and rewards the characters' emotional growth.
+Do not rewrite earlier parts."""
 
     full_prompt = f"""STORY CONTEXT (continuity reference):
 
@@ -800,6 +827,40 @@ Start now with the header line. Each sentence on a separate line with a blank li
     return None
 
 
+def call_openai_story_plan(caption: str):
+    """Lập dàn ý TOÀN BỘ Part 2→6 trước khi viết (yêu cầu của prompt), để mọi manh mối nối logic tới kết.
+    Dàn ý chỉ dùng nội bộ, không in ra truyện. Lỗi thì bỏ qua, vẫn viết bình thường."""
+    if not OPENAI_API_KEY:
+        return None
+    prompt = f"""ORIGINAL STORY (PART 1):
+
+{caption}
+
+TASK: Before any part is written, plan the entire continuation of this story in five parts:
+""" + "\n".join(f"PART {n}{' (THE END)' if n == LAST_PART else ''}: {PART_ROLES[n]}" for n in STORY_PARTS) + """
+
+Write a concise private story plan (about 300-450 words): the hidden truths, the key clues and where each one appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6. Keep 100% consistency with Part 1. Family-friendly. Output only the plan."""
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}],
+                  "max_completion_tokens": 1500, "reasoning_effort": "none"},
+            timeout=OPENAI_TIMEOUT_SECONDS,
+        )
+        data = resp.json() if resp.content else {}
+        if resp.status_code != 200:
+            print(f"[OPENAI] Dàn ý lỗi HTTP {resp.status_code}; viết tiếp không có dàn ý.")
+            return None
+        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        if content:
+            print(f"[OPENAI] Đã lập dàn ý truyện ({_word_count(content)} từ) | usage={data.get('usage', {})}")
+            return content
+    except Exception as exc:
+        print(f"[OPENAI] Không lập được dàn ý: {exc}; viết tiếp không có dàn ý.")
+    return None
+
+
 def _strip_program_endings(text: str) -> str:
     """Loại ending/CTA nếu model lỡ tự sinh; code sẽ chèn đúng 1 lần sau validation."""
     if not text:
@@ -809,7 +870,7 @@ def _strip_program_endings(text: str) -> str:
         for variant in (ending, f"**{ending}**"):
             cleaned = cleaned.replace(variant, "")
     # Loại các dòng CTA phổ biến mà model có thể tự thêm ngoài ý muốn.
-    cleaned = re.sub(r"(?im)^\s*[-–—]*\s*END OF PART [234].*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*[-–—]*\s*END OF PART [2-9].*$", "", cleaned)
     cleaned = re.sub(r"(?im)^.*PRESS NEX(?:T)? PART.*$", "", cleaned)
     cleaned = re.sub(r"(?im)^.*LIKE,? SHARE THIS POST.*$", "", cleaned)
     cleaned = re.sub(r"(?im)^.*CLICK\s+\W?NEXT\W?\s+AT THE BOTTOM.*$", "", cleaned)
@@ -838,7 +899,7 @@ def _ensure_part_header(text: str, part_number: int) -> str:
         return f"Part {part_number} – {first}\n\n" + rest
     if re.search(rf"(?im)^\s*[*#]*\s*PART\s+{part_number}\b", text):
         return text
-    label = "PART 4 (THE END)" if part_number == 4 else f"PART {part_number}"
+    label = _part_label(part_number)
     return f"{label}\n\n{text}"
 
 
@@ -849,9 +910,9 @@ def _validate_part(text: str, part_number: int):
     words = len(re.findall(r"\b[\w’'-]+\b", text, flags=re.UNICODE))
     # 2500-3000 là mục tiêu để kiểm soát chi phí. Chỉ <2500 mới là lỗi.
     # Nếu model hiếm khi vượt mục tiêu, vẫn giữ và xuất TXT để không vứt nội dung đã trả tiền.
-    if words < 2500:
-        return False, f"quá ngắn ({words} từ; bắt buộc tối thiểu 2500 từ)"
-    if part_number in (3, 4) and not re.search(rf"(?i)PART\s+{part_number}", text):
+    if words < STORY_MIN_WORDS:
+        return False, f"quá ngắn ({words} từ; bắt buộc tối thiểu {STORY_MIN_WORDS} từ)"
+    if part_number != STORY_PARTS[0] and not re.search(rf"(?i)PART\s+{part_number}", text):
         return False, f"thiếu nhãn PART {part_number}"
     return True, f"OK ({words} từ)"
 
@@ -860,14 +921,14 @@ def _word_count(text: str) -> int:
     return len(re.findall(r"\b[\w’'-]+\b", text or "", flags=re.UNICODE))
 
 
-def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = 3000):
+def call_openai_continue_part(story_context: str, existing_part: str, part_number: int, target_words: int = STORY_TARGET_WORDS):
     """Bổ sung phần còn thiếu thay vì vứt content đã trả tiền và generate lại từ đầu."""
     current_words = _word_count(existing_part)
     need_words = max(100, target_words - current_words)
     # Cho dư nhẹ để model có thể kết thúc tự nhiên, nhưng tránh sinh quá dài/tốn tiền.
     requested_words = min(max(need_words + 40, 150), 750)
 
-    if part_number in (2, 3):
+    if part_number < LAST_PART:
         ending_instruction = f"End with an unexpected twist, an intriguing revelation, or an open-ended question that creates a natural bridge to Part {part_number + 1}."
     else:
         ending_instruction = "Resolve the remaining story threads with a satisfying, emotionally relieving ending."
@@ -881,7 +942,7 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 2500-3500 words, ideally near 3000 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
+Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 2000-3000 words, ideally near 2500 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
 Keep the same format: each sentence on a separate line, with a blank line between sentences.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
@@ -955,9 +1016,9 @@ def generate_valid_part(story_context: str, part_number: int):
     # Nếu chưa đủ 2500 từ, tuyệt đối không regenerate toàn bộ.
     # Giữ content và gọi continuation để đạt tối thiểu 2500 từ.
     continuation_rounds = 1
-    while words < 2500 and continuation_rounds > 0:
+    while words < STORY_MIN_WORDS and continuation_rounds > 0:
         print(f"[OPENAI] Part {part_number} mới có {words} từ -> giữ nguyên và viết bổ sung, KHÔNG regenerate.")
-        extra = call_openai_continue_part(story_context, raw, part_number, target_words=3000)
+        extra = call_openai_continue_part(story_context, raw, part_number, target_words=STORY_TARGET_WORDS)
         if not extra:
             break
         raw = f"{raw.rstrip()}\n\n{extra.strip()}"
@@ -1009,12 +1070,12 @@ def validate_complete_story(story_text: str):
     """Cổng cuối: TXT tuyệt đối không được tạo nếu thiếu bất kỳ Part 2/3/4 hoặc ending."""
     if not story_text:
         return False, "story_text rỗng"
-    for n in (2, 3, 4):
+    for n in STORY_PARTS:
         if not re.search(rf"(?i)PART\s+{n}", story_text):
             return False, f"thiếu PART {n}"
         if story_text.count(PART_ENDINGS[n]) != 1:
             return False, f"ending Part {n} không xuất hiện đúng 1 lần"
-    return True, "đủ Part 2 + Part 3 + Part 4"
+    return True, f"đủ {len(STORY_PARTS)} Part"
 
 
 def split_story_into_parts(story_text: str):
@@ -1025,11 +1086,11 @@ def split_story_into_parts(story_text: str):
 
     separator = "=" * 60
     chunks = story_text.split(separator)
-    if len(chunks) != 3:
-        raise ValueError(f"Không thể tách chính xác 3 Part (tìm thấy {len(chunks)} khối)")
+    if len(chunks) != len(STORY_PARTS):
+        raise ValueError(f"Không thể tách chính xác {len(STORY_PARTS)} Part (tìm thấy {len(chunks)} khối)")
 
     parts = {}
-    for n, chunk in zip((2, 3, 4), chunks):
+    for n, chunk in zip(STORY_PARTS, chunks):
         clean = chunk.replace("**", "").strip() + "\n"
         if not re.search(rf"(?i)PART\s+{n}", clean):
             raise ValueError(f"Khối TXT thứ {n - 1} không chứa PART {n}")
@@ -1101,7 +1162,7 @@ def _cache_path(caption):
 def _valid_cached_parts(parts):
     return isinstance(parts, dict) and all(
         isinstance(parts.get(str(n)), str) and _validate_part(parts[str(n)], n)[0]
-        for n in (2, 3, 4)
+        for n in STORY_PARTS
     )
 
 
@@ -1149,7 +1210,7 @@ def _cache_write(caption, parts):
 def _story_links_for_alert(state):
     """3 link thật đã đăng web (API thường hoặc chapter). Thiếu bất kỳ link nào -> None."""
     posts = state.get("page6_api_posts") or state.get("page6_chapter_posts") or {}
-    links = {n: (posts.get(str(n)) or {}).get("url") for n in (2, 3, 4)}
+    links = {n: (posts.get(str(n)) or {}).get("url") for n in STORY_PARTS}
     return links if state.get("web_publish_complete") and all(links.values()) else None
 
 
@@ -1177,7 +1238,7 @@ def _send_pending_alert(post_id, alert_text, note, links_included=False):
     if not alert_text:
         return True
     with TELEGRAM_GROUP_LOCK:
-        print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN" + (" kèm 3 link." if links_included else "."))
+        print(f"[ALERT-SEND] {post_id}: gửi Telegram BÀI ĐANG LÊN" + (" kèm link truyện." if links_included else "."))
         if not send_telegram_message(_alert_with_note(alert_text, note)):
             return False
         key = state.get("alert_key")
@@ -1244,15 +1305,21 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
             parts.update(cached)
             state["cache_reused"] = True
             _save_progress(post_id, state)
-            _telegram_or_defer(post_id, f"♻️ Bài {post_id}: tái sử dụng Part 2/3/4 từ kho truyện; không gọi OpenAI.", state)
-    for n in (2, 3, 4):
+            _telegram_or_defer(post_id, f"♻️ Bài {post_id}: tái sử dụng Part 2–6 từ kho truyện; không gọi OpenAI.", state)
+    # Lập dàn ý toàn truyện 1 lần trước Part 2 (lưu checkpoint, không lập lại).
+    if not all(str(n) in parts for n in STORY_PARTS) and "story_plan" not in state:
+        state["story_plan"] = call_openai_story_plan(caption) or ""
+        _save_progress(post_id, state)
+    plan = state.get("story_plan") or ""
+    for n in STORY_PARTS:
         key = str(n)
         if key in parts:
             valid, reason = _validate_part(parts[key], n)
             if not valid:
                 raise ValueError(f"Part {n} đã lưu không hợp lệ ({reason}); không tự mua lại")
             continue
-        context = caption + "".join("\n\n" + parts[str(k)] for k in range(2, n))
+        context = (("[PRIVATE STORY PLAN — follow it, never print it]\n" + plan + "\n[END OF PLAN]\n\nPART 1 (ORIGINAL STORY):\n") if plan else "") \
+            + caption + "".join("\n\n" + parts[str(k)] for k in STORY_PARTS if k < n)
         print(f"[OPENAI] Bài {post_id}: tiếp tục Part {n}, giữ các Part đã lưu.")
         result = generate_valid_part(context, n)
         if not result:
@@ -1263,7 +1330,7 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
     _cache_write(caption, parts)
     story = "\n\n".join((
         ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n" + _ending_block(n)
-        for n in (2, 3, 4)
+        for n in STORY_PARTS
     ))
     # Vẫn kiểm tra nội dung 3 phần trước khi xuất bản web.
     outputs = split_story_into_parts(story)
@@ -1285,9 +1352,9 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
         TELEGRAM_GROUP_LOCK.acquire()  # giữ khóa xuyên suốt: thông báo + 3 TXT liền nhau
         group_lock_held = True
         if links:
-            note = "\n".join(f"PART {n}: {links[n]}" for n in (2, 3, 4))
+            note = "\n".join(f"PART {n}: {links[n]}" for n in STORY_PARTS)
         elif web_on:
-            note = "⚠️ Web chưa đăng xong — 3 link truyện sẽ gửi riêng ngay khi bot đăng được."
+            note = "⚠️ Web chưa đăng xong — link truyện sẽ gửi riêng ngay khi bot đăng được."
         else:
             note = ""
         if not _send_pending_alert(post_id, alert_text, note, links_included=bool(links)):
@@ -1308,7 +1375,7 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
     if (web_on and state.get("web_publish_complete") and not state.get("page6_api_links_sent")
             and _story_links_for_alert(state)):
         links = _story_links_for_alert(state)
-        if send_telegram_message("\n".join(f"PART {n}: {links[n]}" for n in (2, 3, 4))):
+        if send_telegram_message("\n".join(f"PART {n}: {links[n]}" for n in STORY_PARTS)):
             state["page6_api_links_sent"] = True
             _save_progress(post_id, state)
     return _resume_finish(post_id, state)
@@ -1316,7 +1383,7 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
 
 def _resume_send_txt(page_name, post_id, state, outputs):
     sent = state.setdefault("sent", [])
-    for n in (2, 3, 4):
+    for n in STORY_PARTS:
         if n in sent:
             continue
         if SEND_STORY_TXT_TELEGRAM:
@@ -1366,13 +1433,13 @@ def _web_part_title(base_title, n, page_number):
     """Có mã Page: "PART 2: The Lifeboat Key6 026". Không có mã Page: "PART 2: The Lifeboat Key 026"."""
     page_number = int(page_number) if page_number is not None else None
     title = base_title.strip()
-    title = re.sub(r"(?i)^PART\s*[234](?:\s*\(THE END\))?\s*[:\-–—]?\s*", "", title).strip()
+    title = re.sub(r"(?i)^PART\s*[2-9](?:\s*\(THE END\))?\s*[:\-–—]?\s*", "", title).strip()
     # Xóa hậu tố từ các bản code cũ (FB Page ID dài hoặc mã số ngắn).
     title = re.sub(r"\s*\d{1,20}\s+" + re.escape(AUTHOR_CODE) + r"$", "", title, flags=re.I).strip()
     title = re.sub(r"\s+" + re.escape(AUTHOR_CODE) + r"$", "", title, flags=re.I).strip()
     # Gỡ mã Page cũ dính sát chữ cuối nếu tiêu đề đã được chuẩn hóa trước đó.
     title = re.sub(r"(?<=\D)(?:" + "|".join(map(str, sorted(PAGE_NUMBER_BY_NAME.values(), key=lambda x: -len(str(x))))) + r")$", "", title).strip() if re.search(r"\d$", title) and re.search(r"\s+" + re.escape(AUTHOR_CODE) + r"$", base_title.strip(), flags=re.I) else title
-    prefix = "PART 4 (THE END): " if n == 4 else f"PART {n}: "
+    prefix = f"{_part_label(n)}: "
     if page_number is None:
         return f"{prefix}{title} {AUTHOR_CODE}"
     return f"{prefix}{title}{page_number} {AUTHOR_CODE}"
@@ -1646,7 +1713,7 @@ def _wp_chapter_html(parts, n, records):
         if not url:
             raise RuntimeError(f"Thiếu URL Part {n-1} để tạo liên kết chương")
         links.append((f"← PREVIOUS: PART {n-1}", url))
-    if n < 4:
+    if n < LAST_PART:
         url = records.get(str(n+1), {}).get("url")
         if not url:
             raise RuntimeError(f"Thiếu URL Part {n+1} để tạo liên kết chương")
@@ -1671,9 +1738,9 @@ def repair_existing_wordpress_links(post_id):
     records = state.get("web_posts") or {}
     parts = state.get("parts") or {}
     if not all(records.get(str(n), {}).get("id") and records[str(n)].get("url")
-               and parts.get(str(n)) for n in (2, 3, 4)):
+               and parts.get(str(n)) for n in STORY_PARTS):
         raise RuntimeError("Checkpoint chưa đủ 3 chương WordPress; không sửa để tránh sai bài")
-    for n in (2, 3, 4):
+    for n in STORY_PARTS:
         _wp_update_post(records[str(n)], _wp_chapter_html(parts, n, records))
         print(f"[WP-REPAIR] {post_id}: updated Part {n}")
     state["wp_chapter_format_version"] = 2
@@ -1698,7 +1765,7 @@ def publish_wordpress_story(post_id):
     if not re.fullmatch(r"\d+_\d+", post_id):
         raise ValueError("POST_ID không hợp lệ")
     state = _load_progress(post_id)
-    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not all(n in state.get("sent", []) for n in (2, 3, 4)):
+    if not all(str(n) in (state.get("parts") or {}) for n in STORY_PARTS) or not all(n in state.get("sent", []) for n in STORY_PARTS):
         raise RuntimeError("Chưa gửi đủ ba TXT")
     if not ENABLE_WEB_PUBLISH_TEST:
         raise RuntimeError("ENABLE_WEB_PUBLISH_TEST=false")
@@ -1733,22 +1800,22 @@ def publish_wordpress_story(post_id):
         key = str(n)
         if records.get(key, {}).get("id"):
             continue
-        nav = [(f"READ PART {n+1}", records[str(n+1)]["url"])] if n < 4 and records.get(str(n+1), {}).get("url") else []
+        nav = [(f"READ PART {n+1}", records[str(n+1)]["url"])] if n < LAST_PART and records.get(str(n+1), {}).get("url") else []
         title = _web_part_title(base_title, n, page_number)
         records[key] = _wp_create_post(title, _to_html(_story_body(parts[key], n)) + "\n" + _to_html(_ending_block(n)), media_id)
         _save_progress(post_id, state)
         print(f"[WORDPRESS] {post_id}: created Part {n}, ID={records[key]['id']}")
     # Version 2: ghi lại tất cả chương kể cả checkpoint cũ đã đánh dấu linked.
     if state.get("wp_chapter_format_version") != 2:
-        for n in (2, 3, 4):
+        for n in STORY_PARTS:
             _wp_update_post(records[str(n)], _wp_chapter_html(parts, n, records))
             _save_progress(post_id, state)
         state["wp_chapter_format_version"] = 2
         state["web_linked"] = [2, 3, 4]
         _save_progress(post_id, state)
     if not state.get("web_links_telegram_sent"):
-        message = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in (2, 3, 4))
-        if not all(records[str(n)].get("url") for n in (2, 3, 4)):
+        message = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in STORY_PARTS)
+        if not all(records[str(n)].get("url") for n in STORY_PARTS):
             raise RuntimeError("WordPress thiếu link chương")
         if not send_telegram_message(message):
             raise RuntimeError("Telegram chưa xác nhận thông báo ba link")
@@ -1780,11 +1847,11 @@ def generate_and_send_story_continuation(page_name: str, post_id: str, caption: 
         return False
     finally:
         if not ok and alert_text and not all(
-                str(n) in (_load_progress(post_id).get("parts") or {}) for n in (2, 3, 4)):
+                str(n) in (_load_progress(post_id).get("parts") or {}) for n in STORY_PARTS):
             # Viết truyện lỗi: KHÔNG giữ thông báo lại mãi -> vẫn báo bài đang lên (chưa có link).
             _send_pending_alert(post_id, alert_text,
-                                ("⚠️ Tạo truyện chưa xong (bot tự thử lại) — 3 link sẽ gửi sau." if not SEND_STORY_TXT_TELEGRAM
-                                 else "⚠️ Tạo truyện chưa xong (bot tự thử lại) — file TXT và 3 link sẽ gửi sau."))
+                                ("⚠️ Tạo truyện chưa xong (bot tự thử lại) — link truyện sẽ gửi sau." if not SEND_STORY_TXT_TELEGRAM
+                                 else "⚠️ Tạo truyện chưa xong (bot tự thử lại) — file TXT và link truyện sẽ gửi sau."))
         state = _load_progress(post_id)
         if state and str(post_id) not in story_completed:
             state["retry_after"] = time.time() + STORY_RETRY_SECONDS
@@ -2938,7 +3005,7 @@ def check_all_pages():
                 + (f"🚀 Bài {jump_desc}\n" if jump_desc and not spike_ev else "")
                 + (f"Link: {link}\n" if link else "")
                 + "=> Gắn link ngay!\n"
-                + "⏳ Đang tạo file TXT Part 2, 3 & 4 cho chính bài này..."
+                + "⏳ Đang tạo file TXT Part 2–6 cho chính bài này..."
             )
             # Chặn bài đã bắt đầu tạo và không xếp hàng khi chế độ trả phí đang tắt.
             if not _retry_due(post_id) or not ENABLE_PAID_GENERATION:
@@ -3002,8 +3069,8 @@ def _page6_navigation(part, urls):
     links = []
     if part > 2:
         links.append((f"PREVIOUS: PART {part-1}", urls[part-1]))
-    if part < 4:
-        links.append(("NEXT: PART 4(THE END)" if part == 3 else "NEXT: PART 3", urls[part+1]))
+    if part < LAST_PART:
+        links.append((f"NEXT: PART {part+1}(THE END)" if part + 1 == LAST_PART else f"NEXT: PART {part+1}", urls[part+1]))
     return ('<hr><nav aria-label="Story chapters">' + ' | '.join(
         '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
         for label, url in links) + '</nav>') if links else ''
@@ -3107,13 +3174,13 @@ def _page6_chapter_response(obj):
                 break
         if not candidates and isinstance(root.get("data"), list):
             candidates = root["data"]
-    if len(candidates) != 3:
+    if len(candidates) != len(STORY_PARTS):
         raise RuntimeError(
             "API chapter không trả đúng 3 bài (hoặc cấu trúc response chưa được hỗ trợ); "
             "đã gửi request, KHÔNG tự gửi lại để tránh trùng. Kiểm tra BioBlog thủ công."
         )
     result = {}
-    for n, item in zip((2, 3, 4), candidates):
+    for n, item in zip(STORY_PARTS, candidates):
         if not isinstance(item, dict):
             raise RuntimeError("Response chapter không có thông tin từng bài; kiểm tra thủ công")
         slug = item.get("slug")
@@ -3126,7 +3193,7 @@ def _page6_chapter_response(obj):
         if parsed.scheme != "https" or parsed.netloc != urlparse(WEB_BASE_URL).netloc:
             raise RuntimeError("Response chapter thiếu URL hợp lệ; kiểm tra thủ công, không POST lại")
         result[str(n)] = {"id": item.get("postId") or item.get("post_id") or item.get("id"), "slug": slug, "url": url}
-    if len({v["url"] for v in result.values()}) != 3:
+    if len({v["url"] for v in result.values()}) != len(STORY_PARTS):
         raise RuntimeError("API trả URL trùng chương; cần kiểm tra thủ công")
     return result
 
@@ -3151,7 +3218,7 @@ def _page6_publish_chapter_batch(post_id, state):
         base_title = _story_title(state["parts"]["2"])
         title = re.sub(r"(?i)^PART\s*2\s*[:\-–—]?\s*", "", base_title).strip()
         chapters = []
-        for n in (2, 3, 4):
+        for n in STORY_PARTS:
             chapter_title = _web_part_title(base_title, n, _page6_number_for_post(post_id))
             body = _to_html(_story_body(state["parts"][str(n)], n))
             body += "\n" + _to_html(_ending_block(n))
@@ -3193,7 +3260,7 @@ def _page6_publish_chapter_batch(post_id, state):
     posts = state["page6_chapter_posts"]
     if not state.get("page6_api_links_sent") and not _links_deferred(post_id):
         message = f"🧪 PAGE {_page6_number_for_post(post_id)} — BioBlog CHAPTER TEST\n" + "\n".join(
-            f"PART {n}: {posts[str(n)]['url']}" for n in (2, 3, 4))
+            f"PART {n}: {posts[str(n)]['url']}" for n in STORY_PARTS)
         message += "\n⚠️ Kiểm tra nút Previous/Next trên giao diện BioBlog trước khi bật chính thức."
         if not send_telegram_message(message):
             raise RuntimeError("Gửi link Telegram chưa thành công")
@@ -3201,7 +3268,7 @@ def _page6_publish_chapter_batch(post_id, state):
         _save_progress(post_id, state)
     state["web_publish_complete"] = True
     _save_progress(post_id, state)
-    print(f"[PAGE6-TEST] {post_id}: chapter batch đủ 3 Part, dùng chung ảnh.")
+    print(f"[PAGE6-TEST] {post_id}: chapter batch đủ các Part, dùng chung ảnh.")
     return True
 
 
@@ -3218,8 +3285,8 @@ def publish_page6_bioblog_test(post_id):
     state = _load_progress(post_id)
     if not state.get("auto_publish_eligible"):
         raise RuntimeError("Checkpoint chưa xác nhận bài mới đủ điều kiện")
-    if not all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4)) or not (
-            all(n in state.get("sent", []) for n in (2, 3, 4))
+    if not all(str(n) in (state.get("parts") or {}) for n in STORY_PARTS) or not (
+            all(n in state.get("sent", []) for n in STORY_PARTS)
             or (state.get("defer_links_to_alert") and state.get("alert_pending"))):
         print(f"[PAGE6-TEST] {post_id}: chờ gửi đủ 3 TXT rồi mới đăng web.")
         return False
@@ -3249,17 +3316,17 @@ def publish_page6_bioblog_test(post_id):
     _save_progress(post_id, state)
     posts = state["page6_api_posts"]
     base_title = _story_title(state["parts"]["2"])
-    titles = {n: _web_part_title(base_title, n, page_number) for n in (2, 3, 4)}
+    titles = {n: _web_part_title(base_title, n, page_number) for n in STORY_PARTS}
     # Slug nguồn như bản đầu: theo tiêu đề, bỏ hậu tố AUTHOR_CODE (server ghép author vào slug cuối).
-    slugs = {n: _page6_permalink(titles[n]) for n in (2, 3, 4)}
-    if len(set(slugs.values())) != 3:
+    slugs = {n: _page6_permalink(titles[n]) for n in STORY_PARTS}
+    if len(set(slugs.values())) != len(STORY_PARTS):
         raise RuntimeError("Trùng permalink giữa các Part")
 
     # ---- Tạo bài bằng API công khai (đúng author + permalink như bản đầu),
     # ---- sau đó lấy id và PUT prev/next bằng admin API, cuối cùng gửi link Telegram một lần.
     image_url = state.get("web_featured_image")
     if not image_url:
-        if any(posts.get(str(n)) for n in (2, 3, 4)):
+        if any(posts.get(str(n)) for n in STORY_PARTS):
             raise RuntimeError("Checkpoint đã có bài nhưng thiếu ảnh gốc; không tiếp tục để tránh sai ảnh")
         page_id = str(post_id).split("_", 1)[0]
         page = next((p for p in get_managed_pages() if str(p.get("id")) == page_id), None)
@@ -3278,7 +3345,7 @@ def publish_page6_bioblog_test(post_id):
         return _to_html(_story_body(state["parts"][str(n)], n)) + "\n" + _to_html(_ending_block(n))
 
     # Tạo theo thứ tự Part 2 -> 3 -> 4, mỗi bài gửi prev_chapter = slug bài trước (API hỗ trợ).
-    for n in (2, 3, 4):
+    for n in STORY_PARTS:
         k = str(n)
         if posts.get(k, {}).get("url"):
             continue
@@ -3289,22 +3356,22 @@ def publish_page6_bioblog_test(post_id):
             raise RuntimeError(f"Part {n-1} thiếu slug để làm prev_chapter")
         # Link chữ PREVIOUS/NEXT cuối bài (như "PREVIOUS: PART 2 | NEXT: PART 4(THE END)"):
         # Part đã tạo thì dùng link thật, Part chưa tạo thì dùng link đoán trước theo quy tắc slug.
-        nav_urls = {m: (posts.get(str(m)) or {}).get("url") or _bioblog_predicted_url(slugs[m]) for m in (2, 3, 4)}
+        nav_urls = {m: (posts.get(str(m)) or {}).get("url") or _bioblog_predicted_url(slugs[m]) for m in STORY_PARTS}
         body = _base_body(n) + "\n" + _page6_navigation(n, nav_urls)
         posts[k] = {"request_started": True, "started_at": datetime.now(timezone.utc).isoformat()}
         _save_progress(post_id, state)
         result = _page6_bioblog_create(post_id, n, titles[n], body, image_url, slugs[n], prev_slug)
-        result["nav_used"] = {str(m): nav_urls[m] for m in (2, 3, 4) if m != n}
+        result["nav_used"] = {str(m): nav_urls[m] for m in STORY_PARTS if m != n}
         posts[k] = result
         _save_progress(post_id, state)
         print(f"[PAGE6-TEST] {post_id}: đã đăng Part {n}: {result.get('url')} id={result.get('id')} slug={result.get('slug')}", flush=True)
 
-    for n in (2, 3, 4):
+    for n in STORY_PARTS:
         rec = posts.get(str(n)) or {}
         if not (rec.get("slug") and rec.get("url")):
             raise RuntimeError(f"Part {n} thiếu slug/url từ website; cần kiểm tra thủ công")
-    actual_urls = {n: posts[str(n)]["url"] for n in (2, 3, 4)}
-    if len(set(actual_urls.values())) != 3:
+    actual_urls = {n: posts[str(n)]["url"] for n in STORY_PARTS}
+    if len(set(actual_urls.values())) != len(STORY_PARTS):
         raise RuntimeError("Ba chương có URL trùng; dừng liên kết")
 
     _page6_fix_text_nav(post_id, state, titles, image_url, _base_body)
@@ -3316,9 +3383,9 @@ def publish_page6_bioblog_test(post_id):
     # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và nối chương xong.
     # Lưu checkpoint để retry/redeploy không gửi lại.
     if not state.get("page6_api_links_sent") and not _links_deferred(post_id):
-        message = "\n".join(f"PART {n}: {actual_urls[n]}" for n in (2, 3, 4))
+        message = "\n".join(f"PART {n}: {actual_urls[n]}" for n in STORY_PARTS)
         if send_telegram_message(message) is False:
-            raise RuntimeError("Telegram chưa xác nhận gửi thông báo 3 link")
+            raise RuntimeError("Telegram chưa xác nhận gửi thông báo link")
         state["page6_api_links_sent"] = True
         _save_progress(post_id, state)
         print(f"[PAGE6-LINKS] {post_id}: đã gửi đủ 3 URL sau khi nối chương", flush=True)
@@ -3326,7 +3393,7 @@ def publish_page6_bioblog_test(post_id):
     state["web_publish_complete"] = True
     state.pop("page6_retry_after", None)
     _save_progress(post_id, state)
-    resolve_error_alert(f"web_link_retry_{post_id}", f"Bài {post_id}: đã nối chương và gửi đủ 3 link.")
+    resolve_error_alert(f"web_link_retry_{post_id}", f"Bài {post_id}: đã nối chương và gửi đủ link.")
     resolve_error_alert(f"web_publish_retry_{post_id}", f"Bài {post_id}: đã đăng lên web thành công.")
     if state.get("page6_422_recovered") and not state.get("page6_422_recovery_notified"):
         if send_telegram_message("✅ ĐÃ KHẮC PHỤC: Page 6 đăng BioBlog thành công sau lỗi HTTP 422 thiếu permalink."):
@@ -3340,13 +3407,13 @@ def _page6_fix_text_nav(post_id, state, titles, image_url, base_body):
     if state.get("page6_text_nav_checked"):
         return
     posts = state["page6_api_posts"]
-    actual = {m: posts[str(m)]["url"] for m in (2, 3, 4)}
+    actual = {m: posts[str(m)]["url"] for m in STORY_PARTS}
     wrong = []
-    for n in (2, 3, 4):
+    for n in STORY_PARTS:
         used = posts[str(n)].get("nav_used")
         if not used:
             continue  # bài tạo từ bản cũ, chưa có link chữ
-        needed = [m for m in ((n - 1,) if n > 2 else ()) + ((n + 1,) if n < 4 else ())]
+        needed = [m for m in ((n - 1,) if n > 2 else ()) + ((n + 1,) if n < LAST_PART else ())]
         if any(used.get(str(m)) != actual[m] for m in needed):
             wrong.append(n)
     if wrong:
@@ -3359,14 +3426,14 @@ def _page6_fix_text_nav(post_id, state, titles, image_url, base_body):
                     rec["id"] = _page6_bioblog_lookup_id(rec["slug"])
                 _web_update_chapter(session, rec, titles[n], base_body(n) + "\n" + _page6_navigation(n, actual), image_url,
                                     prev_slug=posts[str(n - 1)]["slug"] if n > 2 else "",
-                                    next_slug=posts[str(n + 1)]["slug"] if n < 4 else "")
-                rec["nav_used"] = {str(m): actual[m] for m in (2, 3, 4) if m != n}
+                                    next_slug=posts[str(n + 1)]["slug"] if n < LAST_PART else "")
+                rec["nav_used"] = {str(m): actual[m] for m in STORY_PARTS if m != n}
                 _save_progress(post_id, state)
         except Exception as exc:
             send_error_alert("text_nav_wrong",
                 f"Bài {post_id}: link chữ PREVIOUS/NEXT ở Part {', '.join(map(str, wrong))} có thể trỏ sai "
                 f"(web đặt link khác dự đoán) và không tự sửa được: {str(exc)[:200]}. "
-                f"Link đúng: " + " | ".join(f"PART {m}: {actual[m]}" for m in (2, 3, 4)))
+                f"Link đúng: " + " | ".join(f"PART {m}: {actual[m]}" for m in STORY_PARTS))
     state["page6_text_nav_checked"] = True
     _save_progress(post_id, state)
 
@@ -3402,7 +3469,7 @@ def _page6_try_publish_once_unlocked(post_id):
         records = state.get("page6_api_posts") or {}
         if "thiếu id/slug/url thực tế" in reason and all(
                 (records.get(str(n)) or {}).get("url") and (records.get(str(n)) or {}).get("slug")
-                for n in (2, 3, 4)):
+                for n in STORY_PARTS):
             state.pop("page6_test_blocked", None)
             _save_progress(post_id, state)
             print(f"[PAGE6-RECOVERY] {post_id}: gỡ khóa cũ thiếu id; không POST lại", flush=True)
@@ -3422,7 +3489,7 @@ def _page6_try_publish_once_unlocked(post_id):
         sent = set(state.get("sent") or [])
         if (PAGE6_FIX_422_PERMALINK and "HTTP 422" in reason
                 and "permalink" in reason.lower() and len(invalid) == 1
-                and all(n in sent for n in (2, 3, 4))):
+                and all(n in sent for n in STORY_PARTS)):
             records.pop(invalid[0], None)
             state.pop("page6_test_blocked", None)
             state["page6_422_recovered"] = True
@@ -3437,7 +3504,7 @@ def _page6_try_publish_once_unlocked(post_id):
         records = state.get("page6_api_posts") or {}
         creation_done = bool(state.get("page6_chapter_posts")) or all(
             (records.get(str(n)) or {}).get("slug") and (records.get(str(n)) or {}).get("url")
-            for n in (2, 3, 4))
+            for n in STORY_PARTS)
         if creation_done:
             # Các Part đã tồn tại trên web: lỗi nằm ở bước nối chương / gửi link -> thử lại an toàn.
             state["page6_retry_after"] = time.time() + PAGE6_LINK_RETRY_SECONDS
@@ -3445,7 +3512,7 @@ def _page6_try_publish_once_unlocked(post_id):
             _save_progress(post_id, state)
             print(f"[PAGE6-TEST-RETRY] {post_id}: {type(exc).__name__}: {exc}; thử lại sau {PAGE6_LINK_RETRY_SECONDS}s", flush=True)
             send_error_alert(f"web_link_retry_{post_id}",
-                             "Page 6 đã đăng đủ 3 Part nhưng nối chương/gửi link chưa xong; bot sẽ tự thử lại, "
+                             "Đã đăng đủ các Part nhưng nối chương/gửi link chưa xong; bot sẽ tự thử lại, "
                              "không tạo lại bài: " + str(exc)[:400])
         elif not any(r.get("request_started") or r.get("url") for r in records.values()):
             # Lỗi trước khi tạo bất kỳ bài nào (web 500, đăng nhập, ảnh...): chưa có gì để trùng -> tự thử lại.
@@ -3477,8 +3544,8 @@ def page6_test_recovery_worker():
                     state = _load_progress(post_id)
                     if (_web_publish_allowed(_page6_number_for_post(post_id))
                             and not state.get("web_publish_complete")
-                            and all(n in state.get("sent", []) for n in (2, 3, 4))
-                            and all(str(n) in (state.get("parts") or {}) for n in (2, 3, 4))):
+                            and all(n in state.get("sent", []) for n in STORY_PARTS)
+                            and all(str(n) in (state.get("parts") or {}) for n in STORY_PARTS)):
                         if not state.get("auto_publish_eligible"):
                             # Bài cũ đã viết + gửi TXT đủ 3 Part nhưng chưa lên web: bù đăng (trong WEB_BACKFILL_HOURS giờ gần đây).
                             age_h = (time.time() - os.path.getmtime(os.path.join(STORY_PROGRESS_DIR, filename))) / 3600
