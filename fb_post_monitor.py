@@ -405,6 +405,9 @@ def _ending_block(n):
 #   Bỏ trống  -> "PART 2: https://..."  (như cũ, link cùng dòng)
 #   Ví dụ LINK_LABEL="READ FULL PART {n} HERE:" -> dòng "READ FULL PART 2 HERE:" rồi link ở dòng dưới.
 LINK_LABEL = os.getenv("LINK_LABEL", "").strip()
+# Mặc định NỐI CHƯƠNG phía website (gửi prev_chapter) -> web có nút "← Previous / Next →" như các bài chuẩn.
+# Railway WEB_LINK_CHAPTERS=false để tắt (chỉ còn link chữ PREVIOUS/NEXT cuối bài).
+WEB_LINK_CHAPTERS = os.getenv("WEB_LINK_CHAPTERS", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _link_lines(urls):
@@ -3979,8 +3982,9 @@ def publish_page6_bioblog_test(post_id):
             continue
         if posts.get(k, {}).get("request_started"):
             raise RuntimeError(f"Part {n} đã gọi POST nhưng chưa rõ kết quả; kiểm tra thủ công trước khi tiếp tục")
-        prev_slug = posts[str(n - 1)]["slug"] if n > 2 else ""
-        if n > 2 and not prev_slug:
+        # Gửi prev_chapter = slug Part trước để web hiện nút Previous/Next (tắt bằng WEB_LINK_CHAPTERS=false).
+        prev_slug = (posts[str(n - 1)].get("slug") or "") if (n > 2 and WEB_LINK_CHAPTERS) else ""
+        if n > 2 and WEB_LINK_CHAPTERS and not prev_slug:
             raise RuntimeError(f"Part {n-1} thiếu slug để làm prev_chapter")
         # Link chữ PREVIOUS/NEXT cuối bài (như "PREVIOUS: PART 2 | NEXT: PART 4(THE END)"):
         # Part đã tạo thì dùng link thật, Part chưa tạo thì dùng link đoán trước theo quy tắc slug.
@@ -4060,8 +4064,8 @@ def _page6_fix_text_nav(post_id, state, titles, image_url, base_body):
                 if not rec.get("id"):
                     rec["id"] = _page6_bioblog_lookup_id(rec["slug"])
                 _web_update_chapter(session, rec, titles[n], base_body(n) + "\n" + _page6_navigation(n, actual), image_url,
-                                    prev_slug=posts[str(n - 1)]["slug"] if n > 2 else "",
-                                    next_slug=posts[str(n + 1)]["slug"] if n < LAST_PART else "")
+                                    prev_slug=posts[str(n - 1)]["slug"] if (n > 2 and WEB_LINK_CHAPTERS) else "",
+                                    next_slug=posts[str(n + 1)]["slug"] if (n < LAST_PART and WEB_LINK_CHAPTERS) else "")
                 rec["nav_used"] = {str(m): actual[m] for m in STORY_PARTS if m != n}
                 _save_progress(post_id, state)
         except Exception as exc:
