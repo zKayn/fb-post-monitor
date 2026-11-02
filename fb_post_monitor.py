@@ -13,6 +13,9 @@
 #   INCLUDE_PAGE_NAMES     (không bắt buộc) chỉ theo dõi các Page này, ví dụ "Page A;Page B"
 #   STORY_WORKERS          (không bắt buộc) số bài viết truyện song song, 1–6 (mặc định 3). Mỗi bài vẫn đúng thứ tự
 #                          tin; giữa các bài thì bài xong trước báo trước. Đặt 1 nếu muốn báo đúng thứ tự đạt điều kiện.
+#   OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_REASONING_EFFORT  (không bắt buộc) đổi nhà cung cấp/model AI viết truyện
+#   LINK_LABEL             (không bắt buộc) chữ trước mỗi link truyện trên Telegram, {n} = số Part,
+#                          ví dụ "READ FULL PART {n} HERE:". Bỏ trống = "PART 2: link" như cũ.
 #   INSTANT_PAGE_IDS       (không bắt buộc) Page ĐẶC BIỆT: bài mới là viết truyện ngay, không cần ngưỡng.
 #                          Ghi Page ID, nhiều Page ngăn cách bằng dấu phẩy. Bỏ trống = không có Page đặc biệt.
 # =====================================================================================
@@ -97,7 +100,15 @@ LAST_PART = STORY_PARTS[-1]     # Part cuối = THE END
 STORY_MIN_WORDS = 2000          # mỗi Part tối thiểu 2.000 từ
 STORY_TARGET_WORDS = 2500       # mục tiêu ~2.000–3.000 từ
 ENABLE_STORY_CONTINUATION = True
-OPENAI_MODEL = "gpt-5.6-luna"
+# Railway (không bắt buộc) — đổi nhà cung cấp API tương thích OpenAI:
+#   OPENAI_BASE_URL  mặc định https://api.openai.com/v1 (ví dụ nhà cung cấp khác: https://api.nghimmo.com/v1)
+#   OPENAI_MODEL     mặc định gpt-5.6-luna
+#   OPENAI_REASONING_EFFORT  mặc định none; đặt "off" nếu API báo không hỗ trợ tham số reasoning_effort
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1").rstrip("/")
+OPENAI_CHAT_URL = OPENAI_BASE_URL + "/chat/completions"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip() or "gpt-5.6-luna"
+_effort = os.getenv("OPENAI_REASONING_EFFORT", "none").strip().lower()
+_REASONING = {} if _effort in ("off", "false", "no", "") else {"reasoning_effort": _effort}
 OPENAI_MAX_OUTPUT_TOKENS = 5500  # đủ cho 2.000–3.000 từ/Part (mỗi câu 1 dòng)
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
@@ -152,6 +163,19 @@ def _ending_block(n):
     if PART_AFTER_ENDING.get(n):
         text += "\n\n" + PART_AFTER_ENDING[n]
     return text
+
+
+# Railway (không bắt buộc): LINK_LABEL = chữ đứng trước mỗi link truyện trong tin Telegram. {n} = số Part.
+#   Bỏ trống  -> "PART 2: https://..."  (như cũ, link cùng dòng)
+#   Ví dụ LINK_LABEL="READ FULL PART {n} HERE:" -> dòng "READ FULL PART 2 HERE:" rồi link ở dòng dưới.
+LINK_LABEL = os.getenv("LINK_LABEL", "").strip()
+
+
+def _link_lines(urls):
+    """Khối link truyện gửi Telegram theo LINK_LABEL (urls: {số Part: link})."""
+    if not LINK_LABEL:
+        return "\n".join(f"PART {n}: {urls[n]}" for n in STORY_PARTS)
+    return "\n".join(f"{LINK_LABEL.replace('{n}', str(n))}\n{urls[n]}" for n in STORY_PARTS)
 
 
 def _part_label(n):
@@ -859,12 +883,12 @@ Start now with the header line. Each sentence on a separate line with a blank li
             request_token_budget = 7000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
             force_length_retry = False
             resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
+                OPENAI_CHAT_URL,
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": full_prompt}],
-                    "reasoning_effort": "none",
+                    **_REASONING,
                     "max_completion_tokens": request_token_budget,
                 },
                 timeout=OPENAI_TIMEOUT_SECONDS,
@@ -940,10 +964,10 @@ TASK: Before any part is written, plan the entire continuation of this story in 
 Write a concise private story plan (about 300-450 words): the hidden truths, the key clues and where each one appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6. Keep 100% consistency with Part 1. Family-friendly. Output only the plan."""
     try:
         resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            OPENAI_CHAT_URL,
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}],
-                  "max_completion_tokens": 1500, "reasoning_effort": "none"},
+                  "max_completion_tokens": 1500, **_REASONING},
             timeout=OPENAI_TIMEOUT_SECONDS,
         )
         data = resp.json() if resp.content else {}
@@ -1051,12 +1075,12 @@ Output ONLY the new continuation paragraphs."""
     for attempt in range(1, OPENAI_PART_RETRIES + 1):
         try:
             resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
+                OPENAI_CHAT_URL,
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
-                    "reasoning_effort": "none",
+                    **_REASONING,
                     # Continuation chỉ mua phần còn thiếu; không mở trần 6000 vô ích.
                     "max_completion_tokens": min(2200, max(900, int(requested_words * 1.6) + 300)),
                 },
@@ -1412,7 +1436,7 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
         state["page_name"] = page_name
         _save_progress(post_id, state)
     if caption and not state.get("fb_caption"):
-        state["fb_caption"] = caption  # chỉ để làm tiêu đề web (10–20 từ đầu caption); không dùng để so sánh
+        state["fb_caption"] = caption  # chỉ để làm tiêu đề web (15–35 từ đầu caption); không dùng để so sánh
         _save_progress(post_id, state)
     parts = state.setdefault("parts", {})
     # Chỉ áp dụng cache nếu bài hiện tại chưa sinh phần nào.
@@ -1469,7 +1493,7 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
         TELEGRAM_GROUP_LOCK.acquire()  # giữ khóa xuyên suốt: thông báo + 3 TXT liền nhau
         group_lock_held = True
         if links:
-            note = "\n".join(f"PART {n}: {links[n]}" for n in STORY_PARTS)
+            note = _link_lines(links)
         elif web_on:
             note = "⚠️ Web chưa đăng xong — link truyện sẽ gửi riêng ngay khi bot đăng được."
         else:
@@ -1492,7 +1516,7 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
     if (web_on and state.get("web_publish_complete") and not state.get("page6_api_links_sent")
             and _story_links_for_alert(state)):
         links = _story_links_for_alert(state)
-        if send_telegram_message("\n".join(f"PART {n}: {links[n]}" for n in STORY_PARTS)):
+        if send_telegram_message(_link_lines(links)):
             state["page6_api_links_sent"] = True
             _save_progress(post_id, state)
     return _resume_finish(post_id, state)
@@ -1562,9 +1586,9 @@ def _web_part_title(base_title, n, page_number):
     return f"{prefix}{title}{page_number} {AUTHOR_CODE}"
 
 
-def _caption_web_title(caption, min_words=10, max_words=20):
-    """Tiêu đề chung trên web = 10–20 từ đầu của caption Facebook (Part 1).
-    Ưu tiên dừng ở cuối câu (10–20 từ); không được thì cắt ở dấu phẩy/chấm phẩy gần nhất, cuối cùng là 20 từ (không thêm "...")."""
+def _caption_web_title(caption, min_words=15, max_words=35):
+    """Tiêu đề chung trên web = 15–35 từ đầu của caption Facebook (Part 1).
+    Ưu tiên dừng ở cuối câu (15–35 từ); không được thì cắt ở dấu phẩy/chấm phẩy gần nhất, cuối cùng là 35 từ (không thêm "...")."""
     lines = []
     for line in str(caption or "").splitlines():
         # Bỏ dòng mời đọc / CTA ngắn ở đầu caption ("👇 Read full story below", "Part 1"...).
@@ -1582,6 +1606,7 @@ def _caption_web_title(caption, min_words=10, max_words=20):
     if len(words) <= max_words:
         return text
     head = words[:max_words]
+    # Dừng ở cuối câu gần mốc 35 từ nhất (nhưng >= 15 từ).
     ends = [i for i, w in enumerate(head) if i + 1 >= min_words and re.search(r"[.!?…][\"”’)]*$", w)]
     if ends:
         return " ".join(head[:ends[-1] + 1])
@@ -3610,7 +3635,7 @@ def publish_page6_bioblog_test(post_id):
     slug_titles = {n: _web_part_title(base_title, n, page_number) for n in STORY_PARTS}
     # Slug (link web) GIỮ NGUYÊN cách tạo cũ: theo tiêu đề Part, bỏ hậu tố AUTHOR_CODE (server ghép author vào slug cuối).
     slugs = {n: _page6_permalink(slug_titles[n]) for n in STORY_PARTS}
-    # Tiêu đề HIỂN THỊ chung cho mọi Part = 10–20 từ đầu caption Facebook + mã NV (chỉ đổi chữ hiển thị, không đổi link).
+    # Tiêu đề HIỂN THỊ chung cho mọi Part = 15–35 từ đầu caption Facebook + mã NV (chỉ đổi chữ hiển thị, không đổi link).
     # Bài đã đăng dở bằng bản cũ thì giữ tiêu đề cũ cho đồng bộ.
     if "web_display_title" not in state:
         started = any((posts.get(str(n)) or {}) for n in STORY_PARTS)
@@ -3694,7 +3719,7 @@ def publish_page6_bioblog_test(post_id):
     # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và nối chương xong.
     # Lưu checkpoint để retry/redeploy không gửi lại.
     if not state.get("page6_api_links_sent") and not _links_deferred(post_id):
-        message = "\n".join(f"PART {n}: {actual_urls[n]}" for n in STORY_PARTS)
+        message = _link_lines(actual_urls)
         if send_telegram_message(message) is False:
             raise RuntimeError("Telegram chưa xác nhận gửi thông báo link")
         state["page6_api_links_sent"] = True
@@ -3912,6 +3937,7 @@ def main():
     for _i in range(STORY_WORKERS):
         threading.Thread(target=story_worker, name=f"story-worker-{_i + 1}", daemon=True).start()
     print(f"[CONFIG] Số luồng viết truyện song song: {STORY_WORKERS}", flush=True)
+    print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | reasoning={_REASONING.get('reasoning_effort', 'off')}", flush=True)
     if ENABLE_PAGE6_WEB_TEST:
         threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
     while True:
