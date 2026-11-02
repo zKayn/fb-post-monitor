@@ -104,6 +104,7 @@ ENABLE_STORY_CONTINUATION = True
 #   OPENAI_BASE_URL  mặc định https://api.openai.com/v1 (ví dụ nhà cung cấp khác: https://api.nghimmo.com/v1)
 #   OPENAI_MODEL     mặc định gpt-5.6-luna
 #   OPENAI_API_STYLE  chat / responses (bỏ trống = tự chọn: nghimmo dùng responses)
+#   OPENAI_PLAN_REASONING_EFFORT  mức suy nghĩ riêng cho bước lập dàn ý (bỏ trống = giống OPENAI_REASONING_EFFORT)
 #   OPENAI_REASONING_EFFORT  none / low / medium / high (mặc định none). Cao hơn = truyện chặt chẽ hơn nhưng tốn token + chậm hơn;
 #                            bot tự nới giới hạn token theo mức này. "off" = không gửi tham số (dùng mặc định của model).
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").strip().strip("\"'").strip() or "https://api.openai.com/v1").rstrip("/")
@@ -116,6 +117,11 @@ _REASONING = {} if _effort in ("off", "false", "no", "") else {"reasoning_effort
 _REASONING_EXTRA = {"none": 0, "minimal": 1500, "low": 3000, "medium": 9000, "high": 20000, "xhigh": 30000}
 _reasoning_extra = _REASONING_EXTRA.get(_REASONING.get("reasoning_effort", "off"), 9000)  # off = mặc định của model (~medium)
 OPENAI_MAX_OUTPUT_TOKENS = 5500 + _reasoning_extra
+# Mức suy nghĩ RIÊNG cho bước lập dàn ý (ngắn nhưng quyết định độ chặt chẽ của cả truyện).
+# Railway: OPENAI_PLAN_REASONING_EFFORT=high  (bỏ trống = giống OPENAI_REASONING_EFFORT).
+_plan_effort = os.getenv("OPENAI_PLAN_REASONING_EFFORT", "").strip().lower()
+_PLAN_REASONING = _REASONING if not _plan_effort else ({} if _plan_effort in ("off", "false", "no") else {"reasoning_effort": _plan_effort})
+_plan_extra = _REASONING_EXTRA.get(_PLAN_REASONING.get("reasoning_effort", "off"), 9000) if _PLAN_REASONING else 0
 # Kiểu API: "chat" (/v1/chat/completions) hoặc "responses" (/v1/responses — key "Codex" của nghimmo dùng kiểu này).
 # Railway: OPENAI_API_STYLE=chat|responses. Bỏ trống = tự chọn (nghimmo -> responses, còn lại -> chat).
 _style = os.getenv("OPENAI_API_STYLE", "").strip().lower()
@@ -159,8 +165,11 @@ def _responses_text(obj):
 
 
 def _read_sse(resp):
-    """Đọc luồng stream của /v1/responses: trả (object response cuối, chữ ghép từ delta, lỗi)."""
-    final, parts, error = None, [], ""
+    """Đọc luồng stream của /v1/responses: trả (object response cuối, chữ đầy đủ nhất, lỗi).
+    Gom chữ từ MỌI nguồn (delta, output_text.done, content_part.done, output_item.done) và lấy bản dài nhất,
+    để không bị mất đoạn đầu nếu server gửi vài chữ đầu theo kiểu sự kiện khác."""
+    final, error = None, ""
+    deltas, done_texts, kinds = {}, [], {}
     resp.encoding = "utf-8"
     for raw in resp.iter_lines(decode_unicode=True):
         if isinstance(raw, bytes):
@@ -175,30 +184,52 @@ def _read_sse(resp):
         except ValueError:
             continue
         kind = ev.get("type", "")
-        if kind == "response.output_text.delta":
-            parts.append(ev.get("delta") or "")
-        elif kind in ("response.completed", "response.incomplete", "response.failed"):
+        kinds[kind] = kinds.get(kind, 0) + 1
+        key = (ev.get("item_id") or "", ev.get("output_index", 0), ev.get("content_index", 0))
+        if kind.endswith("output_text.delta"):
+            deltas.setdefault(key, []).append(ev.get("delta") or ev.get("text") or "")
+        elif kind.endswith("output_text.done") and ev.get("text"):
+            done_texts.append(ev["text"])
+        elif kind == "response.content_part.done":
+            part = ev.get("part") or {}
+            if part.get("type") in ("output_text", "text") and part.get("text"):
+                done_texts.append(part["text"])
+        elif kind == "response.output_item.done":
+            t = _responses_text({"output": [ev.get("item") or {}]})
+            if t:
+                done_texts.append(t)
+        elif kind in ("response.completed", "response.incomplete", "response.failed", "response.done"):
             final = ev.get("response") or final
         elif kind == "error":
             error = (ev.get("error") or {}).get("message") or ev.get("message") or str(ev)[:300]
-    return final, "".join(parts), error
+    streamed = "".join("".join(v) for v in deltas.values())
+    candidates = [t for t in [_responses_text(final or {}), streamed] + done_texts if t]
+    best = max(candidates, key=len) if candidates else ""
+    if streamed and best and streamed != best:
+        print(f"[AI-STREAM] chữ ghép từ delta ({len(streamed)} ký tự) khác bản đầy đủ ({len(best)} ký tự); "
+              f"dùng bản đầy đủ. Sự kiện: {kinds}", flush=True)
+    return final, best, error
 
 
-def _ai_request(prompt, max_tokens):
+def _ai_request(prompt, max_tokens, cache_key="", reasoning=None):
     """Gọi AI theo OPENAI_API_STYLE. Luôn trả object có status_code + json() dạng chat/completions."""
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     if OPENAI_API_STYLE == "chat":
         return requests.post(OPENAI_CHAT_URL, headers=headers, json={
             "model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}],
-            **_REASONING, "max_completion_tokens": max_tokens}, timeout=OPENAI_TIMEOUT_SECONDS)
+            **(_REASONING if reasoning is None else reasoning), "max_completion_tokens": max_tokens},
+            timeout=OPENAI_TIMEOUT_SECONDS)
     for _ in range(5):
         with _RESP_ADAPT_LOCK:
             adapt = dict(_RESP_ADAPT)
         payload = {"model": OPENAI_MODEL, "input": [{"role": "user", "content": prompt}], "store": False}
         if not adapt["no_max"]:
             payload["max_output_tokens"] = max_tokens
-        if _REASONING and not adapt["no_reasoning"]:
-            payload["reasoning"] = {"effort": _REASONING["reasoning_effort"]}
+        eff = (_REASONING if reasoning is None else reasoning)
+        if eff and not adapt["no_reasoning"]:
+            payload["reasoning"] = {"effort": eff["reasoning_effort"]}
+        if cache_key and not adapt.get("no_cache_key"):
+            payload["prompt_cache_key"] = cache_key  # cùng 1 truyện -> server dễ dùng lại phần đầu prompt (cache)
         if adapt["instructions"]:
             payload["instructions"] = "You are a professional novelist. Follow the user's instructions exactly."
         if adapt["stream"]:
@@ -219,6 +250,8 @@ def _ai_request(prompt, max_tokens):
                     fix = "stream"
                 elif "instruction" in msg and not adapt["instructions"]:
                     fix = "instructions"
+                elif "prompt_cache_key" in msg and not adapt.get("no_cache_key"):
+                    fix = "no_cache_key"
                 elif "reasoning" in msg and not adapt["no_reasoning"] and _REASONING:
                     fix = "no_reasoning"
             if not fix and resp.status_code in (502, 503, 504, 520, 522, 524) and not adapt["stream"]:
@@ -232,7 +265,7 @@ def _ai_request(prompt, max_tokens):
         if "event-stream" in (resp.headers.get("content-type") or ""):
             final, streamed, error = _read_sse(resp)
             obj = final or {}
-            text = _responses_text(obj) or streamed
+            text = streamed
             raw_body = "stream: " + json.dumps(final, ensure_ascii=False)[:1500] + (f" | lỗi: {error}" if error else "")
             if error and not text:
                 return _AIResp(502, {"error": {"message": error}})
@@ -272,6 +305,9 @@ REQUIREMENTS
 • Length: approximately 2,000–3,000 words for this part. NEVER finish below 2,000 words.
 • Preserve 100% of Part 1's characters, relationships, events, timeline, personalities, and story logic, and stay consistent with every earlier part supplied above.
 • Follow the STORY PLAN (if provided) so every clue and revelation connects logically to the final resolution. Never print the plan.
+• Treat the FACT SHEET in the plan as final: never change a character's name, relationship, marriage, family tie, age, job or timeline.
+• Balance dialogue with narration, setting, body language and the narrator's inner thoughts. Avoid long runs of one-line question-and-answer exchanges, and do not repeat stock replies such as "I don't know" or "I know" again and again.
+• Do not repeat the final line of the previous part; open with a fresh sentence that moves the scene forward.
 • Maintain a tone suitable for all ages, appropriate for mainstream publishing platforms, and compliant with safety standards for advertiser-friendly content.
 • FORMAT: Each sentence on a separate line, with line spacing (one blank line) between the sentences.
 • Write the story only, without explanations or commentary.
@@ -1025,7 +1061,8 @@ Start now with the header line. Each sentence on a separate line with a blank li
             # Chỉ nếu content rỗng + length mới cứu đúng request đó với 7000; checkpoint cũ vẫn giữ.
             request_token_budget = OPENAI_MAX_OUTPUT_TOKENS + 2000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
             force_length_retry = False
-            resp = _ai_request(full_prompt, request_token_budget)
+            resp = _ai_request(full_prompt, request_token_budget,
+                               cache_key="story-" + hashlib.sha1(story_context[:3000].encode("utf-8")).hexdigest()[:16])
             try:
                 data = resp.json()
             except Exception:
@@ -1094,9 +1131,13 @@ def call_openai_story_plan(caption: str):
 TASK: Before any part is written, plan the entire continuation of this story in five parts:
 """ + "\n".join(f"PART {n}{' (THE END)' if n == LAST_PART else ''}: {PART_ROLES[n]}" for n in STORY_PARTS) + """
 
-Write a concise private story plan (about 300-450 words): the hidden truths, the key clues and where each one appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6. Keep 100% consistency with Part 1. Family-friendly. Output only the plan."""
+Write a concise private story plan (about 350-550 words) in two sections:
+1) FACT SHEET — every named character: full name, age range, job, and EXACT relationships (who is married to whom, who is whose parent, child, sibling, ex-partner). Include key dates/timeline facts. These facts are FINAL and must never change in any part.
+2) PLAN — the hidden truths, the key clues and where each one appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6.
+Every mystery or question raised must be clearly answered by Part 6; do not plan a late twist that cannot be resolved. Keep 100% consistency with Part 1. Family-friendly. Output only the plan."""
     try:
-        resp = _ai_request(prompt, 1500 + _reasoning_extra)
+        resp = _ai_request(prompt, 1500 + _plan_extra, reasoning=_PLAN_REASONING,
+                           cache_key="plan-" + hashlib.sha1(caption.encode("utf-8")).hexdigest()[:16])
         data = resp.json() if resp.content else {}
         if resp.status_code != 200:
             print(f"[OPENAI] Dàn ý lỗi HTTP {resp.status_code}; viết tiếp không có dàn ý.")
@@ -1202,7 +1243,8 @@ Output ONLY the new continuation paragraphs."""
     for attempt in range(1, OPENAI_PART_RETRIES + 1):
         try:
             # Continuation chỉ mua phần còn thiếu; không mở trần 6000 vô ích.
-            resp = _ai_request(prompt, min(2200, max(900, int(requested_words * 1.6) + 300)) + _reasoning_extra)
+            resp = _ai_request(prompt, min(2200, max(900, int(requested_words * 1.6) + 300)) + _reasoning_extra,
+                               cache_key="story-" + hashlib.sha1(story_context[:3000].encode("utf-8")).hexdigest()[:16])
             try:
                 data = resp.json()
             except Exception:
@@ -1249,6 +1291,11 @@ def generate_valid_part(story_context: str, part_number: int):
         return None
 
     raw = _strip_program_endings(raw)
+    if raw[:1].islower():
+        # Chữ đầu viết thường (vd "neath his blanket") = mất đoạn đầu khi nhận chữ từ server.
+        send_error_alert(f"part_start_cut_{part_number}",
+                         f"Part {part_number} bắt đầu bằng chữ bị cụt: {raw[:60]!r}… — server AI trả thiếu đoạn đầu. "
+                         f"Nếu lặp lại, đặt Railway OPENAI_STREAM=false.")
     raw = _ensure_part_header(raw, part_number)
     words = _word_count(raw)
 
@@ -4047,7 +4094,7 @@ def page6_test_recovery_worker():
 def _ai_selftest():
     """Khi dùng nhà cung cấp AI khác OpenAI: gửi 1 câu thử ngắn theo vài cách gọi, tự chọn cách CHẠY ĐƯỢC.
     In rõ phản hồi của server vào Deploy Logs để biết lỗi nằm ở đâu (key / model / kiểu API / reasoning)."""
-    global OPENAI_API_STYLE, _REASONING, _reasoning_extra, OPENAI_MAX_OUTPUT_TOKENS
+    global OPENAI_API_STYLE, _REASONING, _reasoning_extra, OPENAI_MAX_OUTPUT_TOKENS, _PLAN_REASONING, _plan_extra
     if not OPENAI_API_KEY:
         return
     host = urlparse(OPENAI_BASE_URL).hostname or ""
@@ -4076,6 +4123,8 @@ def _ai_selftest():
         if text:
             _reasoning_extra = _REASONING_EXTRA.get(reasoning.get("reasoning_effort", "off"), 9000) if reasoning else 0
             OPENAI_MAX_OUTPUT_TOKENS = 5500 + _reasoning_extra
+            if not reasoning:  # server không nhận reasoning -> dàn ý cũng không gửi
+                _PLAN_REASONING, _plan_extra = {}, 0
             print(f"[AI-TEST] ✅ Dùng cách gọi: {label}", flush=True)
             resolve_error_alert("ai_selftest_failed", f"AI viết truyện đã gọi được ({label}).")
             return
@@ -4100,7 +4149,7 @@ def main():
     for _i in range(STORY_WORKERS):
         threading.Thread(target=story_worker, name=f"story-worker-{_i + 1}", daemon=True).start()
     print(f"[CONFIG] Số luồng viết truyện song song: {STORY_WORKERS}", flush=True)
-    print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | API={OPENAI_API_STYLE}{' (stream)' if _RESP_ADAPT['stream'] and OPENAI_API_STYLE == 'responses' else ''} | reasoning={_REASONING.get('reasoning_effort', 'off')} | giới hạn {OPENAI_MAX_OUTPUT_TOKENS} token/Part", flush=True)
+    print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | API={OPENAI_API_STYLE}{' (stream)' if _RESP_ADAPT['stream'] and OPENAI_API_STYLE == 'responses' else ''} | reasoning={_REASONING.get('reasoning_effort', 'off')} (dàn ý: {_PLAN_REASONING.get('reasoning_effort', 'off')}) | giới hạn {OPENAI_MAX_OUTPUT_TOKENS} token/Part", flush=True)
     if ENABLE_PAGE6_WEB_TEST:
         threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
     while True:
