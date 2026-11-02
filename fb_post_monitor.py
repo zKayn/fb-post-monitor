@@ -1,3 +1,21 @@
+# ====================================================================================
+# Điều kiện riêng của từng người khai trong Railway → Variables (không sửa code):
+#   AUTHOR_CODE            (bắt buộc) mã nhân viên
+#   AUTHOR_USERNAME        username trên web (bỏ trống = AUTHOR_CODE)
+#   WEB_SITES, WEB_API_URL website + token;  ENABLE_WEB_PUBLISH=true để tự đăng web
+#   PAGE_NUMBERS           (không bắt buộc) "Tên Page A=1;Tên Page B=2"
+#   ALERT_RULES            ngưỡng views/comments, ví dụ "4000/0, 3000/50"  
+#   COMMENT_ONLY_THRESHOLD comments vượt mốc này thì báo luôn (mặc định 70)
+#   ONLY_POSTS_NEWER_THAN_HOURS  chỉ xét bài đăng trong N giờ (mặc định 120)
+#   ALERT_RULES_VIDEO, COMMENT_ONLY_VIDEO, ALERT_RULES_PHOTO, COMMENT_ONLY_PHOTO
+#                          (không bắt buộc) ngưỡng riêng cho bài VIDEO / ẢNH; bỏ trống = dùng ngưỡng chung
+#   SEND_STORY_TXT         true = gửi 3 file TXT sau thông báo; false = ẩn (mặc định false)
+#   INCLUDE_PAGE_NAMES     (không bắt buộc) chỉ theo dõi các Page này, ví dụ "Page A;Page B"
+#   STORY_WORKERS          (không bắt buộc) số bài viết truyện song song, 1–6 (mặc định 3). Mỗi bài vẫn đúng thứ tự
+#                          tin; giữa các bài thì bài xong trước báo trước. Đặt 1 nếu muốn báo đúng thứ tự đạt điều kiện.
+#   INSTANT_PAGE_IDS       (không bắt buộc) Page ĐẶC BIỆT: bài mới là viết truyện ngay, không cần ngưỡng.
+#                          Ghi Page ID, nhiều Page ngăn cách bằng dấu phẩy. Bỏ trống = không có Page đặc biệt.
+# =====================================================================================
 import json
 import os
 import re
@@ -143,7 +161,8 @@ def _part_label(n):
 
 
 # Để trống [] = theo dõi TẤT CẢ Page bạn quản lý.
-INCLUDE_PAGE_NAMES = []
+# Railway: INCLUDE_PAGE_NAMES="Page A;Page B" để chỉ theo dõi vài Page (bỏ trống = tất cả).
+INCLUDE_PAGE_NAMES = [x.strip() for x in re.split(r"[;\n]+", os.getenv("INCLUDE_PAGE_NAMES", "")) if x.strip()]
 
 # Mã Page (KHÔNG BẮT BUỘC) — ai muốn đánh số để dễ nhận biết thì khai trong env:
 #   PAGE_NUMBERS="Tên Page A=1;Tên Page B=2;..."
@@ -183,15 +202,16 @@ def _page_number(page_name, page_id):
 
 
 # --- Page đặc biệt ---
-# Little Girl: bài MỚI được tạo TXT ngay, không cần đạt ngưỡng.
-SPECIAL_INSTANT_PAGE_IDS = {x for x in re.findall(r"\d+", os.getenv("INSTANT_PAGE_IDS", "1285539704638198"))}  # Mặc định chỉ Little Girl; đổi bằng env INSTANT_PAGE_IDS
+# Page đặc biệt (không bắt buộc): bài MỚI của các Page này được viết truyện ngay, không cần đạt ngưỡng.
+# Railway: INSTANT_PAGE_IDS="123456789012345" (nhiều Page ngăn cách bằng dấu phẩy). Bỏ trống = không có Page đặc biệt.
+SPECIAL_INSTANT_PAGE_IDS = {x for x in re.findall(r"\d+", os.getenv("INSTANT_PAGE_IDS", ""))}
 SPECIAL_BASELINE_FILE = "/data/special_instant_baseline_posts.json"
 
 # Website: 
-PUBLISH_TEST_PAGE_ID = "1285539704638198"  # Little Girl; không giới hạn đăng 15 Page
 ENABLE_WEB_PUBLISH_TEST = os.getenv("ENABLE_WEB_PUBLISH_TEST", "true").lower() == "true"
 ENABLE_AUTO_WEB_PUBLISH = False  # Chặn luồng web cũ; chỉ test qua API công khai cho Page 6
-SEND_STORY_TXT_TELEGRAM = False  # Ẩn 3 file TXT trên Telegram (truyện vẫn viết + đăng web, link nằm trong thông báo)
+# Railway: SEND_STORY_TXT=true để gửi 3 file TXT ngay sau thông báo; false (mặc định) = ẩn.
+SEND_STORY_TXT_TELEGRAM = os.getenv("SEND_STORY_TXT", "false").strip().lower() in ("1", "true", "yes", "on")
 WEB_BASE_URL = ACTIVE_WEB_BASE_URL  # lấy từ WEB_API_URL
 # Chỉ Epic Stories (Page số 6) được phép thử đăng web; tất cả Page khác chỉ TXT.
 # Tắt ngay bằng ENABLE_PAGE6_WEB_TEST=false trên Railway.
@@ -243,15 +263,64 @@ ENABLE_STORY_CACHE = os.getenv("ENABLE_STORY_CACHE", "true").lower() == "true"
 STORY_CACHE_DIR = "/data/story_cache"
 
 
-# Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện dưới là báo):
-THRESHOLD_RULES = [
-    {"min_views": 4000, "min_comments": 0},
-    {"min_views": 3000, "min_comments": 50},
-]
-COMMENT_ONLY_THRESHOLD = 70  # comments vượt mốc này thì báo luôn, không cần xét views
+# Điều kiện thông báo (OR — chỉ cần đạt 1 trong các điều kiện là báo). Khai trong Railway:
+#   ALERT_RULES="4000/0, 3000/50"   nghĩa là (>= 4000 views) HOẶC (>= 3000 views VÀ >= 50 comments)
+#   COMMENT_ONLY_THRESHOLD=70       comments VƯỢT mốc này thì báo luôn, không cần xét views
+def _parse_rules(raw, default):
+    rules = []
+    for item in re.split(r"[,;\n]+", raw or ""):
+        nums = re.findall(r"\d+", item)
+        if len(nums) >= 2:
+            rules.append({"min_views": int(nums[0]), "min_comments": int(nums[1])})
+        elif len(nums) == 1:
+            rules.append({"min_views": int(nums[0]), "min_comments": 0})
+    if (raw or "").strip() and not rules:
+        print(f"[CONFIG-WARN] Ngưỡng {raw!r} sai định dạng (ví dụ đúng: 4000/0, 3000/50); dùng mặc định.", flush=True)
+    return rules or default
 
-# Chỉ theo dõi các bài đăng trong N giờ gần nhất (tránh quét lại bài cũ)
-ONLY_POSTS_NEWER_THAN_HOURS = 120  # Giới hạn phụ để giảm số lần gọi API
+
+def _env_int(name, default):
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(float(value))
+    except ValueError:
+        print(f"[CONFIG-WARN] {name}={value!r} không phải số; dùng mặc định {default}.", flush=True)
+        return default
+
+
+THRESHOLD_RULES = _parse_rules(os.getenv("ALERT_RULES", ""),
+                               [{"min_views": 4000, "min_comments": 0}, {"min_views": 3000, "min_comments": 50}])
+COMMENT_ONLY_THRESHOLD = _env_int("COMMENT_ONLY_THRESHOLD", 70)
+
+# Ngưỡng riêng theo LOẠI BÀI (không bắt buộc). Bỏ trống thì loại đó dùng ngưỡng chung ở trên.
+#   ALERT_RULES_VIDEO="2000/0"  COMMENT_ONLY_VIDEO=1000   (video / reels)
+#   ALERT_RULES_PHOTO="0/30"    COMMENT_ONLY_PHOTO=1000   (ảnh, album, bài chữ)
+THRESHOLD_RULES_VIDEO = _parse_rules(os.getenv("ALERT_RULES_VIDEO", ""), THRESHOLD_RULES)
+COMMENT_ONLY_THRESHOLD_VIDEO = _env_int("COMMENT_ONLY_VIDEO", COMMENT_ONLY_THRESHOLD)
+THRESHOLD_RULES_PHOTO = _parse_rules(os.getenv("ALERT_RULES_PHOTO", ""), THRESHOLD_RULES)
+COMMENT_ONLY_THRESHOLD_PHOTO = _env_int("COMMENT_ONLY_PHOTO", COMMENT_ONLY_THRESHOLD)
+MEDIA_RULES_ENABLED = any(os.getenv(k, "").strip() for k in
+                          ("ALERT_RULES_VIDEO", "COMMENT_ONLY_VIDEO", "ALERT_RULES_PHOTO", "COMMENT_ONLY_PHOTO"))
+MEDIA_LABELS = {"video": "🎬 Video", "photo": "🖼️ Ảnh", "unknown": "❔ Không rõ"}
+
+
+def _rules_for(kind):
+    """Trả (danh sách điều kiện, mốc comments-only) theo loại bài."""
+    if kind == "video":
+        return THRESHOLD_RULES_VIDEO, COMMENT_ONLY_THRESHOLD_VIDEO
+    if kind == "photo":
+        return THRESHOLD_RULES_PHOTO, COMMENT_ONLY_THRESHOLD_PHOTO
+    return THRESHOLD_RULES, COMMENT_ONLY_THRESHOLD
+
+
+# Chỉ theo dõi các bài đăng trong N giờ gần nhất (Railway: ONLY_POSTS_NEWER_THAN_HOURS, mặc định 120)
+ONLY_POSTS_NEWER_THAN_HOURS = _env_int("ONLY_POSTS_NEWER_THAN_HOURS", 120)
+print(f"[CONFIG] Mã NV={os.getenv('AUTHOR_CODE', '').strip()} | ngưỡng={THRESHOLD_RULES} | comments>{COMMENT_ONLY_THRESHOLD} "
+      f"| {ONLY_POSTS_NEWER_THAN_HOURS} giờ | gửi TXT={SEND_STORY_TXT_TELEGRAM}"
+      + (f" | VIDEO={THRESHOLD_RULES_VIDEO}/>{COMMENT_ONLY_THRESHOLD_VIDEO} ẢNH={THRESHOLD_RULES_PHOTO}/>{COMMENT_ONLY_THRESHOLD_PHOTO}"
+         if MEDIA_RULES_ENABLED else ""), flush=True)
 # Bắt buộc gắn Railway Volume vào /data để không reset khi redeploy.
 NEW_POST_CUTOFF_FILE = "/data/new_posts_since_utc.json"
 
@@ -284,23 +353,23 @@ NEW_POSTS_SINCE_UTC = _load_or_create_new_post_cutoff()
 # --- Phát hiện "dựng đứng" (viral spike) dựa trên tốc độ tăng views ---
 # Railway Variable: ENABLE_SPIKE_ALERT=true để BẬT, false để TẮT.
 # Mặc định false để không tự phát sinh cảnh báo ngoài ý muốn sau khi deploy.
-ENABLE_SPIKE_ALERT = os.getenv("ENABLE_SPIKE_ALERT", "false").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_SPIKE_ALERT = os.getenv("ENABLE_SPIKE_ALERT", "true").strip().lower() in ("1", "true", "yes", "on")
 # Thuật toán "ĐANG DỰNG ĐỨNG": so TỐC ĐỘ tăng views hiện tại với TỐC ĐỘ NỀN của chính bài đó
 # (không dùng số tuyệt đối, nên bắt được cả bài nhỏ). Có thể chỉnh bằng biến Railway nếu cần:
 VERTICAL_SHORT_MINUTES = float(os.getenv("VERTICAL_SHORT_MINUTES", "30"))     # cửa sổ tốc độ hiện tại
 VERTICAL_BASE_MAX_MINUTES = float(os.getenv("VERTICAL_BASE_MAX_MINUTES", "360"))  # tốc độ nền: tới 6 giờ trước
 VERTICAL_BASE_MIN_SPAN = float(os.getenv("VERTICAL_BASE_MIN_SPAN", "60"))     # nền phải có ít nhất 60 phút dữ liệu
 VERTICAL_MIN_RATIO = float(os.getenv("VERTICAL_MIN_RATIO", "3"))              # tốc độ hiện tại >= 3 lần tốc độ nền
-VERTICAL_MIN_RATE = float(os.getenv("VERTICAL_MIN_RATE", "1.5"))              # và >= 1,5 views/phút (90 views/giờ)
+VERTICAL_MIN_RATE = float(os.getenv("VERTICAL_MIN_RATE", "5"))                # và >= 5 views/phút (300 views/giờ); bài tăng chậm hơn không tính là dựng
 VERTICAL_SUSTAIN_MINUTES = float(os.getenv("VERTICAL_SUSTAIN_MINUTES", "20")) # giữ được >= 20 phút mới báo
 VERTICAL_MIN_VIEWS = int(os.getenv("VERTICAL_MIN_VIEWS", "1000"))             # chỉ báo khi bài đã có >= 1.000 views
 VERTICAL_STALE_MINUTES = 25   # Facebook cập nhật views theo đợt: số đứng yên tới 25 phút chưa coi là "chậm lại"
 # Bài dựng đứng MẠNH (chưa có link) được xử lý như BÀI ĐANG LÊN luôn (viết truyện + đăng web + báo kèm link),
 # không đợi đủ ngưỡng views/comments. Đặt False để tắt.
-VERTICAL_TRIGGERS_ALERT = True
+VERTICAL_TRIGGERS_ALERT = False  # Dựng đứng CHỈ báo theo dõi; viết truyện + link khi đạt ngưỡng BÀI ĐANG LÊN
 VERTICAL_ALERT_MIN_RATE_PER_HOUR = 240   # tốc độ tối thiểu để tính là BÀI ĐANG LÊN (views/giờ)
 VIEW_HISTORY_KEEP_MINUTES = VERTICAL_SHORT_MINUTES + VERTICAL_BASE_MAX_MINUTES + 30
-VIEW_HISTORY_FILE = "/data/view_history.json"
+VIEW_HISTORY_FILE = "/data/view_history_v2.json"  # v2: chỉ chứa số của metric views chính (bỏ lịch sử cũ lẫn metric dự phòng)
 STORY_COMPLETED_FILE = "/data/story_completed_posts.json"
 STORY_CLAIMED_FILE = "/data/story_claimed_posts.json"
 STORY_PROGRESS_DIR = "/data/story_progress"
@@ -388,10 +457,11 @@ def api_post(url, data=None, timeout=30):
     raise last_exc
 
 
-def meets_threshold(views: int, comments: int) -> bool:
-    if comments > COMMENT_ONLY_THRESHOLD:
+def meets_threshold(views: int, comments: int, kind: str = "unknown") -> bool:
+    rules, comment_only = _rules_for(kind)
+    if comments > comment_only:
         return True
-    for rule in THRESHOLD_RULES:
+    for rule in rules:
         if views >= rule["min_views"] and comments >= rule["min_comments"]:
             return True
     return False
@@ -408,11 +478,22 @@ def load_notified():
     return set()
 
 
+_FILE_WRITE_LOCK = threading.RLock()
+
+
+def _atomic_json_write(path, data):
+    """Ghi JSON an toàn khi nhiều luồng cùng ghi: ghi file tạm rồi đổi tên (không bao giờ ra file hỏng)."""
+    with _FILE_WRITE_LOCK:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+
 def save_notified(notified_set):
     try:
-        os.makedirs(os.path.dirname(NOTIFIED_FILE) or ".", exist_ok=True)
-        with open(NOTIFIED_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(notified_set), f, ensure_ascii=False, indent=2)
+        _atomic_json_write(NOTIFIED_FILE, sorted(list(notified_set)))
     except Exception as e:
         print(f"[LỖI] Không lưu được {NOTIFIED_FILE}: {e}")
 
@@ -454,9 +535,7 @@ def load_story_completed():
 
 def save_story_completed(items):
     try:
-        os.makedirs(os.path.dirname(STORY_COMPLETED_FILE) or ".", exist_ok=True)
-        with open(STORY_COMPLETED_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(items), f, ensure_ascii=False, indent=2)
+        _atomic_json_write(STORY_COMPLETED_FILE, sorted(list(items)))
     except Exception as e:
         print(f"[LỖI] Không lưu được {STORY_COMPLETED_FILE}: {e}")
 
@@ -537,6 +616,14 @@ def _slope_per_minute(points):
     return sum((t - mx) * (v - my) for t, v in points) / den
 
 
+def _steady_growth(points, max_share=0.6):
+    """Tăng LIÊN TỤC: >= 2 lần tăng và không lần tăng nào chiếm > 60% tổng lượng tăng của đoạn.
+    Một cú nhảy đơn lẻ (đổi metric, Facebook giật số) không phải dựng đứng."""
+    steps = [b[1] - a[1] for a, b in zip(points, points[1:]) if b[1] > a[1]]
+    total = sum(steps)
+    return len(steps) >= 2 and total > 0 and max(steps) <= max_share * total
+
+
 def record_and_check_spike(post_id: str, current_views, now: datetime):
     """Ghi mẫu views và kiểm tra bài có ĐANG DỰNG ĐỨNG không.
 
@@ -550,6 +637,16 @@ def record_and_check_spike(post_id: str, current_views, now: datetime):
         return False
     current_views = int(current_views)
     now_ts = now.timestamp()
+    # Lần đo dùng metric dự phòng ("người xem" ~ 1/2 views) -> KHÔNG ghi, không so (tránh nhảy số giả).
+    if _views_metric.get(post_id, 0) != 0:
+        return False
+    # Số TỤT so với lần trước (Facebook trả số lỗi) -> bỏ qua lần đo này.
+    _hist = view_history.get(post_id) or []
+    try:
+        if _hist and current_views < int(_hist[-1][1]) * 0.98:
+            return False
+    except (ValueError, TypeError, IndexError):
+        pass
 
     samples = []
     for entry in view_history.get(post_id, []):
@@ -623,7 +720,8 @@ def record_and_check_spike(post_id: str, current_views, now: datetime):
             tail = short[-3:]
         vt = _slope_per_minute(tail) if len(tail) >= 2 and (tail[-1][0] - tail[0][0]) >= 4 else vs
         hit = (vs >= VERTICAL_MIN_RATE and ratio >= VERTICAL_MIN_RATIO
-               and (vt or 0) >= max(VERTICAL_MIN_RATE, 0.5 * vs, VERTICAL_MIN_RATIO * vb * 0.7))
+               and (vt or 0) >= max(VERTICAL_MIN_RATE, 0.5 * vs, VERTICAL_MIN_RATIO * vb * 0.7)
+               and _steady_growth(short))
         if hit:
             _vertical_last[post_id] = (vs, ratio)
 
@@ -642,7 +740,7 @@ def record_and_check_spike(post_id: str, current_views, now: datetime):
             _vertical_last.pop(post_id, None)
         return False
 
-    held_min = (now_ts - _vertical_since[post_id]) / 60
+    held_min = ((pts[-1][0] if stale_hold else now_ts) - _vertical_since[post_id]) / 60
     if current_views < VERTICAL_MIN_VIEWS:
         # Vẫn theo dõi để tính thời gian giữ, nhưng chưa báo khi bài còn ít views.
         print(f"[VERTICAL] {post_id}: đang dựng ({ratio:.1f} lần) nhưng mới {current_views} views < {VERTICAL_MIN_VIEWS}; chưa báo.")
@@ -1135,9 +1233,25 @@ def _load_progress(post_id):
     try:
         with open(_progress_path(post_id), "r", encoding="utf-8") as f:
             value = json.load(f)
-        return value if isinstance(value, dict) else {}
+        return _migrate_old_checkpoint(value) if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def _migrate_old_checkpoint(state):
+    """Checkpoint do bản Son cũ ghi (publish_platform=bioblog_api, web_posts...): đổi sang tên của code chung
+    để bài đang đăng dở được đăng tiếp, bài đã đăng không bị đăng lại."""
+    if state.get("publish_platform") == "bioblog_api":
+        if state.get("web_posts") and not state.get("page6_api_posts"):
+            state["page6_api_posts"] = state["web_posts"]
+        if state.get("web_links_telegram_sent"):
+            state["page6_api_links_sent"] = True
+        if state.get("web_publish_blocked") and not state.get("page6_test_blocked"):
+            state["page6_test_blocked"] = state["web_publish_blocked"]
+        if state.get("web_retry_after") and not state.get("page6_retry_after"):
+            state["page6_retry_after"] = state["web_retry_after"]
+        state["publish_platform"] = "bioblog_api_page6_test"
+    return state
 
 
 def _retry_due(post_id):
@@ -1297,6 +1411,9 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
     if not state.get("page_name"):
         state["page_name"] = page_name
         _save_progress(post_id, state)
+    if caption and not state.get("fb_caption"):
+        state["fb_caption"] = caption  # chỉ để làm tiêu đề web (10–20 từ đầu caption); không dùng để so sánh
+        _save_progress(post_id, state)
     parts = state.setdefault("parts", {})
     # Chỉ áp dụng cache nếu bài hiện tại chưa sinh phần nào.
     if not parts:
@@ -1445,6 +1562,68 @@ def _web_part_title(base_title, n, page_number):
     return f"{prefix}{title}{page_number} {AUTHOR_CODE}"
 
 
+def _caption_web_title(caption, min_words=10, max_words=20):
+    """Tiêu đề chung trên web = 10–20 từ đầu của caption Facebook (Part 1).
+    Ưu tiên dừng ở cuối câu (10–20 từ); không được thì cắt ở dấu phẩy/chấm phẩy gần nhất, cuối cùng là 20 từ (không thêm "...")."""
+    lines = []
+    for line in str(caption or "").splitlines():
+        # Bỏ dòng mời đọc / CTA ngắn ở đầu caption ("👇 Read full story below", "Part 1"...).
+        if not lines and len(line.split()) <= 8 and re.search(
+                r"(?i)\b(read|full story|below|comments?|link|continue|part\s*\d+)\b|👇", line):
+            continue
+        lines.append(line)
+    text = re.sub(r"https?://\S+|www\.\S+", " ", " ".join(lines))
+    text = re.sub(r"#\w+", " ", text)
+    text = "".join(c if (c.isalnum() or c.isspace() or c in ".,;:!?'\"’‘“”-–—()&%$…") else " " for c in text)
+    text = re.sub(r"\s+", " ", text).strip(" -–—")
+    words = text.split()
+    if not words:
+        return ""
+    if len(words) <= max_words:
+        return text
+    head = words[:max_words]
+    ends = [i for i, w in enumerate(head) if i + 1 >= min_words and re.search(r"[.!?…][\"”’)]*$", w)]
+    if ends:
+        return " ".join(head[:ends[-1] + 1])
+    commas = [i for i, w in enumerate(head) if i + 1 >= min_words and re.search(r"[,;:–—]$", w)]
+    cut = head[:commas[-1] + 1] if commas else head
+    # Không thêm "...": bỏ các từ nối/mạo từ treo ở cuối để tiêu đề kết thúc tự nhiên.
+    weak = {"a", "an", "the", "and", "or", "but", "so", "to", "of", "in", "on", "at", "for", "with", "from",
+            "by", "my", "his", "her", "their", "our", "your", "its", "that", "which", "who", "when", "as",
+            "about", "into", "than", "then", "because", "if", "while", "was", "were", "is", "had", "has", "be"}
+    while len(cut) > min_words and re.sub(r"[^a-z']", "", cut[-1].lower()) in weak:
+        cut = cut[:-1]
+    return " ".join(cut).rstrip(",;:–— ")
+
+
+def _part_heading(raw, part):
+    """Lấy dòng "Part n – Tên Part" do model viết; thiếu tên thì chỉ "Part n"."""
+    for line in str(raw or "").splitlines():
+        line = line.strip().strip("*# ")
+        if not line:
+            continue
+        m = re.match(r"(?i)^PART\s*%d(?:\s*\(THE END\))?\s*[:\-–—]\s*(.+)$" % part, line)
+        if m and m.group(1).strip():
+            return f"Part {part} – {m.group(1).strip()}"
+        break
+    return f"Part {part}"
+
+
+def _story_text_without_heading(raw, part):
+    """Thân truyện không kèm dòng tiêu đề "Part n – ..." (tiêu đề được hiển thị riêng ở đầu bài web)."""
+    body = _story_body(raw, part)
+    lines = body.splitlines()
+    if lines and re.match(r"(?i)^\s*[*#]*\s*PART\s*%d\b" % part, lines[0]):
+        body = "\n".join(lines[1:]).strip()
+    return body
+
+
+def _web_heading_html(raw, part):
+    """Đầu mỗi bài web: "Part n – Tên Part" (đậm, lớn) rồi dòng "Part n" (đậm)."""
+    return (f"<h3><strong>{html.escape(_part_heading(raw, part))}</strong></h3>\n"
+            f"<p><strong>Part {part}</strong></p>\n")
+
+
 def _story_body(raw, part):
     raw = _strip_program_endings(raw)
     raw = re.sub(r"(?im)^\s*PART\s+%d(?:\s*\(THE END\))?\s*$" % part, "", raw).strip()
@@ -1519,23 +1698,32 @@ def _web_login():
 
 
 def _facebook_original_image(post_id, page_token):
-    """Tìm ảnh gốc của post, không sử dụng ảnh thumbnail nếu có bản full."""
-    response = requests.get(f"{GRAPH_URL}/{post_id}", params={
-        "fields": "full_picture,attachments{type,media,subattachments{media,type}}",
-        "access_token": page_token,
-    }, timeout=30)
-    response.raise_for_status()
-    obj = response.json()
-    if obj.get("error"):
-        raise RuntimeError("Facebook không cấp quyền đọc ảnh bài gốc")
-    attachments = ((obj.get("attachments") or {}).get("data") or [])
-    candidates = []
-    for att in attachments:
-        candidates.append(((att.get("media") or {}).get("image") or {}).get("src"))
-        for sub in ((att.get("subattachments") or {}).get("data") or []):
-            candidates.append(((sub.get("media") or {}).get("image") or {}).get("src"))
-    candidates.append(obj.get("full_picture"))
-    return next((u for u in candidates if isinstance(u, str) and u.startswith("https://")), None)
+    """Tìm ảnh gốc của bài (ưu tiên ảnh full). Thử nhiều cách hỏi vì Reel/video có thể không hỗ trợ một số trường.
+    Không lấy được thì trả None (KHÔNG làm hỏng việc đăng web)."""
+    last_err = None
+    for fields in ("full_picture,attachments{type,media,subattachments{media,type}}",
+                   "full_picture", "attachments{media,subattachments{media}}", "picture"):
+        try:
+            response = requests.get(f"{GRAPH_URL}/{post_id}", params={"fields": fields, "access_token": page_token}, timeout=30)
+            obj = response.json() if response.content else {}
+        except Exception as exc:
+            last_err = exc
+            continue
+        if response.status_code != 200 or not isinstance(obj, dict) or obj.get("error"):
+            last_err = ((obj.get("error") or {}).get("message") if isinstance(obj, dict) else None) or f"HTTP {response.status_code}"
+            continue
+        attachments = ((obj.get("attachments") or {}).get("data") or [])
+        candidates = []
+        for att in attachments:
+            candidates.append(((att.get("media") or {}).get("image") or {}).get("src"))
+            for sub in ((att.get("subattachments") or {}).get("data") or []):
+                candidates.append(((sub.get("media") or {}).get("image") or {}).get("src"))
+        candidates += [obj.get("full_picture"), obj.get("picture")]
+        url = next((u for u in candidates if isinstance(u, str) and u.startswith("https://")), None)
+        if url:
+            return url
+    print(f"[WEB-IMAGE] {post_id}: Facebook không trả ảnh của bài ({_mask_secrets(str(last_err))[:200]}); đăng web không ảnh.", flush=True)
+    return None
 
 
 def _download_facebook_image(image_url):
@@ -1606,7 +1794,10 @@ def _web_upload_featured_image(session, post_id, page_token):
 
 def _web_featured_image_or_fallback(post_id, page_token):
     """Đăng nhập admin + tải ảnh lên web. Lỗi tạm thời (500/522...) thì thử lại; nếu vẫn lỗi thì dùng
-    thẳng link ảnh gốc Facebook (API chỉ cần URL) để KHÔNG chặn việc đăng bài. Trả (url, dùng_fallback)."""
+    thẳng link ảnh gốc Facebook (API chỉ cần URL) để KHÔNG chặn việc đăng bài.
+    Trả (url, kiểu): kiểu False = ảnh trên web; True = tạm link Facebook; "none" = không có ảnh (vẫn đăng bài)."""
+    if not _facebook_original_image(post_id, page_token):
+        return "", "none"
     last = None
     for attempt in range(1, 4):
         try:
@@ -1618,7 +1809,7 @@ def _web_featured_image_or_fallback(post_id, page_token):
             time.sleep(6 * attempt)
     fb_url = _facebook_original_image(post_id, page_token)
     if not fb_url:
-        raise RuntimeError(f"Không tải được ảnh lên web và không lấy được ảnh Facebook: {last}")
+        return "", "none"
     print(f"[WEB-IMAGE] dùng tạm link ảnh Facebook vì web lỗi: {last}", flush=True)
     return fb_url, True
 
@@ -2202,6 +2393,25 @@ def chunked(lst, n):
         yield lst[i : i + n]
 
 
+_post_media_kind = {}
+
+
+def _detect_media_kind(body):
+    """'video' cho video/reels, 'photo' cho ảnh/album/bài chữ, 'unknown' nếu Facebook không trả thông tin."""
+    atts = ((body.get("attachments") or {}).get("data") or []) if isinstance(body, dict) else []
+    if not atts:
+        return "photo" if isinstance(body, dict) else "unknown"  # không có đính kèm = bài chữ, tính như ảnh
+    for att in atts:
+        media_type = str(att.get("media_type") or "").lower()
+        att_type = str(att.get("type") or "").lower()
+        if media_type == "video" or "video" in att_type or "reel" in att_type:
+            return "video"
+    return "photo"
+
+
+_views_metric = {}  # post_id -> metric đã dùng ở lần đo gần nhất (0 = post_media_view)
+
+
 def get_stats_batch(post_ids: list, page_token: str) -> dict:
     """Lấy views/comments/link/message của nhiều bài viết cùng lúc qua
     Facebook Batch API (tối đa POSTS_PER_BATCH bài/lần gọi HTTP).
@@ -2224,7 +2434,8 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
             batch_items.append(
                 {
                     "method": "GET",
-                    "relative_url": f"{pid}?fields=message,comments.limit(0).summary(true),permalink_url",
+                    "relative_url": f"{pid}?fields=message,comments.limit(0).summary(true),permalink_url"
+                                    + (",attachments{media_type,type}" if MEDIA_RULES_ENABLED else ""),
                 }
             )
 
@@ -2261,7 +2472,8 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
 
             # Thử lần lượt từng metric, lấy kết quả đầu tiên hợp lệ
             views = None
-            for insight_item in insight_items:
+            _views_metric.pop(str(pid), None)
+            for metric_idx, insight_item in enumerate(insight_items):
                 if insight_item and insight_item.get("code") == 200:
                     try:
                         body = json.loads(insight_item["body"])
@@ -2270,6 +2482,7 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
                             vals = data_list[0].get("values", [])
                             if vals and vals[-1].get("value") is not None:
                                 views = vals[-1]["value"]
+                                _views_metric[str(pid)] = metric_idx  # 0 = views thật; 1 = metric dự phòng
                                 break
                     except Exception:
                         continue
@@ -2281,6 +2494,8 @@ def get_stats_batch(post_ids: list, page_token: str) -> dict:
                 try:
                     body = json.loads(fields_item["body"])
                     message = body.get("message", "") or ""
+                    if MEDIA_RULES_ENABLED:
+                        _post_media_kind[str(pid)] = _detect_media_kind(body)
                     if "comments" in body:
                         comments = body["comments"]["summary"]["total_count"]
                         link = body.get("permalink_url")
@@ -2382,22 +2597,23 @@ def get_comment_count_fallback(post_id: str, page_token: str, summary_count=None
     }
 
 
-def should_deep_count_comments(views: int, comments: int) -> bool:
+def should_deep_count_comments(views: int, comments: int, kind: str = "unknown") -> bool:
     """Deep-count mọi bài có khả năng đạt/gần ngưỡng để Telegram dùng TOP_LEVEL sát Facebook."""
     views = int(views or 0)
     comments = int(comments or 0)
+    rules, comment_only = _rules_for(kind)
 
     # Nếu views đã đạt bất kỳ rule nào, cần top_level chính xác trước khi xét/báo.
-    for rule in THRESHOLD_RULES:
+    for rule in rules:
         if views >= int(rule["min_views"]):
             return True
 
     # Hoặc summary comments đang gần mốc comments-only.
-    if comments >= max(0, COMMENT_ONLY_THRESHOLD - COMMENT_COUNT_NEAR_THRESHOLD):
+    if comments >= max(0, comment_only - COMMENT_COUNT_NEAR_THRESHOLD):
         return True
 
     # Hoặc summary đang gần min_comments của bất kỳ rule.
-    for rule in THRESHOLD_RULES:
+    for rule in rules:
         min_comments = int(rule["min_comments"])
         if min_comments > 0 and comments >= max(0, min_comments - COMMENT_COUNT_NEAR_THRESHOLD):
             return True
@@ -2474,10 +2690,26 @@ STORY_QUEUE = queue.Queue()
 _story_pending = set()
 _story_lock = threading.Lock()
 
+# Số luồng viết truyện chạy song song (Railway: STORY_WORKERS, 1–6; mặc định 3). Nhiều bài đạt cùng lúc
+# không phải chờ nhau. Muốn báo đúng thứ tự đạt điều kiện tuyệt đối thì khai STORY_WORKERS=1.
+STORY_WORKERS = max(1, min(_env_int("STORY_WORKERS", 3), 6))
+STORY_QUEUE_MAX = 3 if STORY_WORKERS == 1 else STORY_WORKERS * 4
+_enqueue_reason = {}
+
+
 def enqueue_story(page_name, post_id, message, page_id, page_token, alert_text, notified_key):
     with _story_lock:
-        if (post_id in _story_pending or post_id in story_completed
-                or not _retry_due(post_id) or STORY_QUEUE.qsize() >= 3):
+        if post_id in _story_pending:
+            _enqueue_reason[post_id] = "đang viết truyện / đang chờ đến lượt"
+            return False
+        if post_id in story_completed:
+            _enqueue_reason[post_id] = "đã xử lý xong trước đó"
+            return False
+        if not _retry_due(post_id):
+            _enqueue_reason[post_id] = "vừa lỗi, chờ thử lại"
+            return False
+        if STORY_QUEUE.qsize() >= STORY_QUEUE_MAX:
+            _enqueue_reason[post_id] = f"hàng đợi đầy ({STORY_QUEUE.qsize()} bài đang chờ)"
             return False
         _story_pending.add(post_id)
     STORY_QUEUE.put((page_name, post_id, message, page_id, page_token, alert_text, notified_key))
@@ -2522,11 +2754,11 @@ def story_worker():
                 state["page_name"] = page_name
                 changed_state = True
             if notified_key not in already_notified and not state.get("alert_pending"):
-                # Chưa báo: KHOAN gửi. Thông báo sẽ gửi sau khi có 3 link truyện (kèm 3 link).
+                # Chưa báo: KHOAN gửi. Thông báo sẽ gửi sau khi có link truyện.
                 state["alert_pending"] = True
                 state["alert_key"] = notified_key
                 changed_state = True
-                print(f"[ALERT-WAIT] {post_id}: chờ viết truyện + đăng web để gửi thông báo kèm 3 link.")
+                print(f"[ALERT-WAIT] {post_id}: chờ viết truyện + đăng web để gửi thông báo kèm link truyện.")
             elif not state.get("alert_pending"):
                 print(f"[WORKER] {post_id}: đã báo trước đó; không báo lặp.")
             if changed_state:
@@ -2589,7 +2821,7 @@ JUMP_SURE_GAIN = 1000             # tăng >= 1.000 views thì nhắc luôn, khô
 _jump_pending = {}                # post_id -> thời điểm lần đo đầu tiên thấy bẻ lên (chờ xác nhận)
 
 
-def _jump_check(pid, alert_base):
+def _jump_check(pid, alert_base, since_ts=None):
     """Trả (True, mô tả) nếu bài VỪA BẺ LÊN. Dùng lịch sử views đã ghi (chỉ các lần số views thay đổi)."""
     now_ts = time.time()
     pts = []
@@ -2604,11 +2836,14 @@ def _jump_check(pid, alert_base):
         return False, ""
     last_t, last_v = pts[-1]
     fresh = (now_ts - last_t) <= 90  # lần đo này có số mới
-    if (now_ts - last_t) / 60 > 30:
-        return False, ""
+    if (now_ts - last_t) / 60 > 20:
+        return False, ""  # số views đã đứng yên quá lâu: đợt tăng (nếu có) đã qua
     # Điểm đầu đoạn đo: lần đổi số gần nhất cách điểm cuối >= ~8 phút (tối đa 30 phút).
+    # Nhắc gắn link: chỉ tính lượt tăng SAU lúc báo (since_ts), không dùng đợt tăng cũ trước đó.
     start = None
     for t, v in reversed(pts[:-1]):
+        if since_ts is not None and t < since_ts:
+            break
         if (last_t - t) / 60 >= JUMP_WINDOW_MINUTES * 0.8:
             start = (t, v)
             break
@@ -2638,8 +2873,6 @@ def _jump_check(pid, alert_base):
         if fresh:
             _jump_pending.pop(str(pid), None)
         return False, ""
-    if gain >= JUMP_SURE_GAIN:
-        return True, desc
     first = _jump_pending.get(str(pid))
     if first is None:
         _jump_pending[str(pid)] = (last_t, last_v)
@@ -2698,8 +2931,14 @@ def check_link_reminders(page_id, page_name, page_token, all_post_ids):
         # Ghi mẫu views + thuật toán "đang dựng đứng" (cho bài nhỏ tăng chậm).
         vertical = record_and_check_spike(pid, views, datetime.now())
         # Luật BẺ LÊN: bắt ngay mấy phút đầu của đợt tăng vọt (trước khi dựng xong).
-        jump, jump_desc = _jump_check(pid, base)
-        if not (jump or vertical) or minutes < REMIND_MIN_MINUTES:
+        try:
+            alert_ts = datetime.fromisoformat(base["at"]).timestamp()
+        except (KeyError, ValueError, TypeError):
+            alert_ts = None
+        jump, jump_desc = _jump_check(pid, base, since_ts=alert_ts)
+        # Phải tăng thật sau lúc báo (>= 300 views); tránh nhắc khi views đứng yên.
+        grown = int(views or 0) - int(base.get("views") or 0) >= JUMP_MIN_GAIN
+        if not (jump or vertical) or not grown or minutes < REMIND_MIN_MINUTES:
             continue
         ev = spike_evidence.get(pid, {})
         reason = jump_desc if jump else (
@@ -2770,13 +3009,15 @@ def check_all_pages():
 
         # Lần đầu bật chế độ đặc biệt: các bài đang tồn tại là baseline (bài cũ).
         # Chỉ post_id xuất hiện SAU baseline mới được coi là "bài mới".
-        if is_special_page and not _special_baseline_ready:
+        # Mốc ghi riêng cho từng Page (dòng "<page_id>_baseline"), nên thêm Page đặc biệt mới sau này vẫn đúng.
+        if is_special_page and f"{page_id}_baseline" not in special_baseline_posts:
             special_baseline_posts.update(str(pid) for pid in all_post_ids)
+            special_baseline_posts.add(f"{page_id}_baseline")
             save_special_baseline(special_baseline_posts)
             _special_baseline_ready = True
             print(
                 f"[SPECIAL-BASELINE] [{page_name}] đã ghi nhận {len(all_post_ids)} bài hiện có. "
-                "Từ bây giờ bài mới sẽ tạo TXT ngay, không cần chờ ngưỡng."
+                "Từ bây giờ bài mới sẽ viết truyện ngay; bài cũ vẫn xét theo ngưỡng thường."
             )
             continue
 
@@ -2786,7 +3027,6 @@ def check_all_pages():
         post_ids_to_check = [
             pid for pid in all_post_ids
             if str(pid) not in story_completed
-            and (not is_special_page or str(pid) not in special_baseline_posts)
             and now_mono >= _post_next_check.get(str(pid), 0)
         ]
 
@@ -2802,10 +3042,14 @@ def check_all_pages():
 
         for post_id in post_ids_to_check:
             key = f"{page_id}_{post_id}"
+            # Page đặc biệt: chỉ bài MỚI (sau mốc) mới bỏ qua ngưỡng; bài cũ vẫn xét ngưỡng như Page thường.
+            is_instant_page = is_special_page and str(post_id) not in special_baseline_posts
             views, comments, link, message = stats.get(post_id, (None, None, None, ""))
+            kind = _post_media_kind.get(str(post_id), "unknown")
+            kind_rules, kind_comment_only = _rules_for(kind)
 
             if not is_instant_page and (comments is None or (
-                views is None and comments <= COMMENT_ONLY_THRESHOLD
+                views is None and comments <= kind_comment_only
             )):
                 print(f"[{ts}] [{page_name}] {post_id}: không lấy được dữ liệu, bỏ qua.")
                 # Dữ liệu lỗi: thử lại ngay vòng 60 giây kế tiếp, không cache kết quả lỗi lâu.
@@ -2817,7 +3061,7 @@ def check_all_pages():
             # Khi pagination hoàn tất, biến comments được thay bằng TOP_LEVEL; vì vậy cả threshold
             # VÀ dòng "Comments:" trong Telegram đều dùng cùng một số top_level sát Facebook.
             summary_comments = int(comments or 0)
-            if not is_instant_page and should_deep_count_comments(views or 0, summary_comments):
+            if not is_instant_page and should_deep_count_comments(views or 0, summary_comments, kind):
                 effective_comments, comment_debug = get_comment_count_fallback(
                     post_id, page_token, summary_comments
                 )
@@ -2828,7 +3072,7 @@ def check_all_pages():
                     )
                 comments = effective_comments
 
-            poll_seconds = CHECK_INTERVAL_SECONDS if is_special_page else _adaptive_poll_seconds(views or 0, comments or 0)
+            poll_seconds = CHECK_INTERVAL_SECONDS if is_instant_page else _adaptive_poll_seconds(views or 0, comments or 0)
             _post_next_check[str(post_id)] = time.monotonic() + poll_seconds
             print(
                 f"[{ts}] [{page_name}] {post_id} -> views={views} | comments={comments}"
@@ -2849,12 +3093,17 @@ def check_all_pages():
                                   and (views or 0) >= VERTICAL_MIN_VIEWS
                                   and (spike_ev.get("rate_per_hour") or 0) >= VERTICAL_ALERT_MIN_RATE_PER_HOUR)
             jump_desc = ""
-            if VERTICAL_TRIGGERS_ALERT and not vertical_alert and (views or 0) >= VERTICAL_MIN_VIEWS:
-                # Vọt lên gắt (cả đợt chỉ 30-40 phút): báo ngay mấy phút đầu, không đợi giữ đủ 20 phút.
+            jumped = False
+            if not spike_detected and (views or 0) >= VERTICAL_MIN_VIEWS:
+                # Vọt lên gắt (cả đợt chỉ 30-40 phút): báo theo dõi ngay mấy phút đầu, không đợi giữ đủ 20 phút.
                 jumped, jump_desc = _jump_check(post_id, {})
-                vertical_alert = bool(jumped)
+                if VERTICAL_TRIGGERS_ALERT:
+                    vertical_alert = bool(jumped)
 
-            if ENABLE_SPIKE_ALERT and spike_detected and not vertical_alert and spike_key not in already_notified:
+            # Dựng đứng / vừa bẻ lên: CHỈ báo "ĐANG DỰNG ĐỨNG" để theo dõi (1 lần/bài), không viết truyện.
+            # Bài đã báo BÀI ĐANG LÊN thì không báo thêm (phần nhắc gắn link lo).
+            if (ENABLE_SPIKE_ALERT and (spike_detected or jumped) and not vertical_alert
+                    and spike_key not in already_notified and key not in already_notified):
 
                 # Spike cũng phải kiểm tra link TRƯỚC khi báo Telegram.
 
@@ -2873,15 +3122,18 @@ def check_all_pages():
                 else:
 
                     evidence = spike_evidence.get(str(post_id), {})
+                    speed = (f"Bài {jump_desc}.\n" if jumped and not spike_detected else
+                             f"Tốc độ hiện tại: ~{evidence.get('rate_per_hour', '?'):,} views/giờ "
+                             f"(trước đó ~{evidence.get('base_per_hour', '?'):,} views/giờ, "
+                             f"gấp {evidence.get('ratio', '?')} lần), đã giữ {evidence.get('held_minutes', '?')} phút.\n")
                     spike_msg = (
                         f"🚀 BÀI ĐANG DỰNG ĐỨNG! (Page: {page_name})\n"
-                        f"Views: {views}\n"
+                        + (f"Loại: {MEDIA_LABELS.get(kind, kind)}\n" if MEDIA_RULES_ENABLED else "")
+                        + f"Views: {views}\n"
                         f"Comments: {comments}\n"
                         + (f"Link: {link}\n" if link else "")
-                        + f"Tốc độ hiện tại: ~{evidence.get('rate_per_hour', '?'):,} views/giờ "
-                          f"(trước đó ~{evidence.get('base_per_hour', '?'):,} views/giờ, "
-                          f"gấp {evidence.get('ratio', '?')} lần), đã giữ {evidence.get('held_minutes', '?')} phút.\n"
-                        + "=> Kiểm tra bài ngay!"
+                        + speed
+                        + "👀 Chỉ báo để theo dõi — khi đạt điều kiện BÀI ĐANG LÊN bot mới viết truyện + tạo link."
                     )
 
                     print(f"[SPIKE] [{page_name}] {post_id}: dựng đứng + CHƯA có link -> gửi Telegram.")
@@ -2894,18 +3146,20 @@ def check_all_pages():
                         print(f"[SPIKE-TELEGRAM-FAILED] [{page_name}] {post_id}: chưa đánh dấu đã báo; sẽ thử lại.")
                         _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
 
-            # Little Girl: bài xuất hiện sau baseline được xử lý ngay, kể cả 0 views/comments.
+            # Page đặc biệt (INSTANT_PAGE_IDS): bài xuất hiện sau baseline được xử lý ngay, kể cả 0 views/comments.
             # Những Page còn lại vẫn phải đạt ngưỡng tương tác.
-            if not is_instant_page and not meets_threshold(views or 0, comments or 0) and not vertical_alert:
+            if not is_instant_page and not meets_threshold(views or 0, comments or 0, kind) and not vertical_alert:
                 continue
 
-            qualified_reasons = (["Page đặc biệt: bài mới, không cần ngưỡng"] if is_special_page else [])
+            qualified_reasons = (["Page đặc biệt: bài mới, không cần ngưỡng"] if is_instant_page else [])
             if vertical_alert:
                 qualified_reasons.append(jump_desc or
                     f"dựng đứng ~{spike_ev.get('rate_per_hour')}/giờ, gấp {spike_ev.get('ratio')} lần")
-            if (comments or 0) > COMMENT_ONLY_THRESHOLD:
-                qualified_reasons.append(f"comments>{COMMENT_ONLY_THRESHOLD}")
-            for rule in THRESHOLD_RULES:
+            if MEDIA_RULES_ENABLED:
+                qualified_reasons.append(f"loại={kind}")
+            if (comments or 0) > kind_comment_only:
+                qualified_reasons.append(f"comments>{kind_comment_only}")
+            for rule in kind_rules:
                 if (views or 0) >= rule["min_views"] and (comments or 0) >= rule["min_comments"]:
                     qualified_reasons.append(
                         f"views>={rule['min_views']} & comments>={rule['min_comments']}"
@@ -2963,7 +3217,8 @@ def check_all_pages():
                     if _retry_due(post_id):
                         retry_msg = (
                             f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                            f"Views: {views}\nComments: {comments}\n"
+                            + (f"Loại: {MEDIA_LABELS.get(kind, kind)}\n" if MEDIA_RULES_ENABLED else "")
+                            + f"Views: {views}\nComments: {comments}\n"
                             + (f"Link: {link}\n" if link else "")
                             + "=> Gắn link ngay!\n"
                             + "🔄 Tiếp tục tạo/gửi các file TXT còn thiếu..."
@@ -2998,7 +3253,8 @@ def check_all_pages():
 
             msg = (
                 f"🔥 BÀI ĐANG LÊN! (Page: {page_name})\n"
-                f"Views: {views}\n"
+                + (f"Loại: {MEDIA_LABELS.get(kind, kind)}\n" if MEDIA_RULES_ENABLED else "")
+                + f"Views: {views}\n"
                 f"Comments: {comments}\n"
                 + (f"🚀 Đang dựng đứng: ~{spike_ev.get('rate_per_hour', 0):,} views/giờ "
                    f"(gấp {spike_ev.get('ratio', '?')} lần trước đó)\n" if spike_ev else "")
@@ -3017,8 +3273,8 @@ def check_all_pages():
                 print(f"[QUEUE] [{page_name}] {post_id}: đã xếp hàng thông báo + TXT.")
             else:
                 print(
-                    f"[QUEUE-BUSY] [{page_name}] {post_id}: đạt ngưỡng nhưng chưa vào queue "
-                    f"(pending/completed/retry-delay/queue-full). Sẽ được xét lại vòng sau."
+                    f"[QUEUE-BUSY] [{page_name}] {post_id}: đạt ngưỡng, chưa vào hàng đợi vì "
+                    f"{_enqueue_reason.get(post_id, 'không rõ')}. Sẽ xét lại vòng sau."
                 )
                 # Đừng để adaptive polling kéo dài lần thử lại của một bài đã đạt ngưỡng.
                 _post_next_check[str(post_id)] = time.monotonic() + CHECK_INTERVAL_SECONDS
@@ -3092,12 +3348,39 @@ def _page6_nav_html(links):
         for label, url in links) + '</nav>')
 
 
+class WebRejected(RuntimeError):
+    """Website TỪ CHỐI yêu cầu (Cloudflare chặn / HTTP 4xx): chắc chắn CHƯA tạo bài -> thử lại an toàn."""
+    def __init__(self, message, cloudflare=False):
+        super().__init__(message)
+        self.cloudflare = cloudflare
+
+
+def _is_cloudflare_block(status, text):
+    t = (text or "")[:3000].lower()
+    return status in (403, 429, 503) and ("just a moment" in t or "cf-chl" in t or "challenge-platform" in t
+                                          or "attention required" in t or "cloudflare" in t)
+
+
+def _web_rejection(status, text):
+    """Trả WebRejected nếu phản hồi chắc chắn là bị từ chối (chưa tạo bài); None nếu không chắc."""
+    if _is_cloudflare_block(status, text):
+        host = urlparse(WEB_BASE_URL).hostname
+        return WebRejected(f"Website {host} đang bị Cloudflare chặn bot (trang 'Just a moment', HTTP {status}); "
+                           f"chưa tạo bài, bot sẽ tự thử lại.", cloudflare=True)
+    if 400 <= status < 500 and status not in (408, 409):
+        body = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text or "")).strip()[:250]
+        return WebRejected(f"BioBlog từ chối HTTP {status}: {body}")
+    return None
+
+
 def _page6_bioblog_create(post_id, part, title, content, image_url, permalink, prev_slug=""):
     # (Giữ lại để tương thích; luồng normal hiện tạo bài qua admin API để có id nối chương.)
-    if not image_url or not image_url.startswith("https://"):
-        raise RuntimeError("Thiếu ảnh đại diện công khai; không tạo bài BioBlog")
+    if image_url and not image_url.startswith("https://"):
+        raise RuntimeError("Ảnh đại diện không phải HTTPS; không tạo bài BioBlog")
     payload = {"title": title, "content": content, "author": BIOBLOG_AUTHOR_USERNAME,
-               "permalink": permalink, "feature_image": image_url, "mode": "normal"}
+               "permalink": permalink, "mode": "normal"}
+    if image_url:
+        payload["feature_image"] = image_url  # không có ảnh thì vẫn đăng bài (thêm ảnh tay sau)
     if prev_slug:
         payload["prev_chapter"] = prev_slug  # API: slug của bài chương trước
     # Không retry POST vì request có thể đã tạo bài dù mất phản hồi.
@@ -3105,7 +3388,10 @@ def _page6_bioblog_create(post_id, part, title, content, image_url, permalink, p
         headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN, "Accept": "application/json"},
         json=payload, timeout=65)
     if resp.status_code not in (200, 201):
-        raise RuntimeError(f"BioBlog HTTP {resp.status_code}: {resp.text[:350]}")
+        rejected = _web_rejection(resp.status_code, resp.text)
+        if rejected:
+            raise rejected
+        raise RuntimeError(f"BioBlog HTTP {resp.status_code}: {re.sub(r'<[^>]+>', ' ', resp.text or '')[:300]}")
     obj = resp.json()
     data = obj.get("data", obj) if isinstance(obj, dict) else {}
     if not isinstance(data, dict):
@@ -3316,16 +3602,25 @@ def publish_page6_bioblog_test(post_id):
     _save_progress(post_id, state)
     posts = state["page6_api_posts"]
     base_title = _story_title(state["parts"]["2"])
-    titles = {n: _web_part_title(base_title, n, page_number) for n in STORY_PARTS}
-    # Slug nguồn như bản đầu: theo tiêu đề, bỏ hậu tố AUTHOR_CODE (server ghép author vào slug cuối).
-    slugs = {n: _page6_permalink(titles[n]) for n in STORY_PARTS}
+    slug_titles = {n: _web_part_title(base_title, n, page_number) for n in STORY_PARTS}
+    # Slug (link web) GIỮ NGUYÊN cách tạo cũ: theo tiêu đề Part, bỏ hậu tố AUTHOR_CODE (server ghép author vào slug cuối).
+    slugs = {n: _page6_permalink(slug_titles[n]) for n in STORY_PARTS}
+    # Tiêu đề HIỂN THỊ chung cho mọi Part = 10–20 từ đầu caption Facebook + mã NV (chỉ đổi chữ hiển thị, không đổi link).
+    # Bài đã đăng dở bằng bản cũ thì giữ tiêu đề cũ cho đồng bộ.
+    if "web_display_title" not in state:
+        started = any((posts.get(str(n)) or {}) for n in STORY_PARTS)
+        caption_title = "" if started else _caption_web_title(state.get("fb_caption") or state.get("caption", ""))
+        state["web_display_title"] = f"{caption_title} {AUTHOR_CODE}" if caption_title else ""
+        _save_progress(post_id, state)
+    display_title = state.get("web_display_title") or ""
+    titles = {n: (display_title or slug_titles[n]) for n in STORY_PARTS}
     if len(set(slugs.values())) != len(STORY_PARTS):
         raise RuntimeError("Trùng permalink giữa các Part")
 
     # ---- Tạo bài bằng API công khai (đúng author + permalink như bản đầu),
     # ---- sau đó lấy id và PUT prev/next bằng admin API, cuối cùng gửi link Telegram một lần.
-    image_url = state.get("web_featured_image")
-    if not image_url:
+    image_url = state.get("web_featured_image") or ""
+    if "web_featured_image" not in state:
         if any(posts.get(str(n)) for n in STORY_PARTS):
             raise RuntimeError("Checkpoint đã có bài nhưng thiếu ảnh gốc; không tiếp tục để tránh sai ảnh")
         page_id = str(post_id).split("_", 1)[0]
@@ -3333,16 +3628,22 @@ def publish_page6_bioblog_test(post_id):
         if not page or not page.get("access_token"):
             raise RuntimeError("Không có Facebook Page token để lấy ảnh gốc")
         image_url, used_fb = _web_featured_image_or_fallback(post_id, page["access_token"])
-        if not isinstance(image_url, str) or not image_url.startswith("https://"):
+        if image_url and not str(image_url).startswith("https://"):
             raise RuntimeError("Ảnh upload không có HTTPS URL")
-        state["web_featured_image"] = image_url
+        state["web_featured_image"] = image_url or ""
         _save_progress(post_id, state)
-        if used_fb:
+        if used_fb == "none":
+            _telegram_or_defer(post_id, state=state, text=f"⚠️ Bài {post_id}: Facebook không cho lấy ảnh của bài (thường gặp với Reel). Truyện vẫn đăng lên web nhưng CHƯA có ảnh đại diện — nên thêm ảnh trong trang quản trị.")
+        elif used_fb:
             _telegram_or_defer(post_id, state=state, text="⚠️ Web lỗi khi tải ảnh lên (HTTP 500/đăng nhập). Bài vẫn đăng, ảnh đại diện đang dùng tạm link ảnh Facebook — có thể hết hạn, nên thay ảnh trong trang quản trị sau.")
-        print(f"[PAGE6-TEST] {post_id}: đã upload ảnh đại diện dùng chung 3 Part")
+        print(f"[PAGE6-TEST] {post_id}: đã xử lý ảnh đại diện dùng chung các Part")
 
     def _base_body(n):
-        return _to_html(_story_body(state["parts"][str(n)], n)) + "\n" + _to_html(_ending_block(n))
+        raw = state["parts"][str(n)]
+        if display_title:
+            return (_web_heading_html(raw, n) + _to_html(_story_text_without_heading(raw, n))
+                    + "\n" + _to_html(_ending_block(n)))
+        return _to_html(_story_body(raw, n)) + "\n" + _to_html(_ending_block(n))
 
     # Tạo theo thứ tự Part 2 -> 3 -> 4, mỗi bài gửi prev_chapter = slug bài trước (API hỗ trợ).
     for n in STORY_PARTS:
@@ -3360,7 +3661,12 @@ def publish_page6_bioblog_test(post_id):
         body = _base_body(n) + "\n" + _page6_navigation(n, nav_urls)
         posts[k] = {"request_started": True, "started_at": datetime.now(timezone.utc).isoformat()}
         _save_progress(post_id, state)
-        result = _page6_bioblog_create(post_id, n, titles[n], body, image_url, slugs[n], prev_slug)
+        try:
+            result = _page6_bioblog_create(post_id, n, titles[n], body, image_url, slugs[n], prev_slug)
+        except WebRejected:
+            posts.pop(k, None)  # web đã từ chối -> chắc chắn chưa tạo Part này, gỡ dấu để thử lại an toàn
+            _save_progress(post_id, state)
+            raise
         result["nav_used"] = {str(m): nav_urls[m] for m in STORY_PARTS if m != n}
         posts[k] = result
         _save_progress(post_id, state)
@@ -3388,13 +3694,15 @@ def publish_page6_bioblog_test(post_id):
             raise RuntimeError("Telegram chưa xác nhận gửi thông báo link")
         state["page6_api_links_sent"] = True
         _save_progress(post_id, state)
-        print(f"[PAGE6-LINKS] {post_id}: đã gửi đủ 3 URL sau khi nối chương", flush=True)
+        print(f"[PAGE6-LINKS] {post_id}: đã gửi đủ URL sau khi nối chương", flush=True)
 
     state["web_publish_complete"] = True
     state.pop("page6_retry_after", None)
     _save_progress(post_id, state)
     resolve_error_alert(f"web_link_retry_{post_id}", f"Bài {post_id}: đã nối chương và gửi đủ link.")
     resolve_error_alert(f"web_publish_retry_{post_id}", f"Bài {post_id}: đã đăng lên web thành công.")
+    resolve_error_alert(f"web_cloudflare_{urlparse(WEB_BASE_URL).hostname}",
+                        f"Website {urlparse(WEB_BASE_URL).hostname} đã nhận bài trở lại (hết bị Cloudflare chặn).")
     if state.get("page6_422_recovered") and not state.get("page6_422_recovery_notified"):
         if send_telegram_message("✅ ĐÃ KHẮC PHỤC: Page 6 đăng BioBlog thành công sau lỗi HTTP 422 thiếu permalink."):
             state["page6_422_recovery_notified"] = True
@@ -3474,6 +3782,17 @@ def _page6_try_publish_once_unlocked(post_id):
             _save_progress(post_id, state)
             print(f"[PAGE6-RECOVERY] {post_id}: gỡ khóa cũ thiếu id; không POST lại", flush=True)
     if state.get("page6_test_blocked"):
+        # Khóa cũ do web TỪ CHỐI (trang Cloudflare 'Just a moment' / HTTP 4xx): chắc chắn chưa tạo Part đó -> mở khóa.
+        _reason = str(state.get("page6_test_blocked", ""))
+        _m = re.search(r"BioBlog HTTP (\d{3})", _reason)
+        if _m and _web_rejection(int(_m.group(1)), _reason) is not None:
+            _recs = state.get("page6_api_posts") or {}
+            for _k in [k for k, r in _recs.items() if r.get("request_started") and not r.get("url")]:
+                _recs.pop(_k, None)
+            state.pop("page6_test_blocked", None)
+            _save_progress(post_id, state)
+            print(f"[PAGE6-RECOVERY] {post_id}: gỡ khóa do web từ chối (HTTP {_m.group(1)}); sẽ đăng tiếp", flush=True)
+    if state.get("page6_test_blocked"):
         # Khóa cũ do lỗi XẢY RA TRƯỚC KHI gọi POST tạo bài (ví dụ web 500 lúc tải ảnh) thì chưa có bài nào -> mở khóa, đăng lại.
         _recs = state.get("page6_api_posts") or {}
         if not any(r.get("request_started") or r.get("url") for r in _recs.values()):
@@ -3499,6 +3818,21 @@ def _page6_try_publish_once_unlocked(post_id):
             return False
     try:
         return publish_page6_bioblog_test(post_id)
+    except WebRejected as exc:
+        # Web từ chối (Cloudflare / 4xx): chưa tạo Part đang đăng -> tự thử lại sau 5 phút, không khóa bài.
+        state = _load_progress(post_id)
+        state["page6_retry_after"] = time.time() + 300
+        state["page6_last_error"] = str(exc)[:800]
+        _save_progress(post_id, state)
+        print(f"[PAGE6-REJECTED] {post_id}: {exc}; thử lại sau 300s", flush=True)
+        if getattr(exc, "cloudflare", False):
+            send_error_alert(f"web_cloudflare_{urlparse(WEB_BASE_URL).hostname}",
+                f"{exc}\nCác bài chờ đăng sẽ tự đăng khi web mở lại, không tạo trùng.\n"
+                "Cách sửa triệt để (người quản trị website): Cloudflare → Security → WAF → tạo rule 'Skip' "
+                "(bỏ qua Bot Fight Mode / Managed Challenge) cho đường dẫn /api/, /login và /admin/api/.")
+        else:
+            send_error_alert(f"web_publish_retry_{post_id}", f"Bài {post_id}: {exc}. Bot tự thử lại, không tạo trùng.")
+        return False
     except Exception as exc:
         state = _load_progress(post_id)
         records = state.get("page6_api_posts") or {}
@@ -3562,9 +3896,17 @@ def page6_test_recovery_worker():
 
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
+    # Không gắn Railway Volume vào /data thì mỗi lần deploy mất hết trạng thái -> báo trùng, nhắc trùng.
+    if not os.path.ismount("/data"):
+        print("[DATA-WARN] /data KHÔNG phải Railway Volume: mỗi lần deploy sẽ quên bài đã báo.", flush=True)
+        send_telegram_message("⚠️ CẢNH BÁO CẤU HÌNH: service này CHƯA gắn Railway Volume vào /data.\n"
+                              "Mỗi lần deploy/khởi động lại bot sẽ quên bài đã báo -> báo trùng, nhắc trùng.\n"
+                              "Sửa: Railway → service → Settings/Volumes → Add Volume, Mount path: /data")
     if PUBLISH_PLATFORM == "wordpress":
         threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
-    threading.Thread(target=story_worker, name="story-worker", daemon=True).start()
+    for _i in range(STORY_WORKERS):
+        threading.Thread(target=story_worker, name=f"story-worker-{_i + 1}", daemon=True).start()
+    print(f"[CONFIG] Số luồng viết truyện song song: {STORY_WORKERS}", flush=True)
     if ENABLE_PAGE6_WEB_TEST:
         threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
     while True:
