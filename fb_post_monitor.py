@@ -4016,6 +4016,7 @@ def publish_page6_bioblog_test(post_id):
     # Chuỗi chương do SERVER tự đồng bộ 2 chiều: gửi prev_chapter=slug bài trước khi tạo thì bài trước
     # tự có next_chapter trỏ lại (theo tài liệu API). Không cần PUT admin nữa.
     _page6_check_author(post_id, posts["2"])
+    _page6_detach_series(post_id, state, titles, image_url, _base_body)
 
     # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và nối chương xong.
     # Lưu checkpoint để retry/redeploy không gửi lại.
@@ -4039,6 +4040,60 @@ def publish_page6_bioblog_test(post_id):
             state["page6_422_recovery_notified"] = True
             _save_progress(post_id, state)
     return True
+
+# Website tự gom các Part nối chương (prev_chapter) thành 1 "series". Sau khi đăng đủ, bot sửa từng Part qua trang
+# quản trị: GIỮ prev/next (nút ← Previous / Next →) nhưng gỡ series (series_id = trống), giống thao tác sửa tay.
+# Cần WEB_ADMIN_EMAIL + WEB_ADMIN_PASSWORD. Railway WEB_DETACH_SERIES=false để tắt.
+WEB_DETACH_SERIES = os.getenv("WEB_DETACH_SERIES", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _page6_series_of(slug):
+    """Đọc (chỉ đọc) bài theo slug, trả series nếu API có trả về; None nếu không có/không đọc được."""
+    try:
+        resp = requests.get(WEB_BASE_URL + "/api/posts/" + str(slug).lstrip("/"),
+            headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN, "Accept": "application/json"}, timeout=40)
+        obj = resp.json() if resp.status_code == 200 else {}
+    except (requests.RequestException, ValueError):
+        return None
+    data = obj.get("data", obj) if isinstance(obj, dict) else {}
+    if isinstance(data, dict) and isinstance(data.get("post"), dict):
+        data = data["post"]
+    if not isinstance(data, dict):
+        return None
+    return data.get("series_id") or data.get("series") or None
+
+
+def _page6_detach_series(post_id, state, titles, image_url, base_body):
+    """Gỡ series web tự tạo, giữ nguyên liên kết chương. Lỗi không chặn thông báo/link (chỉ báo 1 lần)."""
+    if (not WEB_DETACH_SERIES or not WEB_LINK_CHAPTERS or state.get("page6_series_detached")
+            or not WEB_ADMIN_EMAIL or not WEB_ADMIN_PASSWORD):
+        return
+    posts = state["page6_api_posts"]
+    actual = {m: posts[str(m)]["url"] for m in STORY_PARTS}
+    try:
+        session = _web_login()
+        for n in STORY_PARTS:
+            rec = posts[str(n)]
+            if not rec.get("id"):
+                rec["id"] = _page6_bioblog_lookup_id(rec["slug"])
+                _save_progress(post_id, state)
+            _web_update_chapter(session, rec, titles[n], base_body(n) + "\n" + _page6_navigation(n, actual), image_url,
+                                prev_slug=posts[str(n - 1)]["slug"] if n > 2 else "",
+                                next_slug=posts[str(n + 1)]["slug"] if n < LAST_PART else "")
+        state["page6_series_detached"] = True
+        _save_progress(post_id, state)
+        left = _page6_series_of(posts[str(STORY_PARTS[0])]["slug"])
+        print(f"[SERIES] {post_id}: đã gỡ series, giữ nút Previous/Next"
+              + (f" — CẢNH BÁO: web vẫn báo series={left!r}" if left else ""), flush=True)
+        resolve_error_alert("web_detach_series", "Gỡ series tự tạo trên web đã hoạt động lại.")
+    except Exception as exc:
+        print(f"[SERIES] {post_id}: chưa gỡ được series: {exc}", flush=True)
+        send_error_alert("web_detach_series",
+                         f"Bài {post_id}: đã đăng đủ Part (có nút Previous/Next) nhưng chưa gỡ được series web tự tạo: "
+                         f"{str(exc)[:200]}. Link truyện vẫn dùng bình thường; có thể gỡ series tay trong trang quản trị.")
+        state["page6_series_detached"] = True  # không thử lại liên tục; bài vẫn đọc bình thường
+        _save_progress(post_id, state)
+
 
 def _page6_fix_text_nav(post_id, state, titles, image_url, base_body):
     """Đối chiếu link PREVIOUS/NEXT đã chèn với link thật. Nếu web đặt slug khác dự đoán (ví dụ trùng tên),
