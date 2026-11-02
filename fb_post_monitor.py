@@ -164,25 +164,58 @@ def _responses_text(obj):
     return "".join(out)
 
 
+def _sse_events(resp):
+    """Tách luồng SSE thành từng sự kiện JSON, CHỊU ĐƯỢC server trả JSON lỗi định dạng:
+    xuống dòng thật nằm ngay trong chữ (JSON bị cắt sang nhiều dòng, có cả dòng trống ở giữa).
+    Trước đây những sự kiện này bị bỏ -> mất đúng các đoạn có xuống dòng (mất tên Part, dính câu, mất dấu “)."""
+    resp.encoding = "utf-8"
+    buf = None
+
+    def _parse(text):
+        try:
+            return json.loads(text, strict=False)  # strict=False: chấp nhận ký tự xuống dòng thật trong chuỗi
+        except ValueError:
+            return None
+
+    for raw in resp.iter_lines(decode_unicode=True):
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        raw = raw if raw is not None else ""
+        if raw.startswith("data:"):
+            if buf is not None:
+                ev = _parse(buf)
+                if isinstance(ev, dict):
+                    yield ev
+            payload = raw[5:]
+            buf = payload[1:] if payload.startswith(" ") else payload
+            if buf.strip() == "[DONE]":
+                return
+            continue
+        if buf is None:
+            continue  # event:/id:/dòng trống ngoài sự kiện
+        if raw == "" or raw.startswith(("event:", "id:", "retry:")):
+            ev = _parse(buf)
+            if isinstance(ev, dict):
+                yield ev
+                buf = None
+                continue
+            if raw.startswith(("event:", "id:", "retry:")):
+                buf = None  # sự kiện hỏng hẳn, bỏ
+                continue
+        buf += "\n" + raw  # dòng tiếp nối của JSON bị cắt
+    if buf is not None:
+        ev = _parse(buf)
+        if isinstance(ev, dict):
+            yield ev
+
+
 def _read_sse(resp):
     """Đọc luồng stream của /v1/responses: trả (object response cuối, chữ đầy đủ nhất, lỗi).
     Gom chữ từ MỌI nguồn (delta, output_text.done, content_part.done, output_item.done) và lấy bản dài nhất,
     để không bị mất đoạn đầu nếu server gửi vài chữ đầu theo kiểu sự kiện khác."""
     final, error = None, ""
     deltas, done_texts, kinds = {}, [], {}
-    resp.encoding = "utf-8"
-    for raw in resp.iter_lines(decode_unicode=True):
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", "replace")
-        if not raw or not raw.startswith("data:"):
-            continue
-        payload = raw[5:].strip()
-        if payload == "[DONE]":
-            break
-        try:
-            ev = json.loads(payload)
-        except ValueError:
-            continue
+    for ev in _sse_events(resp):
         kind = ev.get("type", "")
         kinds[kind] = kinds.get(kind, 0) + 1
         key = (ev.get("item_id") or "", ev.get("output_index", 0), ev.get("content_index", 0))
@@ -308,6 +341,10 @@ REQUIREMENTS
 • Treat the FACT SHEET in the plan as final: never change a character's name, relationship, marriage, family tie, age, job or timeline.
 • Balance dialogue with narration, setting, body language and the narrator's inner thoughts. Avoid long runs of one-line question-and-answer exchanges, and do not repeat stock replies such as "I don't know" or "I know" again and again.
 • Do not repeat the final line of the previous part; open with a fresh sentence that moves the scene forward.
+• Pay off the previous part's cliffhanger exactly as it was set up. Never reverse, retract or contradict a revelation, statement or fact from an earlier part; if a twist changes its meaning, the earlier words must still be literally true.
+• Keep every character's gender and pronouns consistent with the FACT SHEET.
+• Avoid contrived devices: no convenient memory loss ("I don't remember signing it"), no anonymous texts or calls from unknown numbers that reveal secrets, no unexplained letters appearing from nowhere. Discoveries must come from characters' own choices, conversations and plausible evidence.
+• Do not introduce a new major mystery in Part 5 or Part 6; those parts resolve what is already in motion.
 • Maintain a tone suitable for all ages, appropriate for mainstream publishing platforms, and compliant with safety standards for advertiser-friendly content.
 • FORMAT: Each sentence on a separate line, with line spacing (one blank line) between the sentences.
 • Write the story only, without explanations or commentary.
@@ -1131,9 +1168,10 @@ def call_openai_story_plan(caption: str):
 TASK: Before any part is written, plan the entire continuation of this story in five parts:
 """ + "\n".join(f"PART {n}{' (THE END)' if n == LAST_PART else ''}: {PART_ROLES[n]}" for n in STORY_PARTS) + """
 
-Write a concise private story plan (about 350-550 words) in two sections:
-1) FACT SHEET — every named character: full name, age range, job, and EXACT relationships (who is married to whom, who is whose parent, child, sibling, ex-partner). Include key dates/timeline facts. These facts are FINAL and must never change in any part.
-2) PLAN — the hidden truths, the key clues and where each one appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6.
+Write a concise private story plan (about 400-650 words) in two sections:
+1) FACT SHEET — every named character: full name, gender/pronouns, age range, job, and EXACT relationships (who is married to whom, who is whose parent, child, sibling, ex-partner). Include key dates/timeline facts. These facts are FINAL and must never change in any part.
+2) PLAN — for EACH part: its main events, the exact cliffhanger it ends on, and how the next part pays that cliffhanger off. Also the hidden truths, where each clue appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6.
+Keep the plot simple enough to stay consistent: at most two hidden truths, revealed step by step; no convenient memory loss, no anonymous messages from unknown numbers.
 Every mystery or question raised must be clearly answered by Part 6; do not plan a late twist that cannot be resolved. Keep 100% consistency with Part 1. Family-friendly. Output only the plan."""
     try:
         resp = _ai_request(prompt, 1500 + _plan_extra, reasoning=_PLAN_REASONING,
@@ -1168,6 +1206,71 @@ def _strip_program_endings(text: str) -> str:
     cleaned = re.sub(r"(?im)^.*COMMENT AND SHARE THIS POST.*$", "", cleaned)
     cleaned = re.sub(r"(?im)^\W*SHARE YOUR THOUGHTS OR FEEDBACK.*$", "", cleaned)
     return cleaned.strip()
+
+
+# "…” Laura said." là lời dẫn thoại -> không tách dòng.
+_SPEECH_TAG = re.compile(r"(?:\S+\s+){0,2}(?:said|asked|replied|answered|whispered|murmured|repeated|added|continued|"
+                         r"called|shouted|cried|told|admitted|insisted|explained|began|went on|snapped|sighed)\b", re.I)
+_ABBREV = re.compile(r"(?:\b(?:Mr|Mrs|Ms|Dr|St|Jr|Sr|Prof|Mt|No|vs|etc|U\.S|a\.m|p\.m))\.$", re.I)
+
+
+def _curly_quotes(par):
+    """Đổi ngoặc kép thẳng "..." thành “...” và ' trong từ thành ’ (đồng bộ kiểu chữ giữa các Part)."""
+    if '"' in par:
+        out, opened = [], False
+        for ch in par:
+            if ch == '"':
+                out.append("”" if opened else "“")
+                opened = not opened
+            else:
+                out.append(ch)
+        par = "".join(out)
+    return re.sub(r"(?<=\w)'(?=\w)|(?<=\w)'(?=\s|$)", "’", par)
+
+
+def _split_sentences(par):
+    """Tách đoạn nhiều câu thành mỗi câu 1 dòng (không cắt bên trong lời thoại “...”, không cắt sau Mr./Dr.)."""
+    parts, start, depth, i, n = [], 0, 0, 0, len(par)
+    while i < n:
+        ch = par[i]
+        if ch == "“":
+            depth += 1
+        elif ch == "”":
+            depth = max(0, depth - 1)
+        if ch in ".!?…" and depth == 0:
+            j = i + 1
+            while j < n and par[j] in ".!?…”’)":
+                if par[j] == "”":
+                    depth = max(0, depth - 1)
+                j += 1
+            if j < n and par[j] == " " and j + 1 < n and (par[j + 1].isupper() or par[j + 1] in "“\"") \
+                    and not _ABBREV.search(par[start:i + 1]):
+                parts.append(par[start:j].strip())
+                start = j + 1
+                i = j
+        elif ch == "”" and depth == 0 and i + 2 < n and par[i + 1] == " " and (
+                par[i + 2] == "“" or (par[i - 1:i] in (".", "…") and par[i + 2].isupper()
+                                      and not _SPEECH_TAG.match(par[i + 2:]))):
+            # Lời thoại kết thúc câu rồi tới câu/lời thoại mới -> tách dòng
+            parts.append(par[start:i + 1].strip())
+            start = i + 2
+        i += 1
+    parts.append(par[start:].strip())
+    return [x for x in parts if x]
+
+
+def _polish_story_text(text):
+    """Chuẩn hóa định dạng sau khi AI viết: mỗi câu 1 dòng, cách nhau 1 dòng trống; ngoặc kép cong thống nhất."""
+    out = []
+    for par in re.split(r"\n\s*\n|\n", str(text or "").strip()):
+        par = re.sub(r"[ \t]+", " ", par).strip()
+        if not par:
+            continue
+        if re.match(r"(?i)^\W*PART\s+\d", par):  # dòng tiêu đề Part giữ nguyên
+            out.append(par.strip("*# "))
+            continue
+        out.extend(_split_sentences(_curly_quotes(par)))
+    return "\n\n".join(out)
 
 
 def _ensure_part_header(text: str, part_number: int) -> str:
@@ -1290,7 +1393,7 @@ def generate_valid_part(story_context: str, part_number: int):
         )
         return None
 
-    raw = _strip_program_endings(raw)
+    raw = _polish_story_text(_strip_program_endings(raw))
     if raw[:1].islower():
         # Chữ đầu viết thường (vd "neath his blanket") = mất đoạn đầu khi nhận chữ từ server.
         send_error_alert(f"part_start_cut_{part_number}",
@@ -1308,7 +1411,7 @@ def generate_valid_part(story_context: str, part_number: int):
         if not extra:
             break
         raw = f"{raw.rstrip()}\n\n{extra.strip()}"
-        raw = _strip_program_endings(raw)
+        raw = _polish_story_text(_strip_program_endings(raw))
         words = _word_count(raw)
         continuation_rounds -= 1
 
