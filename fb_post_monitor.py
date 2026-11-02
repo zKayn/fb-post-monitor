@@ -13,7 +13,7 @@
 #   INCLUDE_PAGE_NAMES     (không bắt buộc) chỉ theo dõi các Page này, ví dụ "Page A;Page B"
 #   STORY_WORKERS          (không bắt buộc) số bài viết truyện song song, 1–6 (mặc định 3). Mỗi bài vẫn đúng thứ tự
 #                          tin; giữa các bài thì bài xong trước báo trước. Đặt 1 nếu muốn báo đúng thứ tự đạt điều kiện.
-#   OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_REASONING_EFFORT  (không bắt buộc) đổi nhà cung cấp/model AI viết truyện
+#   (AI viết truyện cố định trong code: OpenAI gpt-6-luna — chỉ cần OPENAI_API_KEY)
 #   LINK_LABEL             (không bắt buộc) chữ trước mỗi link truyện trên Telegram, {n} = số Part,
 #                          ví dụ "READ FULL PART {n} HERE:". Bỏ trống = "PART 2: link" như cũ.
 #   INSTANT_PAGE_IDS       (không bắt buộc) Page ĐẶC BIỆT: bài mới là viết truyện ngay, không cần ngưỡng.
@@ -101,39 +101,25 @@ STORY_MIN_WORDS = 2000          # mỗi Part tối thiểu 2.000 từ
 STORY_TARGET_WORDS = 2400       # mục tiêu ~2.000–2.800 từ
 STORY_MAX_WORDS = 2800          # trần độ dài mỗi Part
 ENABLE_STORY_CONTINUATION = True
-# Railway (không bắt buộc) — đổi nhà cung cấp API tương thích OpenAI:
-#   OPENAI_BASE_URL  mặc định https://api.openai.com/v1 (ví dụ nhà cung cấp khác: https://api.nghimmo.com/v1)
-#   OPENAI_MODEL     mặc định gpt-5.6-luna
-#   OPENAI_API_STYLE  chat / responses (bỏ trống = tự chọn: nghimmo dùng responses)
-#   OPENAI_PLAN_REASONING_EFFORT  mức suy nghĩ riêng cho bước lập dàn ý (bỏ trống = giống OPENAI_REASONING_EFFORT)
-#   OPENAI_REASONING_EFFORT  none / low / medium / high (mặc định none). Cao hơn = truyện chặt chẽ hơn nhưng tốn token + chậm hơn;
-#                            bot tự nới giới hạn token theo mức này. "off" = không gửi tham số (dùng mặc định của model).
-OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").strip().strip("\"'").strip() or "https://api.openai.com/v1").rstrip("/")
+# ---- AI viết truyện: CỐ ĐỊNH TRONG CODE (không cần biến Railway) ----
+# OpenAI chính chủ, model gpt-6-luna. Chỉ cần OPENAI_API_KEY trên Railway là key OpenAI.
+# Các biến cũ OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_REASONING_EFFORT... trên Railway (nếu còn) sẽ bị BỎ QUA.
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 OPENAI_CHAT_URL = OPENAI_BASE_URL + "/chat/completions"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip().strip("\"'").strip() or "gpt-5.6-luna"
-_effort = os.getenv("OPENAI_REASONING_EFFORT", "none").strip().lower()
-_REASONING = {} if _effort in ("off", "false", "no", "") else {"reasoning_effort": _effort}
+OPENAI_MODEL = "gpt-6-luna"
+_REASONING = {"reasoning_effort": "none"}       # viết từng Part: không suy nghĩ thêm -> nhanh, rẻ
+_IGNORED_AI_ENV = [k for k in ("OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT", "OPENAI_PLAN_REASONING_EFFORT",
+                               "OPENAI_API_STYLE", "OPENAI_STREAM") if os.getenv(k, "").strip()]
 # Token "suy nghĩ" (reasoning) cũng tính vào giới hạn đầu ra -> mức suy nghĩ càng cao càng phải nới giới hạn,
 # nếu không Part sẽ bị cụt / rỗng. Truyện ~2.500 từ cần ~5.500 token chữ; phần cộng thêm là chỗ cho suy nghĩ.
 _REASONING_EXTRA = {"none": 0, "minimal": 1500, "low": 3000, "medium": 9000, "high": 20000, "xhigh": 30000}
 _reasoning_extra = _REASONING_EXTRA.get(_REASONING.get("reasoning_effort", "off"), 9000)  # off = mặc định của model (~medium)
 OPENAI_MAX_OUTPUT_TOKENS = 5500 + _reasoning_extra
-# Mức suy nghĩ RIÊNG cho bước lập dàn ý (ngắn nhưng quyết định độ chặt chẽ của cả truyện).
-# Railway: OPENAI_PLAN_REASONING_EFFORT=high  (bỏ trống = giống OPENAI_REASONING_EFFORT).
-_plan_effort = os.getenv("OPENAI_PLAN_REASONING_EFFORT", "").strip().lower()
-_PLAN_REASONING = _REASONING if not _plan_effort else ({} if _plan_effort in ("off", "false", "no") else {"reasoning_effort": _plan_effort})
+# Bước lập dàn ý: suy nghĩ mức "low" (ngắn nhưng quyết định độ chặt chẽ của cả truyện).
+_PLAN_REASONING = {"reasoning_effort": "low"}
 _plan_extra = _REASONING_EXTRA.get(_PLAN_REASONING.get("reasoning_effort", "off"), 9000) if _PLAN_REASONING else 0
-# Kiểu API: "chat" (/v1/chat/completions) hoặc "responses" (/v1/responses — key "Codex" của nghimmo dùng kiểu này).
-# Railway: OPENAI_API_STYLE=chat|responses. Bỏ trống = tự chọn (nghimmo -> responses, còn lại -> chat).
-_style = os.getenv("OPENAI_API_STYLE", "").strip().lower()
-OPENAI_API_STYLE = _style if _style in ("chat", "responses") else (
-    "responses" if "nghimmo" in (urlparse(OPENAI_BASE_URL).hostname or "") else "chat")
-# Stream (nhận chữ dần) giữ kết nối sống khi model suy nghĩ lâu -> tránh lỗi 502/503 do cổng trung gian hết giờ chờ.
-# Mặc định BẬT cho nhà cung cấp ngoài OpenAI dùng kiểu responses; Railway OPENAI_STREAM=false để tắt.
-_stream_env = os.getenv("OPENAI_STREAM", "").strip().lower()
-OPENAI_STREAM = (_stream_env in ("1", "true", "yes", "on")) if _stream_env else (
-    OPENAI_API_STYLE == "responses" and (urlparse(OPENAI_BASE_URL).hostname or "") != "api.openai.com")
-# Tham số server Responses không nhận -> tự học và bỏ/đổi ở các lần gọi sau (không cần sửa Railway).
+OPENAI_API_STYLE = "chat"   # OpenAI chat/completions
+OPENAI_STREAM = False
 _RESP_ADAPT = {"no_max": False, "stream": OPENAI_STREAM, "instructions": False, "no_reasoning": False}
 _RESP_ADAPT_LOCK = threading.Lock()
 
@@ -249,10 +235,36 @@ def _ai_request(prompt, max_tokens, cache_key="", reasoning=None):
     """Gọi AI theo OPENAI_API_STYLE. Luôn trả object có status_code + json() dạng chat/completions."""
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     if OPENAI_API_STYLE == "chat":
-        return requests.post(OPENAI_CHAT_URL, headers=headers, json={
-            "model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}],
-            **(_REASONING if reasoning is None else reasoning), "max_completion_tokens": max_tokens},
-            timeout=OPENAI_TIMEOUT_SECONDS)
+        eff = dict(_REASONING if reasoning is None else reasoning)
+        resp = None
+        for _ in range(4):
+            with _RESP_ADAPT_LOCK:
+                override = _RESP_ADAPT.get("chat_effort")  # mức suy nghĩ thay thế nếu model không nhận mức cũ
+                tok_key = _RESP_ADAPT.get("chat_tok_key", "max_completion_tokens")
+            extra = 0
+            if eff and override and eff.get("reasoning_effort") == "none":
+                extra = 3000 if override == "low" else 9000  # chỗ cho phần suy nghĩ để Part không bị cụt
+            body = {"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}], tok_key: max_tokens + extra}
+            if eff:
+                if override == "drop":
+                    pass
+                else:
+                    body["reasoning_effort"] = override or eff["reasoning_effort"]
+            resp = requests.post(OPENAI_CHAT_URL, headers=headers, json=body, timeout=OPENAI_TIMEOUT_SECONDS)
+            if resp.status_code != 400:
+                return resp
+            msg = (resp.text or "").lower()
+            with _RESP_ADAPT_LOCK:
+                if "reasoning_effort" in msg and override is None:
+                    _RESP_ADAPT["chat_effort"] = "low"   # model không nhận "none" -> dùng mức thấp nhất còn lại
+                elif "reasoning_effort" in msg and override == "low":
+                    _RESP_ADAPT["chat_effort"] = "drop"  # vẫn không nhận -> bỏ tham số
+                elif "max_completion_tokens" in msg and tok_key == "max_completion_tokens":
+                    _RESP_ADAPT["chat_tok_key"] = "max_tokens"
+                else:
+                    return resp
+            print(f"[OPENAI] Model {OPENAI_MODEL} không nhận tham số cũ -> tự chỉnh và gọi lại.", flush=True)
+        return resp
     for _ in range(5):
         with _RESP_ADAPT_LOCK:
             adapt = dict(_RESP_ADAPT)
@@ -4261,6 +4273,9 @@ def main():
     for _i in range(STORY_WORKERS):
         threading.Thread(target=story_worker, name=f"story-worker-{_i + 1}", daemon=True).start()
     print(f"[CONFIG] Số luồng viết truyện song song: {STORY_WORKERS}", flush=True)
+    if _IGNORED_AI_ENV:
+        print(f"[CONFIG] Bỏ qua biến Railway {', '.join(_IGNORED_AI_ENV)} — AI cố định trong code (OpenAI {OPENAI_MODEL}). "
+              f"Có thể xóa các biến này.", flush=True)
     print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | API={OPENAI_API_STYLE}{' (stream)' if _RESP_ADAPT['stream'] and OPENAI_API_STYLE == 'responses' else ''} | reasoning={_REASONING.get('reasoning_effort', 'off')} (dàn ý: {_PLAN_REASONING.get('reasoning_effort', 'off')}) | giới hạn {OPENAI_MAX_OUTPUT_TOKENS} token/Part", flush=True)
     if ENABLE_PAGE6_WEB_TEST:
         threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
