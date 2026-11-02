@@ -121,7 +121,11 @@ OPENAI_MAX_OUTPUT_TOKENS = 5500 + _reasoning_extra
 _style = os.getenv("OPENAI_API_STYLE", "").strip().lower()
 OPENAI_API_STYLE = _style if _style in ("chat", "responses") else (
     "responses" if "nghimmo" in (urlparse(OPENAI_BASE_URL).hostname or "") else "chat")
-OPENAI_STREAM = os.getenv("OPENAI_STREAM", "").strip().lower() in ("1", "true", "yes", "on")
+# Stream (nhận chữ dần) giữ kết nối sống khi model suy nghĩ lâu -> tránh lỗi 502/503 do cổng trung gian hết giờ chờ.
+# Mặc định BẬT cho nhà cung cấp ngoài OpenAI dùng kiểu responses; Railway OPENAI_STREAM=false để tắt.
+_stream_env = os.getenv("OPENAI_STREAM", "").strip().lower()
+OPENAI_STREAM = (_stream_env in ("1", "true", "yes", "on")) if _stream_env else (
+    OPENAI_API_STYLE == "responses" and (urlparse(OPENAI_BASE_URL).hostname or "") != "api.openai.com")
 # Tham số server Responses không nhận -> tự học và bỏ/đổi ở các lần gọi sau (không cần sửa Railway).
 _RESP_ADAPT = {"no_max": False, "stream": OPENAI_STREAM, "instructions": False, "no_reasoning": False}
 _RESP_ADAPT_LOCK = threading.Lock()
@@ -157,7 +161,10 @@ def _responses_text(obj):
 def _read_sse(resp):
     """Đọc luồng stream của /v1/responses: trả (object response cuối, chữ ghép từ delta, lỗi)."""
     final, parts, error = None, [], ""
+    resp.encoding = "utf-8"
     for raw in resp.iter_lines(decode_unicode=True):
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
         if not raw or not raw.startswith("data:"):
             continue
         payload = raw[5:].strip()
@@ -214,13 +221,15 @@ def _ai_request(prompt, max_tokens):
                     fix = "instructions"
                 elif "reasoning" in msg and not adapt["no_reasoning"] and _REASONING:
                     fix = "no_reasoning"
+            if not fix and resp.status_code in (502, 503, 504, 520, 522, 524) and not adapt["stream"]:
+                fix = "stream"  # cổng trung gian hết giờ chờ -> chuyển sang stream để giữ kết nối
             if fix:
                 with _RESP_ADAPT_LOCK:
                     _RESP_ADAPT[fix] = True
                 print(f"[OPENAI] Server Responses không nhận tham số cũ -> tự chỉnh ({fix}) và gọi lại.", flush=True)
                 continue
             return _AIResp(resp.status_code, err if isinstance(err, dict) else {"error": {"message": str(err)}})
-        if "event-stream" in (resp.headers.get("content-type") or "") or adapt["stream"]:
+        if "event-stream" in (resp.headers.get("content-type") or ""):
             final, streamed, error = _read_sse(resp)
             obj = final or {}
             text = _responses_text(obj) or streamed
@@ -4091,7 +4100,7 @@ def main():
     for _i in range(STORY_WORKERS):
         threading.Thread(target=story_worker, name=f"story-worker-{_i + 1}", daemon=True).start()
     print(f"[CONFIG] Số luồng viết truyện song song: {STORY_WORKERS}", flush=True)
-    print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | API={OPENAI_API_STYLE} | reasoning={_REASONING.get('reasoning_effort', 'off')} | giới hạn {OPENAI_MAX_OUTPUT_TOKENS} token/Part", flush=True)
+    print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | API={OPENAI_API_STYLE}{' (stream)' if _RESP_ADAPT['stream'] and OPENAI_API_STYLE == 'responses' else ''} | reasoning={_REASONING.get('reasoning_effort', 'off')} | giới hạn {OPENAI_MAX_OUTPUT_TOKENS} token/Part", flush=True)
     if ENABLE_PAGE6_WEB_TEST:
         threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
     while True:
