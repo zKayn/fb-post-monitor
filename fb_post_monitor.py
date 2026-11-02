@@ -40,7 +40,7 @@ from datetime import datetime, timezone, timedelta
 USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip().strip("\"'").strip()  # bỏ dấu ngoặc/khoảng trắng dán thừa
 
 # ---------- Danh sách website của team + website đang dùng ----------
 # WEB_SITES: mỗi dòng "link API: token" (ngăn cách bằng xuống dòng hoặc dấu ;), ví dụ:
@@ -103,13 +103,145 @@ ENABLE_STORY_CONTINUATION = True
 # Railway (không bắt buộc) — đổi nhà cung cấp API tương thích OpenAI:
 #   OPENAI_BASE_URL  mặc định https://api.openai.com/v1 (ví dụ nhà cung cấp khác: https://api.nghimmo.com/v1)
 #   OPENAI_MODEL     mặc định gpt-5.6-luna
-#   OPENAI_REASONING_EFFORT  mặc định none; đặt "off" nếu API báo không hỗ trợ tham số reasoning_effort
-OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1").rstrip("/")
+#   OPENAI_API_STYLE  chat / responses (bỏ trống = tự chọn: nghimmo dùng responses)
+#   OPENAI_REASONING_EFFORT  none / low / medium / high (mặc định none). Cao hơn = truyện chặt chẽ hơn nhưng tốn token + chậm hơn;
+#                            bot tự nới giới hạn token theo mức này. "off" = không gửi tham số (dùng mặc định của model).
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "").strip().strip("\"'").strip() or "https://api.openai.com/v1").rstrip("/")
 OPENAI_CHAT_URL = OPENAI_BASE_URL + "/chat/completions"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip() or "gpt-5.6-luna"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip().strip("\"'").strip() or "gpt-5.6-luna"
 _effort = os.getenv("OPENAI_REASONING_EFFORT", "none").strip().lower()
 _REASONING = {} if _effort in ("off", "false", "no", "") else {"reasoning_effort": _effort}
-OPENAI_MAX_OUTPUT_TOKENS = 5500  # đủ cho 2.000–3.000 từ/Part (mỗi câu 1 dòng)
+# Token "suy nghĩ" (reasoning) cũng tính vào giới hạn đầu ra -> mức suy nghĩ càng cao càng phải nới giới hạn,
+# nếu không Part sẽ bị cụt / rỗng. Truyện ~2.500 từ cần ~5.500 token chữ; phần cộng thêm là chỗ cho suy nghĩ.
+_REASONING_EXTRA = {"none": 0, "minimal": 1500, "low": 3000, "medium": 9000, "high": 20000, "xhigh": 30000}
+_reasoning_extra = _REASONING_EXTRA.get(_REASONING.get("reasoning_effort", "off"), 9000)  # off = mặc định của model (~medium)
+OPENAI_MAX_OUTPUT_TOKENS = 5500 + _reasoning_extra
+# Kiểu API: "chat" (/v1/chat/completions) hoặc "responses" (/v1/responses — key "Codex" của nghimmo dùng kiểu này).
+# Railway: OPENAI_API_STYLE=chat|responses. Bỏ trống = tự chọn (nghimmo -> responses, còn lại -> chat).
+_style = os.getenv("OPENAI_API_STYLE", "").strip().lower()
+OPENAI_API_STYLE = _style if _style in ("chat", "responses") else (
+    "responses" if "nghimmo" in (urlparse(OPENAI_BASE_URL).hostname or "") else "chat")
+OPENAI_STREAM = os.getenv("OPENAI_STREAM", "").strip().lower() in ("1", "true", "yes", "on")
+# Tham số server Responses không nhận -> tự học và bỏ/đổi ở các lần gọi sau (không cần sửa Railway).
+_RESP_ADAPT = {"no_max": False, "stream": OPENAI_STREAM, "instructions": False, "no_reasoning": False}
+_RESP_ADAPT_LOCK = threading.Lock()
+
+
+class _AIResp:
+    """Phản hồi đã quy về dạng chat/completions để phần còn lại của code dùng chung."""
+    def __init__(self, status_code, data):
+        self.status_code = status_code
+        self._data = data
+        self.text = json.dumps(data, ensure_ascii=False)[:2000]
+        self.content = self.text.encode("utf-8")
+
+    def json(self):
+        return self._data
+
+
+def _responses_text(obj):
+    if not isinstance(obj, dict):
+        return ""
+    if isinstance(obj.get("output_text"), str) and obj["output_text"].strip():
+        return obj["output_text"]
+    out = []
+    for item in obj.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") not in (None, "message"):
+            continue
+        for c in item.get("content") or []:
+            if isinstance(c, dict) and c.get("type") in ("output_text", "text") and c.get("text"):
+                out.append(c["text"])
+    return "".join(out)
+
+
+def _read_sse(resp):
+    """Đọc luồng stream của /v1/responses: trả (object response cuối, chữ ghép từ delta, lỗi)."""
+    final, parts, error = None, [], ""
+    for raw in resp.iter_lines(decode_unicode=True):
+        if not raw or not raw.startswith("data:"):
+            continue
+        payload = raw[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            ev = json.loads(payload)
+        except ValueError:
+            continue
+        kind = ev.get("type", "")
+        if kind == "response.output_text.delta":
+            parts.append(ev.get("delta") or "")
+        elif kind in ("response.completed", "response.incomplete", "response.failed"):
+            final = ev.get("response") or final
+        elif kind == "error":
+            error = (ev.get("error") or {}).get("message") or ev.get("message") or str(ev)[:300]
+    return final, "".join(parts), error
+
+
+def _ai_request(prompt, max_tokens):
+    """Gọi AI theo OPENAI_API_STYLE. Luôn trả object có status_code + json() dạng chat/completions."""
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    if OPENAI_API_STYLE == "chat":
+        return requests.post(OPENAI_CHAT_URL, headers=headers, json={
+            "model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}],
+            **_REASONING, "max_completion_tokens": max_tokens}, timeout=OPENAI_TIMEOUT_SECONDS)
+    for _ in range(5):
+        with _RESP_ADAPT_LOCK:
+            adapt = dict(_RESP_ADAPT)
+        payload = {"model": OPENAI_MODEL, "input": [{"role": "user", "content": prompt}], "store": False}
+        if not adapt["no_max"]:
+            payload["max_output_tokens"] = max_tokens
+        if _REASONING and not adapt["no_reasoning"]:
+            payload["reasoning"] = {"effort": _REASONING["reasoning_effort"]}
+        if adapt["instructions"]:
+            payload["instructions"] = "You are a professional novelist. Follow the user's instructions exactly."
+        if adapt["stream"]:
+            payload["stream"] = True
+        resp = requests.post(OPENAI_BASE_URL + "/responses", headers=headers, json=payload,
+                             timeout=OPENAI_TIMEOUT_SECONDS, stream=adapt["stream"])
+        if resp.status_code != 200:
+            try:
+                err = resp.json()
+            except ValueError:
+                err = {"error": {"message": (resp.text or "")[:1000]}}
+            msg = str((err.get("error") or {}).get("message") if isinstance(err.get("error"), dict) else err.get("error") or err.get("detail") or err).lower()
+            fix = None
+            if resp.status_code in (400, 422):
+                if "max_output_tokens" in msg and not adapt["no_max"]:
+                    fix = "no_max"
+                elif "stream" in msg and not adapt["stream"]:
+                    fix = "stream"
+                elif "instruction" in msg and not adapt["instructions"]:
+                    fix = "instructions"
+                elif "reasoning" in msg and not adapt["no_reasoning"] and _REASONING:
+                    fix = "no_reasoning"
+            if fix:
+                with _RESP_ADAPT_LOCK:
+                    _RESP_ADAPT[fix] = True
+                print(f"[OPENAI] Server Responses không nhận tham số cũ -> tự chỉnh ({fix}) và gọi lại.", flush=True)
+                continue
+            return _AIResp(resp.status_code, err if isinstance(err, dict) else {"error": {"message": str(err)}})
+        if "event-stream" in (resp.headers.get("content-type") or "") or adapt["stream"]:
+            final, streamed, error = _read_sse(resp)
+            obj = final or {}
+            text = _responses_text(obj) or streamed
+            if error and not text:
+                return _AIResp(502, {"error": {"message": error}})
+        else:
+            try:
+                obj = resp.json()
+            except ValueError:
+                return _AIResp(502, {"error": {"message": "Responses API trả dữ liệu không phải JSON: " + (resp.text or "")[:300]}})
+            text = _responses_text(obj)
+        status = obj.get("status") or ("completed" if text else "failed")
+        reason = (obj.get("incomplete_details") or {}).get("reason") if isinstance(obj.get("incomplete_details"), dict) else None
+        finish = "stop" if status == "completed" else ("length" if reason == "max_output_tokens" else status)
+        if not text and isinstance(obj.get("error"), dict) and obj["error"].get("message"):
+            return _AIResp(502, {"error": {"message": obj["error"]["message"]}})
+        u = obj.get("usage") or {}
+        usage = {"prompt_tokens": u.get("input_tokens"), "completion_tokens": u.get("output_tokens"),
+                 "total_tokens": u.get("total_tokens")}
+        return _AIResp(200, {"choices": [{"message": {"content": text}, "finish_reason": finish}], "usage": usage})
+    return _AIResp(400, {"error": {"message": "Server Responses từ chối mọi cách gọi; kiểm tra model/key."}})
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
@@ -880,19 +1012,9 @@ Start now with the header line. Each sentence on a separate line with a blank li
         try:
             # Bình thường dùng trần 6000 và reasoning=none để giảm chi phí/độ trễ.
             # Chỉ nếu content rỗng + length mới cứu đúng request đó với 7000; checkpoint cũ vẫn giữ.
-            request_token_budget = 7000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
+            request_token_budget = OPENAI_MAX_OUTPUT_TOKENS + 2000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
             force_length_retry = False
-            resp = requests.post(
-                OPENAI_CHAT_URL,
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": OPENAI_MODEL,
-                    "messages": [{"role": "user", "content": full_prompt}],
-                    **_REASONING,
-                    "max_completion_tokens": request_token_budget,
-                },
-                timeout=OPENAI_TIMEOUT_SECONDS,
-            )
+            resp = _ai_request(full_prompt, request_token_budget)
             try:
                 data = resp.json()
             except Exception:
@@ -920,7 +1042,7 @@ Start now with the header line. Each sentence on a separate line with a blank li
                         force_length_retry = True
                         print(
                             f"[OPENAI] Part {part_number}: content rỗng + finish_reason=length "
-                            f"-> retry riêng với 7000 tokens."
+                            f"-> retry riêng với {OPENAI_MAX_OUTPUT_TOKENS + 2000} tokens."
                         )
                     elif attempt >= OPENAI_PART_RETRIES:
                         # Không dùng lượt dự phòng cho các lỗi khác.
@@ -963,13 +1085,7 @@ TASK: Before any part is written, plan the entire continuation of this story in 
 
 Write a concise private story plan (about 300-450 words): the hidden truths, the key clues and where each one appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6. Keep 100% consistency with Part 1. Family-friendly. Output only the plan."""
     try:
-        resp = requests.post(
-            OPENAI_CHAT_URL,
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}],
-                  "max_completion_tokens": 1500, **_REASONING},
-            timeout=OPENAI_TIMEOUT_SECONDS,
-        )
+        resp = _ai_request(prompt, 1500 + _reasoning_extra)
         data = resp.json() if resp.content else {}
         if resp.status_code != 200:
             print(f"[OPENAI] Dàn ý lỗi HTTP {resp.status_code}; viết tiếp không có dàn ý.")
@@ -1074,18 +1190,8 @@ Output ONLY the new continuation paragraphs."""
     last_error = "unknown"
     for attempt in range(1, OPENAI_PART_RETRIES + 1):
         try:
-            resp = requests.post(
-                OPENAI_CHAT_URL,
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": OPENAI_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    **_REASONING,
-                    # Continuation chỉ mua phần còn thiếu; không mở trần 6000 vô ích.
-                    "max_completion_tokens": min(2200, max(900, int(requested_words * 1.6) + 300)),
-                },
-                timeout=OPENAI_TIMEOUT_SECONDS,
-            )
+            # Continuation chỉ mua phần còn thiếu; không mở trần 6000 vô ích.
+            resp = _ai_request(prompt, min(2200, max(900, int(requested_words * 1.6) + 300)) + _reasoning_extra)
             try:
                 data = resp.json()
             except Exception:
@@ -3239,6 +3345,9 @@ def check_all_pages():
                 progress = _load_progress(post_id)
                 has_saved_progress = bool(progress and (
                     progress.get("parts") or progress.get("sent") or progress.get("caption")
+                    # Bài đã qua worker của bản mới (đã báo / đang viết) dù AI lỗi chưa ra Part nào:
+                    # vẫn là checkpoint thật -> KHÔNG xóa notified, tránh báo "BÀI ĐANG LÊN" lặp lại mỗi vòng.
+                    or progress.get("alert_key") or progress.get("fb_caption") or "story_plan" in progress
                 ))
 
                 if has_saved_progress:
@@ -3937,7 +4046,7 @@ def main():
     for _i in range(STORY_WORKERS):
         threading.Thread(target=story_worker, name=f"story-worker-{_i + 1}", daemon=True).start()
     print(f"[CONFIG] Số luồng viết truyện song song: {STORY_WORKERS}", flush=True)
-    print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | reasoning={_REASONING.get('reasoning_effort', 'off')}", flush=True)
+    print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | API={OPENAI_API_STYLE} | reasoning={_REASONING.get('reasoning_effort', 'off')} | giới hạn {OPENAI_MAX_OUTPUT_TOKENS} token/Part", flush=True)
     if ENABLE_PAGE6_WEB_TEST:
         threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
     while True:
