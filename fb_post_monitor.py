@@ -129,10 +129,10 @@ _RESP_ADAPT_LOCK = threading.Lock()
 
 class _AIResp:
     """Phản hồi đã quy về dạng chat/completions để phần còn lại của code dùng chung."""
-    def __init__(self, status_code, data):
+    def __init__(self, status_code, data, raw=None):
         self.status_code = status_code
         self._data = data
-        self.text = json.dumps(data, ensure_ascii=False)[:2000]
+        self.text = (raw if raw is not None else json.dumps(data, ensure_ascii=False))[:2000]
         self.content = self.text.encode("utf-8")
 
     def json(self):
@@ -224,6 +224,7 @@ def _ai_request(prompt, max_tokens):
             final, streamed, error = _read_sse(resp)
             obj = final or {}
             text = _responses_text(obj) or streamed
+            raw_body = "stream: " + json.dumps(final, ensure_ascii=False)[:1500] + (f" | lỗi: {error}" if error else "")
             if error and not text:
                 return _AIResp(502, {"error": {"message": error}})
         else:
@@ -232,15 +233,16 @@ def _ai_request(prompt, max_tokens):
             except ValueError:
                 return _AIResp(502, {"error": {"message": "Responses API trả dữ liệu không phải JSON: " + (resp.text or "")[:300]}})
             text = _responses_text(obj)
+            raw_body = resp.text or ""
         status = obj.get("status") or ("completed" if text else "failed")
         reason = (obj.get("incomplete_details") or {}).get("reason") if isinstance(obj.get("incomplete_details"), dict) else None
         finish = "stop" if status == "completed" else ("length" if reason == "max_output_tokens" else status)
         if not text and isinstance(obj.get("error"), dict) and obj["error"].get("message"):
-            return _AIResp(502, {"error": {"message": obj["error"]["message"]}})
+            return _AIResp(502, {"error": {"message": obj["error"]["message"]}}, raw_body)
         u = obj.get("usage") or {}
         usage = {"prompt_tokens": u.get("input_tokens"), "completion_tokens": u.get("output_tokens"),
                  "total_tokens": u.get("total_tokens")}
-        return _AIResp(200, {"choices": [{"message": {"content": text}, "finish_reason": finish}], "usage": usage})
+        return _AIResp(200, {"choices": [{"message": {"content": text}, "finish_reason": finish}], "usage": usage}, raw_body)
     return _AIResp(400, {"error": {"message": "Server Responses từ chối mọi cách gọi; kiểm tra model/key."}})
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
@@ -1037,7 +1039,7 @@ Start now with the header line. Each sentence on a separate line with a blank li
                     if text:
                         print(f"[OPENAI] Part {part_number} OK | finish_reason={finish_reason} | usage={usage}")
                         return text
-                    last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}"
+                    last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}; server trả: {str(getattr(resp, 'text', ''))[:300]}"
                     if finish_reason == "length" and attempt < total_attempts:
                         force_length_retry = True
                         print(
@@ -4033,8 +4035,51 @@ def page6_test_recovery_worker():
         time.sleep(60)
 
 
+def _ai_selftest():
+    """Khi dùng nhà cung cấp AI khác OpenAI: gửi 1 câu thử ngắn theo vài cách gọi, tự chọn cách CHẠY ĐƯỢC.
+    In rõ phản hồi của server vào Deploy Logs để biết lỗi nằm ở đâu (key / model / kiểu API / reasoning)."""
+    global OPENAI_API_STYLE, _REASONING, _reasoning_extra, OPENAI_MAX_OUTPUT_TOKENS
+    if not OPENAI_API_KEY:
+        return
+    host = urlparse(OPENAI_BASE_URL).hostname or ""
+    if host == "api.openai.com" and os.getenv("OPENAI_SELFTEST", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    other = "chat" if OPENAI_API_STYLE == "responses" else "responses"
+    combos = [(OPENAI_API_STYLE, _REASONING), (other, _REASONING)]
+    if _REASONING:
+        combos += [(OPENAI_API_STYLE, {}), (other, {})]
+    saved = (OPENAI_API_STYLE, _REASONING)
+    report = []
+    for style, reasoning in combos:
+        OPENAI_API_STYLE, _REASONING = style, reasoning
+        label = f"API={style} reasoning={reasoning.get('reasoning_effort', 'off')}"
+        try:
+            resp = _ai_request("Reply with exactly one word: OK", 64 + (3000 if reasoning else 0))
+            data = resp.json() if resp.status_code == 200 else {}
+            choice = ((data.get("choices") or [{}])[0]) if isinstance(data, dict) else {}
+            text = str((choice.get("message") or {}).get("content") or "").strip()
+            raw = str(getattr(resp, "text", ""))[:300]
+        except Exception as exc:
+            text, raw, resp = "", f"lỗi mạng: {exc}", None
+        code = getattr(resp, "status_code", "-")
+        print(f"[AI-TEST] {label} -> HTTP {code} | trả lời={text[:40]!r} | server: {raw}", flush=True)
+        report.append(f"• {label}: HTTP {code} — {text[:30] or raw[:160]}")
+        if text:
+            _reasoning_extra = _REASONING_EXTRA.get(reasoning.get("reasoning_effort", "off"), 9000) if reasoning else 0
+            OPENAI_MAX_OUTPUT_TOKENS = 5500 + _reasoning_extra
+            print(f"[AI-TEST] ✅ Dùng cách gọi: {label}", flush=True)
+            resolve_error_alert("ai_selftest_failed", f"AI viết truyện đã gọi được ({label}).")
+            return
+    OPENAI_API_STYLE, _REASONING = saved
+    send_error_alert("ai_selftest_failed",
+                     f"Không gọi được AI viết truyện ({host}, model={OPENAI_MODEL}) bằng mọi cách thử:\n"
+                     + "\n".join(report)
+                     + "\n👉 Kiểm tra: key còn hạn (trang check), tên model đúng như trang hướng dẫn, gói có model này.")
+
+
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
+    _ai_selftest()
     # Không gắn Railway Volume vào /data thì mỗi lần deploy mất hết trạng thái -> báo trùng, nhắc trùng.
     if not os.path.ismount("/data"):
         print("[DATA-WARN] /data KHÔNG phải Railway Volume: mỗi lần deploy sẽ quên bài đã báo.", flush=True)
