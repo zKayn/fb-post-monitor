@@ -1604,9 +1604,14 @@ def _part_heading(raw, part):
             continue
         m = re.match(r"(?i)^PART\s*%d(?:\s*\(THE END\))?\s*[:\-–—]\s*(.+)$" % part, line)
         if m and m.group(1).strip():
-            return f"Part {part} – {m.group(1).strip()}"
+            return f"{_web_part_name(part)} – {m.group(1).strip()}"
         break
-    return f"Part {part}"
+    return _web_part_name(part)
+
+
+def _web_part_name(part):
+    """Tên Part hiển thị trên web: Part cuối có (The End)."""
+    return f"Part {part} (The End)" if part == LAST_PART else f"Part {part}"
 
 
 def _story_text_without_heading(raw, part):
@@ -1621,7 +1626,7 @@ def _story_text_without_heading(raw, part):
 def _web_heading_html(raw, part):
     """Đầu mỗi bài web: "Part n – Tên Part" (đậm, lớn) rồi dòng "Part n" (đậm)."""
     return (f"<h3><strong>{html.escape(_part_heading(raw, part))}</strong></h3>\n"
-            f"<p><strong>Part {part}</strong></p>\n")
+            f"<p><strong>{_web_part_name(part)}</strong></p>\n")
 
 
 def _story_body(raw, part):
@@ -3610,7 +3615,7 @@ def publish_page6_bioblog_test(post_id):
     if "web_display_title" not in state:
         started = any((posts.get(str(n)) or {}) for n in STORY_PARTS)
         caption_title = "" if started else _caption_web_title(state.get("fb_caption") or state.get("caption", ""))
-        state["web_display_title"] = f"{caption_title} {AUTHOR_CODE}" if caption_title else ""
+        state["web_display_title"] = f"**{caption_title}** {AUTHOR_CODE}" if caption_title else ""  # ** ** cho nổi bật
         _save_progress(post_id, state)
     display_title = state.get("web_display_title") or ""
     titles = {n: (display_title or slug_titles[n]) for n in STORY_PARTS}
