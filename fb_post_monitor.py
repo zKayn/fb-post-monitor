@@ -245,6 +245,8 @@ def _ai_request(prompt, max_tokens, cache_key="", reasoning=None):
             if eff and override and eff.get("reasoning_effort") == "none":
                 extra = 3000 if override == "low" else 9000  # chỗ cho phần suy nghĩ để Part không bị cụt
             body = {"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}], tok_key: max_tokens + extra}
+            if cache_key and not _RESP_ADAPT.get("no_cache_key"):
+                body["prompt_cache_key"] = cache_key  # các Part cùng 1 truyện dùng lại phần đầu prompt -> token đầu vào rẻ hơn
             if eff:
                 if override == "drop":
                     pass
@@ -259,6 +261,8 @@ def _ai_request(prompt, max_tokens, cache_key="", reasoning=None):
                     _RESP_ADAPT["chat_effort"] = "low"   # model không nhận "none" -> dùng mức thấp nhất còn lại
                 elif "reasoning_effort" in msg and override == "low":
                     _RESP_ADAPT["chat_effort"] = "drop"  # vẫn không nhận -> bỏ tham số
+                elif "prompt_cache_key" in msg and not _RESP_ADAPT.get("no_cache_key"):
+                    _RESP_ADAPT["no_cache_key"] = True
                 elif "max_completion_tokens" in msg and tok_key == "max_completion_tokens":
                     _RESP_ADAPT["chat_tok_key"] = "max_tokens"
                 else:
@@ -358,6 +362,8 @@ REQUIREMENTS
 • Keep every character's gender and pronouns consistent with the FACT SHEET.
 • Avoid contrived devices: no convenient memory loss ("I don't remember signing it"), no anonymous texts or calls from unknown numbers that reveal secrets, no unexplained letters appearing from nowhere. Discoveries must come from characters' own choices, conversations and plausible evidence.
 • From Part 4 onward, do not introduce a new major mystery, a new hidden backstory, or a surprise legal/family document that was not set up earlier; Parts 4–6 deepen and resolve what is already in motion.
+• Keep the human, emotional conflict at the center of every part (love, family, loyalty, guilt, forgiveness). Mention procedures such as audits, logs, records, paperwork, investigations or court process only briefly, in a sentence or two — never let them fill whole scenes.
+• Every part needs at least one emotionally charged scene between the main characters and a clear rise in personal stakes; the resolution should feel earned and moving, not merely administrative.
 • Keep ages and years arithmetically consistent (if something happened N years ago, every character's age then must make sense).
 • Maintain a tone suitable for all ages, appropriate for mainstream publishing platforms, and compliant with safety standards for advertiser-friendly content.
 • FORMAT: Each sentence on a separate line, with line spacing (one blank line) between the sentences.
