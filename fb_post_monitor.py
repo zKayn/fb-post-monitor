@@ -98,7 +98,8 @@ COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comme
 STORY_PARTS = (2, 3, 4, 5, 6)   # Part 1 là bài gốc trên Facebook
 LAST_PART = STORY_PARTS[-1]     # Part cuối = THE END
 STORY_MIN_WORDS = 2000          # mỗi Part tối thiểu 2.000 từ
-STORY_TARGET_WORDS = 2500       # mục tiêu ~2.000–3.000 từ
+STORY_TARGET_WORDS = 2400       # mục tiêu ~2.000–2.800 từ
+STORY_MAX_WORDS = 2800          # trần độ dài mỗi Part
 ENABLE_STORY_CONTINUATION = True
 # Railway (không bắt buộc) — đổi nhà cung cấp API tương thích OpenAI:
 #   OPENAI_BASE_URL  mặc định https://api.openai.com/v1 (ví dụ nhà cung cấp khác: https://api.nghimmo.com/v1)
@@ -335,7 +336,7 @@ REQUIREMENTS
 • Build tension through dialogue, hidden secrets, unexpected discoveries, and character decisions, rather than relying on direct, aggressive confrontations.
 • Sustain an engaging pace that appeals to a broad audience.
 • Employ vivid descriptions, authentic dialogue, and emotionally resonant storytelling.
-• Length: approximately 2,000–3,000 words for this part. NEVER finish below 2,000 words.
+• Length: 2,000–2,800 words for this part (aim for about 2,400). NEVER finish below 2,000 words and NEVER exceed 2,800 words; when you approach 2,700 words, move to the part's ending.
 • Preserve 100% of Part 1's characters, relationships, events, timeline, personalities, and story logic, and stay consistent with every earlier part supplied above.
 • Follow the STORY PLAN (if provided) so every clue and revelation connects logically to the final resolution. Never print the plan.
 • Treat the FACT SHEET in the plan as final: never change a character's name, relationship, marriage, family tie, age, job or timeline.
@@ -344,7 +345,8 @@ REQUIREMENTS
 • Pay off the previous part's cliffhanger exactly as it was set up. Never reverse, retract or contradict a revelation, statement or fact from an earlier part; if a twist changes its meaning, the earlier words must still be literally true.
 • Keep every character's gender and pronouns consistent with the FACT SHEET.
 • Avoid contrived devices: no convenient memory loss ("I don't remember signing it"), no anonymous texts or calls from unknown numbers that reveal secrets, no unexplained letters appearing from nowhere. Discoveries must come from characters' own choices, conversations and plausible evidence.
-• Do not introduce a new major mystery in Part 5 or Part 6; those parts resolve what is already in motion.
+• From Part 4 onward, do not introduce a new major mystery, a new hidden backstory, or a surprise legal/family document that was not set up earlier; Parts 4–6 deepen and resolve what is already in motion.
+• Keep ages and years arithmetically consistent (if something happened N years ago, every character's age then must make sense).
 • Maintain a tone suitable for all ages, appropriate for mainstream publishing platforms, and compliant with safety standards for advertiser-friendly content.
 • FORMAT: Each sentence on a separate line, with line spacing (one blank line) between the sentences.
 • Write the story only, without explanations or commentary.
@@ -1098,6 +1100,7 @@ Start now with the header line. Each sentence on a separate line with a blank li
             # Chỉ nếu content rỗng + length mới cứu đúng request đó với 7000; checkpoint cũ vẫn giữ.
             request_token_budget = OPENAI_MAX_OUTPUT_TOKENS + 2000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
             force_length_retry = False
+            _t0 = time.time()
             resp = _ai_request(full_prompt, request_token_budget,
                                cache_key="story-" + hashlib.sha1(story_context[:3000].encode("utf-8")).hexdigest()[:16])
             try:
@@ -1120,7 +1123,8 @@ Start now with the header line. Each sentence on a separate line with a blank li
                     finish_reason = choice.get("finish_reason")
                     usage = data.get("usage", {})
                     if text:
-                        print(f"[OPENAI] Part {part_number} OK | finish_reason={finish_reason} | usage={usage}")
+                        print(f"[OPENAI] Part {part_number} OK | {time.time() - _t0:.0f} giây | {_word_count(text)} từ "
+                              f"| finish_reason={finish_reason} | usage={usage}")
                         return text
                     last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}; server trả: {str(getattr(resp, 'text', ''))[:300]}"
                     if finish_reason == "length" and attempt < total_attempts:
@@ -1335,7 +1339,7 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 2000-3000 words, ideally near 2500 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
+Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop between 2000 and 2800 words, ideally near 2400 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
 Keep the same format: each sentence on a separate line, with a blank line between sentences.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
@@ -1714,6 +1718,8 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
             state["cache_reused"] = True
             _save_progress(post_id, state)
             _telegram_or_defer(post_id, f"♻️ Bài {post_id}: tái sử dụng Part 2–6 từ kho truyện; không gọi OpenAI.", state)
+    _story_t0 = time.time()
+    _need_write = not all(str(n) in parts for n in STORY_PARTS)
     # Lập dàn ý toàn truyện 1 lần trước Part 2 (lưu checkpoint, không lập lại).
     if not all(str(n) in parts for n in STORY_PARTS) and "story_plan" not in state:
         state["story_plan"] = call_openai_story_plan(caption) or ""
@@ -1736,6 +1742,9 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
         _save_progress(post_id, state)  # atomic checkpoint immediately after success
 
     _cache_write(caption, parts)
+    if _need_write:
+        print(f"[STORY-TIME] {post_id}: viết xong dàn ý + {len(STORY_PARTS)} Part trong {(time.time() - _story_t0) / 60:.1f} phút "
+              f"| {sum(_word_count(parts[str(n)]) for n in STORY_PARTS)} từ | model={OPENAI_MODEL}", flush=True)
     story = "\n\n".join((
         ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n" + _ending_block(n)
         for n in STORY_PARTS
