@@ -1242,6 +1242,7 @@ def _cmd_reply(text):
 
 def _command_loop():
     offset = None
+    webhook_cleared = False
     while True:
         try:
             params = {"timeout": 25, "allowed_updates": json.dumps(["message"])}
@@ -1250,6 +1251,12 @@ def _command_loop():
             r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=params, timeout=35)
             if r.status_code != 200:
                 print(f"[CMD] getUpdates HTTP {r.status_code}: {r.text[:200]}", flush=True)
+                if r.status_code == 409 and "webhook" in r.text.lower() and not webhook_cleared:
+                    # Bot này chỉ dùng getUpdates; webhook còn sót lại sẽ chặn nhận lệnh -> xóa một lần.
+                    dr = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=20)
+                    webhook_cleared = True
+                    print(f"[CMD] đã gọi deleteWebhook: HTTP {dr.status_code}", flush=True)
+                    continue
                 time.sleep(10)
                 continue
             for up in r.json().get("result", []):
