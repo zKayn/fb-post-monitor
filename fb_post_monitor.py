@@ -13,11 +13,12 @@
 #   INCLUDE_PAGE_NAMES     (không bắt buộc) chỉ theo dõi các Page này, ví dụ "Page A;Page B"
 #   STORY_WORKERS          (không bắt buộc) số bài viết truyện song song, 1–6 (mặc định 3). Mỗi bài vẫn đúng thứ tự
 #                          tin; giữa các bài thì bài xong trước báo trước. Đặt 1 nếu muốn báo đúng thứ tự đạt điều kiện.
-#   (AI viết truyện cố định trong code: OpenAI gpt-6-luna — chỉ cần OPENAI_API_KEY)
-#   LINK_LABEL             (không bắt buộc) chữ trước mỗi link truyện trên Telegram, {n} = số Part,
-#                          ví dụ "READ FULL PART {n} HERE:". Bỏ trống = "PART 2: link" như cũ.
 #   INSTANT_PAGE_IDS       (không bắt buộc) Page ĐẶC BIỆT: bài mới là viết truyện ngay, không cần ngưỡng.
 #                          Ghi Page ID, nhiều Page ngăn cách bằng dấu phẩy. Bỏ trống = không có Page đặc biệt.
+#   USER_ACCESS_TOKEN_2    (không bắt buộc) token Meta/FB THỨ 2 (via khác) để theo dõi thêm Page của via đó.
+#                          Cần thêm nữa thì USER_ACCESS_TOKEN_3, _4, _5. Bỏ trống = chỉ dùng USER_ACCESS_TOKEN như cũ.
+#   LINK_LABEL             (không bắt buộc) chữ trước mỗi link truyện trên Telegram, {n} = số Part,
+#                          ví dụ "READ FULL PART {n} HERE:". Bỏ trống = "PART 2: link" như cũ.
 # =====================================================================================
 import json
 import os
@@ -38,9 +39,23 @@ from datetime import datetime, timezone, timedelta
 
 # ========================== CONFIG ==========================
 USER_ACCESS_TOKEN = os.getenv("USER_ACCESS_TOKEN", "")
+
+
+def _clean_env_token(value):
+    return (value or "").strip().strip('"').strip("'").strip()
+
+
+# Railway (không bắt buộc): USER_ACCESS_TOKEN_2 (… _5) = token Meta/FB của via khác -> theo dõi thêm Page của via đó.
+# Không khai = chỉ dùng USER_ACCESS_TOKEN như trước. Page trùng giữa các token chỉ quét 1 lần.
+USER_ACCESS_TOKENS = [("USER_ACCESS_TOKEN", USER_ACCESS_TOKEN)] + [
+    (f"USER_ACCESS_TOKEN_{i}", _clean_env_token(os.getenv(f"USER_ACCESS_TOKEN_{i}")))
+    for i in range(2, 6) if _clean_env_token(os.getenv(f"USER_ACCESS_TOKEN_{i}"))]
+_seen_tokens = set()
+USER_ACCESS_TOKENS = [(n, t) for n, t in USER_ACCESS_TOKENS if t and not (t in _seen_tokens or _seen_tokens.add(t))] \
+    or [("USER_ACCESS_TOKEN", USER_ACCESS_TOKEN)]
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip().strip("\"'").strip()  # bỏ dấu ngoặc/khoảng trắng dán thừa
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # ---------- Danh sách website của team + website đang dùng ----------
 # WEB_SITES: mỗi dòng "link API: token" (ngăn cách bằng xuống dòng hoặc dấu ;), ví dụ:
@@ -84,12 +99,18 @@ def _resolve_active_site():
 ACTIVE_WEB_BASE_URL, ACTIVE_WEB_TOKEN = _resolve_active_site()
 
 # Domain link bài đọc: tự gồm mọi website trong WEB_SITES + website đang dùng + ARTICLE_LINK_DOMAINS (nếu có).
-ARTICLE_LINK_DOMAINS = sorted(set(
-    list(WEB_SITES.keys())
-    + ([urlparse(ACTIVE_WEB_BASE_URL).hostname.lower()] if ACTIVE_WEB_BASE_URL else [])
-    + [d.strip().lower() for d in os.getenv(
-        "ARTICLE_LINK_DOMAINS", "storyly.chosouthrussianovcharka.com").split(",") if d.strip()]
-))
+_ARTICLE_LINK_ENV_DOMAINS = [d.strip().lower() for d in os.getenv(
+    "ARTICLE_LINK_DOMAINS", "storyly.chosouthrussianovcharka.com").split(",") if d.strip()]
+
+
+def _build_article_domains(sites, active_base):
+    return sorted(set(
+        list(sites.keys())
+        + ([urlparse(active_base).hostname.lower()] if active_base else [])
+        + _ARTICLE_LINK_ENV_DOMAINS))
+
+
+ARTICLE_LINK_DOMAINS = _build_article_domains(WEB_SITES, ACTIVE_WEB_BASE_URL)
 COMMENT_LINK_MAX_PAGES = 30  # quét tối đa 30 trang x 100 comments trước khi báo / gọi OpenAI
 COMMENT_COUNT_MAX_PAGES = 10  # fallback đếm comment thực tế khi summary có thể thấp hơn UI
 COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comment <= 15 để tiết kiệm Graph API
@@ -98,244 +119,38 @@ COMMENT_COUNT_NEAR_THRESHOLD = 15  # chỉ deep-count khi còn cách mốc comme
 STORY_PARTS = (2, 3, 4, 5, 6)   # Part 1 là bài gốc trên Facebook
 LAST_PART = STORY_PARTS[-1]     # Part cuối = THE END
 STORY_MIN_WORDS = 2000          # mỗi Part tối thiểu 2.000 từ
-STORY_TARGET_WORDS = 2400       # mục tiêu ~2.000–2.800 từ
-STORY_MAX_WORDS = 2800          # trần độ dài mỗi Part
+STORY_TARGET_WORDS = 2500       # mục tiêu ~2.000–3.000 từ
 ENABLE_STORY_CONTINUATION = True
-# ---- AI viết truyện: CỐ ĐỊNH TRONG CODE (không cần biến Railway) ----
-# OpenAI chính chủ, model gpt-6-luna. Chỉ cần OPENAI_API_KEY trên Railway là key OpenAI.
-# Các biến cũ OPENAI_BASE_URL / OPENAI_MODEL / OPENAI_REASONING_EFFORT... trên Railway (nếu còn) sẽ bị BỎ QUA.
-OPENAI_BASE_URL = "https://api.openai.com/v1"
-OPENAI_CHAT_URL = OPENAI_BASE_URL + "/chat/completions"
-OPENAI_MODEL = "gpt-6-luna"
-_REASONING = {"reasoning_effort": "none"}       # viết từng Part: không suy nghĩ thêm -> nhanh, rẻ
-_IGNORED_AI_ENV = [k for k in ("OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT", "OPENAI_PLAN_REASONING_EFFORT",
-                               "OPENAI_API_STYLE", "OPENAI_STREAM") if os.getenv(k, "").strip()]
-# Token "suy nghĩ" (reasoning) cũng tính vào giới hạn đầu ra -> mức suy nghĩ càng cao càng phải nới giới hạn,
-# nếu không Part sẽ bị cụt / rỗng. Truyện ~2.500 từ cần ~5.500 token chữ; phần cộng thêm là chỗ cho suy nghĩ.
-_REASONING_EXTRA = {"none": 0, "minimal": 1500, "low": 3000, "medium": 9000, "high": 20000, "xhigh": 30000}
-_reasoning_extra = _REASONING_EXTRA.get(_REASONING.get("reasoning_effort", "off"), 9000)  # off = mặc định của model (~medium)
-OPENAI_MAX_OUTPUT_TOKENS = 5500 + _reasoning_extra
-# Bước lập dàn ý: suy nghĩ mức "low" (ngắn nhưng quyết định độ chặt chẽ của cả truyện).
-_PLAN_REASONING = {"reasoning_effort": "low"}
-_plan_extra = _REASONING_EXTRA.get(_PLAN_REASONING.get("reasoning_effort", "off"), 9000) if _PLAN_REASONING else 0
-OPENAI_API_STYLE = "chat"   # OpenAI chat/completions
-OPENAI_STREAM = False
-_RESP_ADAPT = {"no_max": False, "stream": OPENAI_STREAM, "instructions": False, "no_reasoning": False}
-_RESP_ADAPT_LOCK = threading.Lock()
+OPENAI_MODEL = "gpt-6-luna"     # model Luna mới nhất của OpenAI (hỗ trợ reasoning_effort=none)
+# Giá OpenAI (USD / 1 triệu token) để ước tính chi tiêu báo về dashboard. Đổi được qua Railway nếu giá thay đổi.
+OPENAI_PRICE_IN_PER_1M = float(os.getenv("OPENAI_PRICE_IN_PER_1M", "0.10") or 0.10)
+OPENAI_PRICE_OUT_PER_1M = float(os.getenv("OPENAI_PRICE_OUT_PER_1M", "0.50") or 0.50)
+_cost_lock = threading.Lock()
+_cost_pending_usd = 0.0  # chi phí OpenAI đã tiêu nhưng chưa báo về dashboard
 
 
-class _AIResp:
-    """Phản hồi đã quy về dạng chat/completions để phần còn lại của code dùng chung."""
-    def __init__(self, status_code, data, raw=None):
-        self.status_code = status_code
-        self._data = data
-        self.text = (raw if raw is not None else json.dumps(data, ensure_ascii=False))[:2000]
-        self.content = self.text.encode("utf-8")
-
-    def json(self):
-        return self._data
-
-
-def _responses_text(obj):
-    if not isinstance(obj, dict):
-        return ""
-    if isinstance(obj.get("output_text"), str) and obj["output_text"].strip():
-        return obj["output_text"]
-    out = []
-    for item in obj.get("output") or []:
-        if not isinstance(item, dict) or item.get("type") not in (None, "message"):
-            continue
-        for c in item.get("content") or []:
-            if isinstance(c, dict) and c.get("type") in ("output_text", "text") and c.get("text"):
-                out.append(c["text"])
-    return "".join(out)
+def _track_openai_cost(usage):
+    """Cộng dồn chi phí 1 lần gọi OpenAI (từ usage trả về)."""
+    global _cost_pending_usd
+    try:
+        pin = int((usage or {}).get("prompt_tokens", 0) or 0)
+        pout = int((usage or {}).get("completion_tokens", 0) or 0)
+    except Exception:
+        return
+    c = pin * OPENAI_PRICE_IN_PER_1M / 1_000_000 + pout * OPENAI_PRICE_OUT_PER_1M / 1_000_000
+    if c > 0:
+        with _cost_lock:
+            _cost_pending_usd += c
 
 
-def _sse_events(resp):
-    """Tách luồng SSE thành từng sự kiện JSON, CHỊU ĐƯỢC server trả JSON lỗi định dạng:
-    xuống dòng thật nằm ngay trong chữ (JSON bị cắt sang nhiều dòng, có cả dòng trống ở giữa).
-    Trước đây những sự kiện này bị bỏ -> mất đúng các đoạn có xuống dòng (mất tên Part, dính câu, mất dấu “)."""
-    resp.encoding = "utf-8"
-    buf = None
-
-    def _parse(text):
-        try:
-            return json.loads(text, strict=False)  # strict=False: chấp nhận ký tự xuống dòng thật trong chuỗi
-        except ValueError:
-            return None
-
-    for raw in resp.iter_lines(decode_unicode=True):
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", "replace")
-        raw = raw if raw is not None else ""
-        if raw.startswith("data:"):
-            if buf is not None:
-                ev = _parse(buf)
-                if isinstance(ev, dict):
-                    yield ev
-            payload = raw[5:]
-            buf = payload[1:] if payload.startswith(" ") else payload
-            if buf.strip() == "[DONE]":
-                return
-            continue
-        if buf is None:
-            continue  # event:/id:/dòng trống ngoài sự kiện
-        if raw == "" or raw.startswith(("event:", "id:", "retry:")):
-            ev = _parse(buf)
-            if isinstance(ev, dict):
-                yield ev
-                buf = None
-                continue
-            if raw.startswith(("event:", "id:", "retry:")):
-                buf = None  # sự kiện hỏng hẳn, bỏ
-                continue
-        buf += "\n" + raw  # dòng tiếp nối của JSON bị cắt
-    if buf is not None:
-        ev = _parse(buf)
-        if isinstance(ev, dict):
-            yield ev
-
-
-def _read_sse(resp):
-    """Đọc luồng stream của /v1/responses: trả (object response cuối, chữ đầy đủ nhất, lỗi).
-    Gom chữ từ MỌI nguồn (delta, output_text.done, content_part.done, output_item.done) và lấy bản dài nhất,
-    để không bị mất đoạn đầu nếu server gửi vài chữ đầu theo kiểu sự kiện khác."""
-    final, error = None, ""
-    deltas, done_texts, kinds = {}, [], {}
-    for ev in _sse_events(resp):
-        kind = ev.get("type", "")
-        kinds[kind] = kinds.get(kind, 0) + 1
-        key = (ev.get("item_id") or "", ev.get("output_index", 0), ev.get("content_index", 0))
-        if kind.endswith("output_text.delta"):
-            deltas.setdefault(key, []).append(ev.get("delta") or ev.get("text") or "")
-        elif kind.endswith("output_text.done") and ev.get("text"):
-            done_texts.append(ev["text"])
-        elif kind == "response.content_part.done":
-            part = ev.get("part") or {}
-            if part.get("type") in ("output_text", "text") and part.get("text"):
-                done_texts.append(part["text"])
-        elif kind == "response.output_item.done":
-            t = _responses_text({"output": [ev.get("item") or {}]})
-            if t:
-                done_texts.append(t)
-        elif kind in ("response.completed", "response.incomplete", "response.failed", "response.done"):
-            final = ev.get("response") or final
-        elif kind == "error":
-            error = (ev.get("error") or {}).get("message") or ev.get("message") or str(ev)[:300]
-    streamed = "".join("".join(v) for v in deltas.values())
-    candidates = [t for t in [_responses_text(final or {}), streamed] + done_texts if t]
-    best = max(candidates, key=len) if candidates else ""
-    if streamed and best and streamed != best:
-        print(f"[AI-STREAM] chữ ghép từ delta ({len(streamed)} ký tự) khác bản đầy đủ ({len(best)} ký tự); "
-              f"dùng bản đầy đủ. Sự kiện: {kinds}", flush=True)
-    return final, best, error
-
-
-def _ai_request(prompt, max_tokens, cache_key="", reasoning=None):
-    """Gọi AI theo OPENAI_API_STYLE. Luôn trả object có status_code + json() dạng chat/completions."""
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    if OPENAI_API_STYLE == "chat":
-        eff = dict(_REASONING if reasoning is None else reasoning)
-        resp = None
-        for _ in range(4):
-            with _RESP_ADAPT_LOCK:
-                override = _RESP_ADAPT.get("chat_effort")  # mức suy nghĩ thay thế nếu model không nhận mức cũ
-                tok_key = _RESP_ADAPT.get("chat_tok_key", "max_completion_tokens")
-            extra = 0
-            if eff and override and eff.get("reasoning_effort") == "none":
-                extra = 3000 if override == "low" else 9000  # chỗ cho phần suy nghĩ để Part không bị cụt
-            body = {"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}], tok_key: max_tokens + extra}
-            if cache_key and not _RESP_ADAPT.get("no_cache_key"):
-                body["prompt_cache_key"] = cache_key  # các Part cùng 1 truyện dùng lại phần đầu prompt -> token đầu vào rẻ hơn
-            if eff:
-                if override == "drop":
-                    pass
-                else:
-                    body["reasoning_effort"] = override or eff["reasoning_effort"]
-            resp = requests.post(OPENAI_CHAT_URL, headers=headers, json=body, timeout=OPENAI_TIMEOUT_SECONDS)
-            if resp.status_code != 400:
-                return resp
-            msg = (resp.text or "").lower()
-            with _RESP_ADAPT_LOCK:
-                if "reasoning_effort" in msg and override is None:
-                    _RESP_ADAPT["chat_effort"] = "low"   # model không nhận "none" -> dùng mức thấp nhất còn lại
-                elif "reasoning_effort" in msg and override == "low":
-                    _RESP_ADAPT["chat_effort"] = "drop"  # vẫn không nhận -> bỏ tham số
-                elif "prompt_cache_key" in msg and not _RESP_ADAPT.get("no_cache_key"):
-                    _RESP_ADAPT["no_cache_key"] = True
-                elif "max_completion_tokens" in msg and tok_key == "max_completion_tokens":
-                    _RESP_ADAPT["chat_tok_key"] = "max_tokens"
-                else:
-                    return resp
-            print(f"[OPENAI] Model {OPENAI_MODEL} không nhận tham số cũ -> tự chỉnh và gọi lại.", flush=True)
-        return resp
-    for _ in range(5):
-        with _RESP_ADAPT_LOCK:
-            adapt = dict(_RESP_ADAPT)
-        payload = {"model": OPENAI_MODEL, "input": [{"role": "user", "content": prompt}], "store": False}
-        if not adapt["no_max"]:
-            payload["max_output_tokens"] = max_tokens
-        eff = (_REASONING if reasoning is None else reasoning)
-        if eff and not adapt["no_reasoning"]:
-            payload["reasoning"] = {"effort": eff["reasoning_effort"]}
-        if cache_key and not adapt.get("no_cache_key"):
-            payload["prompt_cache_key"] = cache_key  # cùng 1 truyện -> server dễ dùng lại phần đầu prompt (cache)
-        if adapt["instructions"]:
-            payload["instructions"] = "You are a professional novelist. Follow the user's instructions exactly."
-        if adapt["stream"]:
-            payload["stream"] = True
-        resp = requests.post(OPENAI_BASE_URL + "/responses", headers=headers, json=payload,
-                             timeout=OPENAI_TIMEOUT_SECONDS, stream=adapt["stream"])
-        if resp.status_code != 200:
-            try:
-                err = resp.json()
-            except ValueError:
-                err = {"error": {"message": (resp.text or "")[:1000]}}
-            msg = str((err.get("error") or {}).get("message") if isinstance(err.get("error"), dict) else err.get("error") or err.get("detail") or err).lower()
-            fix = None
-            if resp.status_code in (400, 422):
-                if "max_output_tokens" in msg and not adapt["no_max"]:
-                    fix = "no_max"
-                elif "stream" in msg and not adapt["stream"]:
-                    fix = "stream"
-                elif "instruction" in msg and not adapt["instructions"]:
-                    fix = "instructions"
-                elif "prompt_cache_key" in msg and not adapt.get("no_cache_key"):
-                    fix = "no_cache_key"
-                elif "reasoning" in msg and not adapt["no_reasoning"] and _REASONING:
-                    fix = "no_reasoning"
-            if not fix and resp.status_code in (502, 503, 504, 520, 522, 524) and not adapt["stream"]:
-                fix = "stream"  # cổng trung gian hết giờ chờ -> chuyển sang stream để giữ kết nối
-            if fix:
-                with _RESP_ADAPT_LOCK:
-                    _RESP_ADAPT[fix] = True
-                print(f"[OPENAI] Server Responses không nhận tham số cũ -> tự chỉnh ({fix}) và gọi lại.", flush=True)
-                continue
-            return _AIResp(resp.status_code, err if isinstance(err, dict) else {"error": {"message": str(err)}})
-        if "event-stream" in (resp.headers.get("content-type") or ""):
-            final, streamed, error = _read_sse(resp)
-            obj = final or {}
-            text = streamed
-            raw_body = "stream: " + json.dumps(final, ensure_ascii=False)[:1500] + (f" | lỗi: {error}" if error else "")
-            if error and not text:
-                return _AIResp(502, {"error": {"message": error}})
-        else:
-            try:
-                obj = resp.json()
-            except ValueError:
-                return _AIResp(502, {"error": {"message": "Responses API trả dữ liệu không phải JSON: " + (resp.text or "")[:300]}})
-            text = _responses_text(obj)
-            raw_body = resp.text or ""
-        status = obj.get("status") or ("completed" if text else "failed")
-        reason = (obj.get("incomplete_details") or {}).get("reason") if isinstance(obj.get("incomplete_details"), dict) else None
-        finish = "stop" if status == "completed" else ("length" if reason == "max_output_tokens" else status)
-        if not text and isinstance(obj.get("error"), dict) and obj["error"].get("message"):
-            return _AIResp(502, {"error": {"message": obj["error"]["message"]}}, raw_body)
-        u = obj.get("usage") or {}
-        usage = {"prompt_tokens": u.get("input_tokens"), "completion_tokens": u.get("output_tokens"),
-                 "total_tokens": u.get("total_tokens")}
-        return _AIResp(200, {"choices": [{"message": {"content": text}, "finish_reason": finish}], "usage": usage}, raw_body)
-    return _AIResp(400, {"error": {"message": "Server Responses từ chối mọi cách gọi; kiểm tra model/key."}})
+def _flush_openai_cost():
+    """Lấy & reset chi phí tích lũy để gửi 1 lần về dashboard (tránh đếm trùng)."""
+    global _cost_pending_usd
+    with _cost_lock:
+        c = _cost_pending_usd
+        _cost_pending_usd = 0.0
+    return round(c, 6)
+OPENAI_MAX_OUTPUT_TOKENS = 5500  # đủ cho 2.000–3.000 từ/Part (mỗi câu 1 dòng)
 OPENAI_TIMEOUT_SECONDS = 600
 OPENAI_PART_RETRIES = 1  # Không tự lặp request có thể đã bị tính phí  # chỉ retry lỗi API/network/content rỗng; không regenerate nội dung ngắn
 
@@ -352,19 +167,9 @@ REQUIREMENTS
 • Build tension through dialogue, hidden secrets, unexpected discoveries, and character decisions, rather than relying on direct, aggressive confrontations.
 • Sustain an engaging pace that appeals to a broad audience.
 • Employ vivid descriptions, authentic dialogue, and emotionally resonant storytelling.
-• Length: 2,000–2,800 words for this part (aim for about 2,400). NEVER finish below 2,000 words and NEVER exceed 2,800 words; when you approach 2,700 words, move to the part's ending.
+• Length: approximately 2,000–3,000 words for this part. NEVER finish below 2,000 words.
 • Preserve 100% of Part 1's characters, relationships, events, timeline, personalities, and story logic, and stay consistent with every earlier part supplied above.
 • Follow the STORY PLAN (if provided) so every clue and revelation connects logically to the final resolution. Never print the plan.
-• Treat the FACT SHEET in the plan as final: never change a character's name, relationship, marriage, family tie, age, job or timeline.
-• Balance dialogue with narration, setting, body language and the narrator's inner thoughts. Avoid long runs of one-line question-and-answer exchanges, and do not repeat stock replies such as "I don't know" or "I know" again and again.
-• Do not repeat the final line of the previous part; open with a fresh sentence that moves the scene forward.
-• Pay off the previous part's cliffhanger exactly as it was set up. Never reverse, retract or contradict a revelation, statement or fact from an earlier part; if a twist changes its meaning, the earlier words must still be literally true.
-• Keep every character's gender and pronouns consistent with the FACT SHEET.
-• Avoid contrived devices: no convenient memory loss ("I don't remember signing it"), no anonymous texts or calls from unknown numbers that reveal secrets, no unexplained letters appearing from nowhere. Discoveries must come from characters' own choices, conversations and plausible evidence.
-• From Part 4 onward, do not introduce a new major mystery, a new hidden backstory, or a surprise legal/family document that was not set up earlier; Parts 4–6 deepen and resolve what is already in motion.
-• Keep the human, emotional conflict at the center of every part (love, family, loyalty, guilt, forgiveness). Mention procedures such as audits, logs, records, paperwork, investigations or court process only briefly, in a sentence or two — never let them fill whole scenes.
-• Every part needs at least one emotionally charged scene between the main characters and a clear rise in personal stakes; the resolution should feel earned and moving, not merely administrative.
-• Keep ages and years arithmetically consistent (if something happened N years ago, every character's age then must make sense).
 • Maintain a tone suitable for all ages, appropriate for mainstream publishing platforms, and compliant with safety standards for advertiser-friendly content.
 • FORMAT: Each sentence on a separate line, with line spacing (one blank line) between the sentences.
 • Write the story only, without explanations or commentary.
@@ -404,17 +209,28 @@ def _ending_block(n):
 # Railway (không bắt buộc): LINK_LABEL = chữ đứng trước mỗi link truyện trong tin Telegram. {n} = số Part.
 #   Bỏ trống  -> "PART 2: https://..."  (như cũ, link cùng dòng)
 #   Ví dụ LINK_LABEL="READ FULL PART {n} HERE:" -> dòng "READ FULL PART 2 HERE:" rồi link ở dòng dưới.
-LINK_LABEL = os.getenv("LINK_LABEL", "").strip()
-# Mặc định NỐI CHƯƠNG phía website (gửi prev_chapter) -> web có nút "← Previous / Next →" như các bài chuẩn.
-# Railway WEB_LINK_CHAPTERS=false để tắt (chỉ còn link chữ PREVIOUS/NEXT cuối bài).
-WEB_LINK_CHAPTERS = os.getenv("WEB_LINK_CHAPTERS", "true").strip().lower() in ("1", "true", "yes", "on")
+LINK_LABEL = os.getenv("LINK_LABEL", "").strip().strip('"').strip("'").strip()
+
+# Railway (không bắt buộc): LINK_PREFIX = chuỗi chèn NGAY TRƯỚC link gốc khi gửi Telegram.
+#   Ví dụ LINK_PREFIX="https://l.facebook.com/l.php?u="  -> link gửi đi thành
+#   "https://l.facebook.com/l.php?u=https://dailyspark.treeiq.biz/blog/..."
+#   (dán link gốc ngay sau dấu =, giữ nguyên không mã hoá). Bỏ trống = gửi link gốc như cũ.
+LINK_PREFIX = os.getenv("LINK_PREFIX", "").strip().strip('"').strip("'").strip()
+
+
+def _wrap_url(url):
+    """Chèn LINK_PREFIX trước link gốc (nếu có khai và chưa được chèn sẵn)."""
+    u = str(url or "")
+    if LINK_PREFIX and u and not u.startswith(LINK_PREFIX):
+        return LINK_PREFIX + u
+    return u
 
 
 def _link_lines(urls):
     """Khối link truyện gửi Telegram theo LINK_LABEL (urls: {số Part: link})."""
     if not LINK_LABEL:
-        return "\n".join(f"PART {n}: {urls[n]}" for n in STORY_PARTS)
-    return "\n".join(f"{LINK_LABEL.replace('{n}', str(n))}\n{urls[n]}" for n in STORY_PARTS)
+        return "\n".join(f"PART {n}: {_wrap_url(urls[n])}" for n in STORY_PARTS)
+    return "\n".join(f"{LINK_LABEL.replace('{n}', str(n))}\n{_wrap_url(urls[n])}" for n in STORY_PARTS)
 
 
 def _part_label(n):
@@ -627,15 +443,16 @@ VERTICAL_MIN_RATE = float(os.getenv("VERTICAL_MIN_RATE", "5"))                # 
 VERTICAL_SUSTAIN_MINUTES = float(os.getenv("VERTICAL_SUSTAIN_MINUTES", "20")) # giữ được >= 20 phút mới báo
 VERTICAL_MIN_VIEWS = int(os.getenv("VERTICAL_MIN_VIEWS", "1000"))             # chỉ báo khi bài đã có >= 1.000 views
 VERTICAL_STALE_MINUTES = 25   # Facebook cập nhật views theo đợt: số đứng yên tới 25 phút chưa coi là "chậm lại"
-# Bài dựng đứng MẠNH (chưa có link) được xử lý như BÀI ĐANG LÊN luôn (viết truyện + đăng web + báo kèm link),
-# không đợi đủ ngưỡng views/comments. Đặt False để tắt.
-VERTICAL_TRIGGERS_ALERT = False  # Dựng đứng CHỈ báo theo dõi; viết truyện + link khi đạt ngưỡng BÀI ĐANG LÊN
+# Bài dựng đứng (chưa có link) được xử lý như BÀI ĐANG LÊN luôn: viết truyện + đăng web + báo kèm link,
+# KHÔNG đợi đủ ngưỡng views/comments. Mặc định TẮT — ai cần mới bật (dashboard hoặc biến Railway).
+VERTICAL_TRIGGERS_ALERT = os.getenv("VERTICAL_TRIGGERS_ALERT", "false").strip().lower() in ("1", "true", "yes", "on")
 VERTICAL_ALERT_MIN_RATE_PER_HOUR = 240   # tốc độ tối thiểu để tính là BÀI ĐANG LÊN (views/giờ)
 VIEW_HISTORY_KEEP_MINUTES = VERTICAL_SHORT_MINUTES + VERTICAL_BASE_MAX_MINUTES + 30
 VIEW_HISTORY_FILE = "/data/view_history_v2.json"  # v2: chỉ chứa số của metric views chính (bỏ lịch sử cũ lẫn metric dự phòng)
 STORY_COMPLETED_FILE = "/data/story_completed_posts.json"
 STORY_CLAIMED_FILE = "/data/story_claimed_posts.json"
 STORY_PROGRESS_DIR = "/data/story_progress"
+LINKED_RECHECK_SECONDS = 1800  # bài ĐÃ có link: 30 phút mới kiểm tra lại (trước đây 1 phút) để giảm chi phí
 STORY_RETRY_SECONDS = 60  # thử lại sau 60 giây để không phải chờ 15 phút
 ERROR_ONCE_FILE = "/data/error_once_keys.json"
 ENABLE_PAID_GENERATION = True  # chỉ đánh dấu sau khi TXT đủ Part 2+3+4 đã gửi thành công
@@ -1038,6 +855,441 @@ def _send_telegram_message_unlocked(text: str):
         return False
 
 
+# ==================== BẢNG QUẢN LÝ (DASHBOARD) — TÙY CHỌN ====================
+# Bot gửi báo cáo (đang chạy, bài đạt ngưỡng, truyện, link web, lỗi) về trang quản lý chung.
+# Điền 2 dòng dưới MỘT LẦN trong code (hoặc khai biến Railway DASHBOARD_URL / DASHBOARD_KEY).
+# Bỏ trống = tắt hoàn toàn, bot chạy y như cũ. Trang quản lý lỗi/tắt cũng KHÔNG ảnh hưởng bot.
+DASHBOARD_URL_DEFAULT = "https://bot-dashboard-production-af6e.up.railway.app"
+DASHBOARD_KEY_DEFAULT = "99eb222774dc7aafc4096f46fac41dad3d4bb5c8637aba2e"   # = INGEST_KEY của dashboard
+DASHBOARD_URL = (os.getenv("DASHBOARD_URL") or DASHBOARD_URL_DEFAULT).strip().strip('"').rstrip("/")
+DASHBOARD_KEY = (os.getenv("DASHBOARD_KEY") or DASHBOARD_KEY_DEFAULT).strip().strip('"')
+DASHBOARD_ON = bool(DASHBOARD_URL and DASHBOARD_KEY)
+_DASH_MAX = 1000
+_dash_buf = []
+_dash_lock = threading.Lock()
+_dash_last = {}
+_DASH_STARTED = datetime.now(timezone.utc).isoformat()
+
+
+def _dash_emp():
+    return (os.getenv("AUTHOR_CODE") or "").strip() or (os.getenv("RAILWAY_PROJECT_NAME") or "unknown")
+
+
+def _dash_event(etype, **data):
+    """Đưa 1 sự kiện vào hàng gửi. Không bao giờ chặn/làm lỗi bot."""
+    if not DASHBOARD_ON:
+        return
+    try:
+        ev = {"type": etype, "ts": datetime.now(timezone.utc).isoformat(), "emp": _dash_emp()}
+        ev.update(data)
+        with _dash_lock:
+            _dash_buf.append(ev)
+            if len(_dash_buf) > _DASH_MAX:
+                del _dash_buf[: len(_dash_buf) - _DASH_MAX]
+    except Exception:
+        pass
+
+
+def _dash_alert_fields(alert_text):
+    out = {}
+    for line in str(alert_text or "").split("\n"):
+        m = re.match(r"\s*(Views|Comments|Link):\s*(.+)$", line)
+        if m:
+            out[m.group(1).lower()] = m.group(2).strip()
+    return out
+
+
+def _dash_qualified(page_name, post_id, caption, alert_text):
+    f = _dash_alert_fields(alert_text)
+    _dash_event("post", post_id=str(post_id), page_name=page_name, caption=str(caption or "")[:300],
+                views=f.get("views"), comments=f.get("comments"), fb_link=f.get("link"), stage="qualified")
+
+
+def _dash_progress(post_id, state, done=False):
+    """Tóm tắt trạng thái bài; chỉ gửi khi có thay đổi."""
+    if not DASHBOARD_ON or not isinstance(state, dict):
+        return
+    try:
+        parts = state.get("parts") or {}
+        posts = state.get("page6_api_posts") or state.get("page6_chapter_posts") or {}
+        links = [(posts.get(str(n)) or {}).get("url") for n in STORY_PARTS]
+        links = [u for u in links if u]
+        snap = {
+            "page_name": state.get("page_name"),
+            "parts_done": sum(1 for n in STORY_PARTS if parts.get(str(n))),
+            "parts_total": len(STORY_PARTS),
+            "alert_sent": bool(state.get("alert_key")) and not state.get("alert_pending"),
+            "web_complete": bool(state.get("web_publish_complete")),
+            "links": links,
+            "blocked": str(state.get("page6_test_blocked") or "")[:300],
+            "done": bool(done or str(post_id) in story_completed),
+        }
+        key = json.dumps(snap, sort_keys=True, ensure_ascii=False)
+        if _dash_last.get(str(post_id)) == key:
+            return
+        _dash_last[str(post_id)] = key
+        cap = str(state.get("fb_caption") or state.get("caption") or "")[:300]
+        _dash_event("post", post_id=str(post_id), caption=cap, stage="progress", **snap)
+    except Exception:
+        pass
+
+
+def _dash_heartbeat():
+    try:
+        pages = [{"id": str(p.get("id")), "name": p.get("name")} for p in (_managed_pages_cache.get("pages") or [])]
+        with _ERROR_LOCK:
+            open_errors = sorted(k for k, v in _error_status.items() if v in ("active", "sending"))
+        config = {
+            "rules": THRESHOLD_RULES,
+            "comment_only": COMMENT_ONLY_THRESHOLD,
+            "post_hours": ONLY_POSTS_NEWER_THAN_HOURS,
+            "send_txt": bool(SEND_STORY_TXT_TELEGRAM),
+            "spike": bool(ENABLE_SPIKE_ALERT),
+            "vertical_link": bool(VERTICAL_TRIGGERS_ALERT),
+            "target_words": STORY_TARGET_WORDS,
+            "link_label": LINK_LABEL or "",
+            "link_prefix": LINK_PREFIX or "",
+            "web_api_url": ACTIVE_WEB_BASE_URL or "",
+            "web_hosts": sorted(WEB_SITES.keys()),
+        }
+        if MEDIA_RULES_ENABLED:
+            config["video"] = {"rules": THRESHOLD_RULES_VIDEO, "comment_only": COMMENT_ONLY_THRESHOLD_VIDEO}
+            config["photo"] = {"rules": THRESHOLD_RULES_PHOTO, "comment_only": COMMENT_ONLY_THRESHOLD_PHOTO}
+        _dash_event("heartbeat", name=os.getenv("RAILWAY_PROJECT_NAME") or _dash_emp(),
+                    started_at=_DASH_STARTED, pages=pages, queue=STORY_QUEUE.qsize(),
+                    writing=len(_story_pending), workers=STORY_WORKERS, model=OPENAI_MODEL,
+                    web=urlparse(WEB_BASE_URL).hostname if WEB_BASE_URL else "",
+                    completed_total=len(story_completed), open_errors=open_errors[:50],
+                    tokens=len(USER_ACCESS_TOKENS), cost_usd=_flush_openai_cost(), config=config)
+    except Exception as exc:
+        print(f"[DASHBOARD] heartbeat lỗi: {exc}", flush=True)
+
+
+def _dash_sender():
+    sess = requests.Session()
+    last_hb = 0.0
+    fails = 0
+    while True:
+        try:
+            if time.monotonic() - last_hb >= 60:
+                _dash_heartbeat()
+                last_hb = time.monotonic()
+            with _dash_lock:
+                batch = _dash_buf[:100]
+            if batch:
+                r = sess.post(DASHBOARD_URL + "/api/ingest", json={"events": batch},
+                              headers={"X-Dashboard-Key": DASHBOARD_KEY}, timeout=15)
+                if r.status_code == 200:
+                    with _dash_lock:
+                        del _dash_buf[: len(batch)]
+                    fails = 0
+                    continue
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:120]}")
+        except Exception as exc:
+            fails += 1
+            if fails in (1, 10) or fails % 60 == 0:
+                print(f"[DASHBOARD] chưa gửi được báo cáo ({exc}); bot vẫn chạy bình thường.", flush=True)
+            time.sleep(min(60, 5 * fails))
+            continue
+        time.sleep(5)
+
+
+# ===== Nạp cài đặt từ dashboard (GIAI ĐOẠN 2) — chỉnh ngưỡng/LINK_LABEL/TXT/spike không cần deploy =====
+_ENV_DEFAULTS = {}
+
+
+def _as_int(v, default):
+    try:
+        return int(float(str(v).strip()))
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
+def _as_bool(v, default):
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
+def _resolve_active_from(sites, web_api_url):
+    """Tính (base_url, token) của web đang dùng từ 1 danh sách sites + link web, giống _resolve_active_site."""
+    raw = (web_api_url or "").strip().rstrip("/")
+    if not raw:
+        return "", ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    if raw.lower().endswith("/api"):
+        raw = raw[:-4].rstrip("/")
+    host = (urlparse(raw).hostname or "").lower()
+    token = (sites.get(host) or {}).get("token") or os.getenv("BIOBLOG_API_TOKEN", "").strip()
+    return raw, token
+
+
+def _recompute_web(web_sites_raw, web_api_url):
+    """Nạp nóng cấu hình web (danh sách web + web đang dùng). Trả (host, có_token?, đổi gì)."""
+    global WEB_SITES, ACTIVE_WEB_BASE_URL, ACTIVE_WEB_TOKEN, WEB_BASE_URL, BIOBLOG_API_TOKEN, ARTICLE_LINK_DOMAINS
+    sites = _parse_web_sites(web_sites_raw)
+    base, token = _resolve_active_from(sites, web_api_url)
+    changed = []
+    if sites != WEB_SITES:
+        WEB_SITES = sites
+        changed.append("danh sách web")
+    if base != WEB_BASE_URL:
+        ACTIVE_WEB_BASE_URL = WEB_BASE_URL = base
+        changed.append(f"web={urlparse(base).hostname or '—'}")
+    if token != BIOBLOG_API_TOKEN:
+        ACTIVE_WEB_TOKEN = BIOBLOG_API_TOKEN = token
+        if "web=" not in " ".join(changed):
+            changed.append("token web")
+    ARTICLE_LINK_DOMAINS = _build_article_domains(WEB_SITES, ACTIVE_WEB_BASE_URL)
+    return (urlparse(base).hostname or ""), bool(token), changed
+
+
+def _apply_config_override(ov):
+    """Áp cài đặt từ dashboard. ov rỗng -> quay về mặc định từ biến Railway (đã chụp lúc khởi động)."""
+    global THRESHOLD_RULES, THRESHOLD_RULES_VIDEO, THRESHOLD_RULES_PHOTO
+    global COMMENT_ONLY_THRESHOLD, COMMENT_ONLY_THRESHOLD_VIDEO, COMMENT_ONLY_THRESHOLD_PHOTO
+    global ONLY_POSTS_NEWER_THAN_HOURS, LINK_LABEL, LINK_PREFIX, SEND_STORY_TXT_TELEGRAM, ENABLE_SPIKE_ALERT
+    global VERTICAL_TRIGGERS_ALERT
+    d = _ENV_DEFAULTS
+    if not d:
+        return
+    ov = ov or {}
+    has = bool(ov)
+    rules = _parse_rules(str(ov.get("alert_rules") or ""), d["rules"]) if (has and ov.get("alert_rules")) else d["rules"]
+    comment_only = _as_int(ov.get("comment_only"), d["comment_only"]) if has else d["comment_only"]
+    post_hours = _as_int(ov.get("post_hours"), d["post_hours"]) if has else d["post_hours"]
+    # Thiếu khóa trong override thì dùng mặc định Railway (tránh link_label/link_prefix bị rỗng khi override chỉ có ngưỡng).
+    link_label = (str(ov["link_label"] or "").strip() if "link_label" in ov else d["link_label"]) if has else d["link_label"]
+    link_prefix = (str(ov["link_prefix"] or "").strip() if "link_prefix" in ov else d["link_prefix"]) if has else d["link_prefix"]
+    send_txt = _as_bool(ov.get("send_txt"), d["send_txt"]) if has else d["send_txt"]
+    spike = _as_bool(ov.get("spike"), d["spike"]) if has else d["spike"]
+    vertical_link = _as_bool(ov.get("vertical_link"), d["vertical_link"]) if has else d["vertical_link"]
+    # Web: chỉ ghi đè khi dashboard khai rõ; để trống -> giữ nguyên cấu hình web trong Railway.
+    web_sites_raw = str(ov.get("web_sites") or "").strip() if (has and str(ov.get("web_sites") or "").strip()) else d["web_sites_raw"]
+    web_api_url = str(ov.get("web_api_url") or "").strip() if (has and str(ov.get("web_api_url") or "").strip()) else d["web_api_url"]
+
+    changed = []
+    web_host, web_has_token, web_changed = _recompute_web(web_sites_raw, web_api_url)
+    if web_changed:
+        changed.extend(web_changed)
+        if web_host and not web_has_token:
+            print(f"[CONFIG-SYNC] CẢNH BÁO: web {web_host} chưa có token (thêm dòng 'link: token' vào danh sách web).", flush=True)
+    if rules != THRESHOLD_RULES:
+        THRESHOLD_RULES = rules
+        if not MEDIA_RULES_ENABLED:
+            THRESHOLD_RULES_VIDEO = THRESHOLD_RULES_PHOTO = rules
+        changed.append(f"ngưỡng={rules}")
+    if comment_only != COMMENT_ONLY_THRESHOLD:
+        COMMENT_ONLY_THRESHOLD = comment_only
+        if not MEDIA_RULES_ENABLED:
+            COMMENT_ONLY_THRESHOLD_VIDEO = COMMENT_ONLY_THRESHOLD_PHOTO = comment_only
+        changed.append(f"comment>{comment_only}")
+    if post_hours != ONLY_POSTS_NEWER_THAN_HOURS:
+        ONLY_POSTS_NEWER_THAN_HOURS = post_hours
+        changed.append(f"{post_hours}h")
+    if link_label != LINK_LABEL:
+        LINK_LABEL = link_label
+        changed.append("LINK_LABEL")
+    if link_prefix != LINK_PREFIX:
+        LINK_PREFIX = link_prefix
+        changed.append("LINK_PREFIX")
+    if send_txt != SEND_STORY_TXT_TELEGRAM:
+        SEND_STORY_TXT_TELEGRAM = send_txt
+        changed.append(f"TXT={send_txt}")
+    if spike != ENABLE_SPIKE_ALERT:
+        ENABLE_SPIKE_ALERT = spike
+        changed.append(f"spike={spike}")
+    if vertical_link != VERTICAL_TRIGGERS_ALERT:
+        VERTICAL_TRIGGERS_ALERT = vertical_link
+        changed.append(f"dựng-đứng-tạo-link={vertical_link}")
+    if changed:
+        print(f"[CONFIG-SYNC] Áp dụng ({'dashboard' if has else 'mặc định Railway'}): {', '.join(changed)}", flush=True)
+
+
+def _config_sync_loop():
+    sess = requests.Session()
+    url = f"{DASHBOARD_URL}/api/config/{_dash_emp()}"
+    fails = 0
+    while True:
+        try:
+            r = sess.get(url, headers={"X-Dashboard-Key": DASHBOARD_KEY}, timeout=15)
+            if r.status_code == 200:
+                _apply_config_override(r.json() or {})
+                fails = 0
+        except Exception as exc:
+            fails += 1
+            if fails in (1, 10) or fails % 60 == 0:
+                print(f"[CONFIG-SYNC] chưa lấy được cài đặt ({exc}); giữ cài đặt hiện tại.", flush=True)
+        time.sleep(90)
+
+
+# ===== Chỉnh điều kiện báo qua chat riêng của nhân viên (có bước xác nhận) =====
+# Chỉ nhận tin từ đúng COMMAND_CHAT_ID (chat riêng của nhân viên với bot). Lưu cần trả lời OK trong 5 phút.
+_TG_CHAT_FALLBACK = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+# Không khai COMMAND_CHAT_ID thì dùng TELEGRAM_CHAT_ID, nhưng chỉ khi là chat riêng (số dương).
+# Group có ID âm nên không dùng, tránh thành viên group ra lệnh đổi điều kiện.
+COMMAND_CHAT_ID = (os.getenv("COMMAND_CHAT_ID", "").strip()
+                   or (_TG_CHAT_FALLBACK if _TG_CHAT_FALLBACK.isdigit() else ""))
+_CMD_STARTED_AT = time.time()
+_CMD_PENDING = {}          # {"p": {...}} — thay đổi đang chờ xác nhận
+_CMD_PENDING_TTL = 300
+_CMD_CONFIRM = ("ok", "có", "xác nhận", "xac nhan", "lưu", "luu")
+_CMD_CANCEL = ("hủy", "huỷ", "huy", "không", "khong")
+_CMD_TERMS_CMT = r"(?:cmt|comment|comments|bình luận|binh luan)"
+_CMD_TERMS_VIEW = r"(\d+(?:[.,]\d+)?)\s*(k|nghìn|ngàn|nghin)?\s*(?:view|views|lượt xem|luot xem)"
+
+
+def _cmd_parse(text):
+    """'1k view và 60cmt hoặc 5k view và 0cmt' -> ('1000/60, 5000/0', comment_only|None, lỗi).
+    Mỗi mệnh đề cách nhau bởi 'hoặc' là một điều kiện (OR). 'báo luôn N cmt' đặt mốc báo luôn."""
+    t = (text or "").lower().strip()
+    cmt_only = None
+    m = (re.search(r"(?:báo luôn|bao luon|luôn báo|luon bao)\D{0,15}(\d+)\s*" + _CMD_TERMS_CMT, t)
+         or re.search(r"(\d+)\s*" + _CMD_TERMS_CMT + r"\D{0,15}(?:báo luôn|bao luon)", t))
+    if m:
+        cmt_only = int(m.group(1))
+        t = t.replace(m.group(0), " ")
+    rules = []
+    for clause in re.split(r"\s*(?:hoặc|hoac|;|\n)\s*", t):
+        mv = re.search(_CMD_TERMS_VIEW, clause)
+        if not mv:
+            continue
+        views = float(mv.group(1).replace(",", "."))
+        if mv.group(2):
+            views *= 1000
+        mc = re.search(r"(\d+)\s*" + _CMD_TERMS_CMT, clause)
+        cmts = int(mc.group(1)) if mc else 0
+        rules.append((int(round(views)), cmts))
+    if not rules:
+        return "", cmt_only, "Không đọc được ngưỡng view."
+    if any(v <= 0 or v > 10_000_000 or c < 0 or c > 1_000_000 for v, c in rules):
+        return "", cmt_only, "Số không hợp lệ (view 1–10.000.000, cmt 0–1.000.000)."
+    if cmt_only is not None and not (0 <= cmt_only <= 1_000_000):
+        return "", cmt_only, "Mốc báo luôn không hợp lệ."
+    return ", ".join(f"{v}/{c}" for v, c in rules), cmt_only, ""
+
+
+def _cmd_help():
+    return ("Cách chỉnh điều kiện báo:\n"
+            "• Gửi: 1k view và 60cmt hoặc 5k view và 0cmt\n"
+            "• Thêm mốc báo luôn: báo luôn 100 cmt\n"
+            "• xem — xem điều kiện đang dùng\n"
+            "• mặc định — về cấu hình mặc định\n"
+            "Bot sẽ hiện bản xem trước, trả lời OK để lưu, HỦY để bỏ.")
+
+
+def _cmd_current():
+    rules = ", ".join(f"{r['min_views']}/{r['min_comments']}" for r in THRESHOLD_RULES)
+    return f"Điều kiện đang dùng: {rules or '—'}\nBáo luôn khi comment > {COMMENT_ONLY_THRESHOLD}."
+
+
+def _cmd_save(p):
+    body = {"reset": True} if p.get("reset") else {"alert_rules": p["rules"], "comment_only": p["comment_only"]}
+    r = requests.post(f"{DASHBOARD_URL}/api/rules/{_dash_emp()}", json=body,
+                      headers={"X-Dashboard-Key": DASHBOARD_KEY}, timeout=20)
+    return r.status_code == 200
+
+
+def _cmd_handle(text):
+    low = text.strip().lower()
+    now = time.time()
+    if low in _CMD_CONFIRM:
+        p = _CMD_PENDING.pop("p", None)
+        if not p or now > p["expires"]:
+            return "Không có thay đổi nào đang chờ xác nhận (hoặc đã hết hạn). Gửi lại điều kiện nhé."
+        try:
+            ok = _cmd_save(p)
+        except Exception as exc:
+            return f"Lưu thất bại (lỗi mạng): {str(exc)[:120]}. Thử lại sau."
+        return "Đã lưu. Bot sẽ áp dụng trong khoảng 90 giây." if ok else "Dashboard từ chối lưu. Báo admin kiểm tra."
+    if low in _CMD_CANCEL:
+        _CMD_PENDING.pop("p", None)
+        return "Đã hủy, giữ nguyên điều kiện cũ."
+    if low in ("help", "hướng dẫn", "huong dan", "?"):
+        return _cmd_help()
+    if low in ("xem", "hiện tại", "hien tai"):
+        return _cmd_current()
+    if low in ("mặc định", "mac dinh", "reset"):
+        _CMD_PENDING["p"] = {"reset": True, "expires": now + _CMD_PENDING_TTL}
+        return "Sẽ đưa điều kiện về cấu hình mặc định. Trả lời OK để xác nhận, HỦY để bỏ (5 phút)."
+    rules, cmt_only, err = _cmd_parse(text)
+    if err:
+        return f"{err}\n\n{_cmd_help()}"
+    _CMD_PENDING["p"] = {"rules": rules, "comment_only": cmt_only, "expires": now + _CMD_PENDING_TTL}
+    lines = []
+    for part in rules.split(", "):
+        v, c = part.split("/")
+        lines.append(f"• ≥ {int(v):,} view và ≥ {c} cmt".replace(",", "."))
+    cmt_line = (f"Báo luôn khi comment > {cmt_only}" if cmt_only is not None
+                else f"Báo luôn: giữ nguyên ({COMMENT_ONLY_THRESHOLD})")
+    return ("Xem trước điều kiện mới:\n" + "\n".join(lines) + "\n" + cmt_line
+            + "\n\nTrả lời OK để lưu, HỦY để bỏ (hết hạn sau 5 phút).")
+
+
+def _cmd_reply(text):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                      data={"chat_id": COMMAND_CHAT_ID, "text": text}, timeout=20)
+    except Exception as exc:
+        print(f"[CMD] không gửi được phản hồi: {exc}", flush=True)
+
+
+def _command_loop():
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 25, "allowed_updates": json.dumps(["message"])}
+            if offset is not None:
+                params["offset"] = offset
+            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=params, timeout=35)
+            if r.status_code != 200:
+                print(f"[CMD] getUpdates HTTP {r.status_code}: {r.text[:200]}", flush=True)
+                time.sleep(10)
+                continue
+            for up in r.json().get("result", []):
+                offset = up["update_id"] + 1
+                msg = up.get("message") or {}
+                if str((msg.get("chat") or {}).get("id", "")) != COMMAND_CHAT_ID:
+                    continue
+                if (msg.get("date") or 0) < _CMD_STARTED_AT - 5:
+                    continue  # bỏ tin cũ gửi trước khi bot khởi động
+                text = msg.get("text") or ""
+                if not text or len(text) > 300:
+                    continue
+                try:
+                    _cmd_reply(_cmd_handle(text))
+                except Exception as exc:
+                    print(f"[CMD] lỗi xử lý tin: {exc}", flush=True)
+                    _cmd_reply("Có lỗi khi xử lý lệnh. Thử lại sau.")
+        except Exception as exc:
+            print(f"[CMD] lỗi getUpdates: {exc}", flush=True)
+            time.sleep(10)
+
+
+def start_dashboard_reporter():
+    if DASHBOARD_ON:
+        global _ENV_DEFAULTS
+        _ENV_DEFAULTS = {"rules": THRESHOLD_RULES, "comment_only": COMMENT_ONLY_THRESHOLD,
+                         "post_hours": ONLY_POSTS_NEWER_THAN_HOURS, "link_label": LINK_LABEL,
+                         "link_prefix": LINK_PREFIX,
+                         "web_sites_raw": os.getenv("WEB_SITES", ""),
+                         "web_api_url": (os.getenv("WEB_API_URL") or os.getenv("WEB_BASE_URL") or "").strip(),
+                         "send_txt": SEND_STORY_TXT_TELEGRAM, "spike": ENABLE_SPIKE_ALERT,
+                         "vertical_link": VERTICAL_TRIGGERS_ALERT}
+        threading.Thread(target=_dash_sender, name="dashboard", daemon=True).start()
+        threading.Thread(target=_config_sync_loop, name="config-sync", daemon=True).start()
+        if COMMAND_CHAT_ID and TELEGRAM_BOT_TOKEN:
+            threading.Thread(target=_command_loop, name="cmd", daemon=True).start()
+            print("[CMD] đã bật nhận lệnh chỉnh điều kiện qua chat riêng", flush=True)
+        print(f"[DASHBOARD] gửi báo cáo + nhận cài đặt từ {urlparse(DASHBOARD_URL).hostname}", flush=True)
+
+
 def send_telegram_message(text: str):
     with TELEGRAM_GROUP_LOCK:
         return _send_telegram_message_unlocked(text)
@@ -1119,11 +1371,19 @@ Start now with the header line. Each sentence on a separate line with a blank li
         try:
             # Bình thường dùng trần 6000 và reasoning=none để giảm chi phí/độ trễ.
             # Chỉ nếu content rỗng + length mới cứu đúng request đó với 7000; checkpoint cũ vẫn giữ.
-            request_token_budget = OPENAI_MAX_OUTPUT_TOKENS + 2000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
+            request_token_budget = 7000 if force_length_retry else OPENAI_MAX_OUTPUT_TOKENS
             force_length_retry = False
-            _t0 = time.time()
-            resp = _ai_request(full_prompt, request_token_budget,
-                               cache_key="story-" + hashlib.sha1(story_context[:3000].encode("utf-8")).hexdigest()[:16])
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [{"role": "user", "content": full_prompt}],
+                    "reasoning_effort": "none",
+                    "max_completion_tokens": request_token_budget,
+                },
+                timeout=OPENAI_TIMEOUT_SECONDS,
+            )
             try:
                 data = resp.json()
             except Exception:
@@ -1143,16 +1403,16 @@ Start now with the header line. Each sentence on a separate line with a blank li
                     text = str(text).strip()
                     finish_reason = choice.get("finish_reason")
                     usage = data.get("usage", {})
+                    _track_openai_cost(usage)
                     if text:
-                        print(f"[OPENAI] Part {part_number} OK | {time.time() - _t0:.0f} giây | {_word_count(text)} từ "
-                              f"| finish_reason={finish_reason} | usage={usage}")
+                        print(f"[OPENAI] Part {part_number} OK | finish_reason={finish_reason} | usage={usage}")
                         return text
-                    last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}; server trả: {str(getattr(resp, 'text', ''))[:300]}"
+                    last_error = f"content rỗng; finish_reason={finish_reason}; usage={usage}"
                     if finish_reason == "length" and attempt < total_attempts:
                         force_length_retry = True
                         print(
                             f"[OPENAI] Part {part_number}: content rỗng + finish_reason=length "
-                            f"-> retry riêng với {OPENAI_MAX_OUTPUT_TOKENS + 2000} tokens."
+                            f"-> retry riêng với 7000 tokens."
                         )
                     elif attempt >= OPENAI_PART_RETRIES:
                         # Không dùng lượt dự phòng cho các lỗi khác.
@@ -1193,19 +1453,21 @@ def call_openai_story_plan(caption: str):
 TASK: Before any part is written, plan the entire continuation of this story in five parts:
 """ + "\n".join(f"PART {n}{' (THE END)' if n == LAST_PART else ''}: {PART_ROLES[n]}" for n in STORY_PARTS) + """
 
-Write a concise private story plan (about 400-650 words) in two sections:
-1) FACT SHEET — every named character: full name, gender/pronouns, age range, job, and EXACT relationships (who is married to whom, who is whose parent, child, sibling, ex-partner). Include key dates/timeline facts. These facts are FINAL and must never change in any part.
-2) PLAN — for EACH part: its main events, the exact cliffhanger it ends on, and how the next part pays that cliffhanger off. Also the hidden truths, where each clue appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6.
-Keep the plot simple enough to stay consistent: at most two hidden truths, revealed step by step; no convenient memory loss, no anonymous messages from unknown numbers.
-Every mystery or question raised must be clearly answered by Part 6; do not plan a late twist that cannot be resolved. Keep 100% consistency with Part 1. Family-friendly. Output only the plan."""
+Write a concise private story plan (about 300-450 words): the hidden truths, the key clues and where each one appears, how relationships change, the difficult choice in Part 5, and the happy resolution in Part 6. Keep 100% consistency with Part 1. Family-friendly. Output only the plan."""
     try:
-        resp = _ai_request(prompt, 1500 + _plan_extra, reasoning=_PLAN_REASONING,
-                           cache_key="plan-" + hashlib.sha1(caption.encode("utf-8")).hexdigest()[:16])
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}],
+                  "max_completion_tokens": 1500, "reasoning_effort": "none"},
+            timeout=OPENAI_TIMEOUT_SECONDS,
+        )
         data = resp.json() if resp.content else {}
         if resp.status_code != 200:
             print(f"[OPENAI] Dàn ý lỗi HTTP {resp.status_code}; viết tiếp không có dàn ý.")
             return None
         content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        _track_openai_cost(data.get("usage"))
         if content:
             print(f"[OPENAI] Đã lập dàn ý truyện ({_word_count(content)} từ) | usage={data.get('usage', {})}")
             return content
@@ -1231,71 +1493,6 @@ def _strip_program_endings(text: str) -> str:
     cleaned = re.sub(r"(?im)^.*COMMENT AND SHARE THIS POST.*$", "", cleaned)
     cleaned = re.sub(r"(?im)^\W*SHARE YOUR THOUGHTS OR FEEDBACK.*$", "", cleaned)
     return cleaned.strip()
-
-
-# "…” Laura said." là lời dẫn thoại -> không tách dòng.
-_SPEECH_TAG = re.compile(r"(?:\S+\s+){0,2}(?:said|asked|replied|answered|whispered|murmured|repeated|added|continued|"
-                         r"called|shouted|cried|told|admitted|insisted|explained|began|went on|snapped|sighed)\b", re.I)
-_ABBREV = re.compile(r"(?:\b(?:Mr|Mrs|Ms|Dr|St|Jr|Sr|Prof|Mt|No|vs|etc|U\.S|a\.m|p\.m))\.$", re.I)
-
-
-def _curly_quotes(par):
-    """Đổi ngoặc kép thẳng "..." thành “...” và ' trong từ thành ’ (đồng bộ kiểu chữ giữa các Part)."""
-    if '"' in par:
-        out, opened = [], False
-        for ch in par:
-            if ch == '"':
-                out.append("”" if opened else "“")
-                opened = not opened
-            else:
-                out.append(ch)
-        par = "".join(out)
-    return re.sub(r"(?<=\w)'(?=\w)|(?<=\w)'(?=\s|$)", "’", par)
-
-
-def _split_sentences(par):
-    """Tách đoạn nhiều câu thành mỗi câu 1 dòng (không cắt bên trong lời thoại “...”, không cắt sau Mr./Dr.)."""
-    parts, start, depth, i, n = [], 0, 0, 0, len(par)
-    while i < n:
-        ch = par[i]
-        if ch == "“":
-            depth += 1
-        elif ch == "”":
-            depth = max(0, depth - 1)
-        if ch in ".!?…" and depth == 0:
-            j = i + 1
-            while j < n and par[j] in ".!?…”’)":
-                if par[j] == "”":
-                    depth = max(0, depth - 1)
-                j += 1
-            if j < n and par[j] == " " and j + 1 < n and (par[j + 1].isupper() or par[j + 1] in "“\"") \
-                    and not _ABBREV.search(par[start:i + 1]):
-                parts.append(par[start:j].strip())
-                start = j + 1
-                i = j
-        elif ch == "”" and depth == 0 and i + 2 < n and par[i + 1] == " " and (
-                par[i + 2] == "“" or (par[i - 1:i] in (".", "…") and par[i + 2].isupper()
-                                      and not _SPEECH_TAG.match(par[i + 2:]))):
-            # Lời thoại kết thúc câu rồi tới câu/lời thoại mới -> tách dòng
-            parts.append(par[start:i + 1].strip())
-            start = i + 2
-        i += 1
-    parts.append(par[start:].strip())
-    return [x for x in parts if x]
-
-
-def _polish_story_text(text):
-    """Chuẩn hóa định dạng sau khi AI viết: mỗi câu 1 dòng, cách nhau 1 dòng trống; ngoặc kép cong thống nhất."""
-    out = []
-    for par in re.split(r"\n\s*\n|\n", str(text or "").strip()):
-        par = re.sub(r"[ \t]+", " ", par).strip()
-        if not par:
-            continue
-        if re.match(r"(?i)^\W*PART\s+\d", par):  # dòng tiêu đề Part giữ nguyên
-            out.append(par.strip("*# "))
-            continue
-        out.extend(_split_sentences(_curly_quotes(par)))
-    return "\n\n".join(out)
 
 
 def _ensure_part_header(text: str, part_number: int) -> str:
@@ -1360,7 +1557,7 @@ EXISTING PART {part_number} (already paid for and must be preserved):
 {existing_part}
 
 TASK:
-Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop between 2000 and 2800 words, ideally near 2400 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
+Continue PART {part_number} from the exact final sentence above. Add only approximately {requested_words} words. The COMPLETE part should stop around 2000-3000 words, ideally near 2500 words. Stop immediately once it reaches a natural ending; no filler, recap, repetition, or extra scenes.
 Keep the same format: each sentence on a separate line, with a blank line between sentences.
 Maintain exact continuity, characters, timeline, tone, and facts.
 {ending_instruction}
@@ -1370,9 +1567,18 @@ Output ONLY the new continuation paragraphs."""
     last_error = "unknown"
     for attempt in range(1, OPENAI_PART_RETRIES + 1):
         try:
-            # Continuation chỉ mua phần còn thiếu; không mở trần 6000 vô ích.
-            resp = _ai_request(prompt, min(2200, max(900, int(requested_words * 1.6) + 300)) + _reasoning_extra,
-                               cache_key="story-" + hashlib.sha1(story_context[:3000].encode("utf-8")).hexdigest()[:16])
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "reasoning_effort": "none",
+                    # Continuation chỉ mua phần còn thiếu; không mở trần 6000 vô ích.
+                    "max_completion_tokens": min(2200, max(900, int(requested_words * 1.6) + 300)),
+                },
+                timeout=OPENAI_TIMEOUT_SECONDS,
+            )
             try:
                 data = resp.json()
             except Exception:
@@ -1391,6 +1597,7 @@ Output ONLY the new continuation paragraphs."""
                     extra = _strip_program_endings(str(extra).strip())
                     if extra:
                         usage = data.get("usage", {})
+                        _track_openai_cost(usage)
                         print(f"[OPENAI] Part {part_number} continuation OK | +{_word_count(extra)} từ | usage={usage}")
                         return extra
                     last_error = f"continuation rỗng; finish_reason={choice.get('finish_reason')}; usage={data.get('usage', {})}"
@@ -1418,12 +1625,7 @@ def generate_valid_part(story_context: str, part_number: int):
         )
         return None
 
-    raw = _polish_story_text(_strip_program_endings(raw))
-    if raw[:1].islower():
-        # Chữ đầu viết thường (vd "neath his blanket") = mất đoạn đầu khi nhận chữ từ server.
-        send_error_alert(f"part_start_cut_{part_number}",
-                         f"Part {part_number} bắt đầu bằng chữ bị cụt: {raw[:60]!r}… — server AI trả thiếu đoạn đầu. "
-                         f"Nếu lặp lại, đặt Railway OPENAI_STREAM=false.")
+    raw = _strip_program_endings(raw)
     raw = _ensure_part_header(raw, part_number)
     words = _word_count(raw)
 
@@ -1436,7 +1638,7 @@ def generate_valid_part(story_context: str, part_number: int):
         if not extra:
             break
         raw = f"{raw.rstrip()}\n\n{extra.strip()}"
-        raw = _polish_story_text(_strip_program_endings(raw))
+        raw = _strip_program_endings(raw)
         words = _word_count(raw)
         continuation_rounds -= 1
 
@@ -1543,6 +1745,7 @@ def _save_progress(post_id, progress):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    _dash_progress(post_id, progress)
 
 
 def _load_progress(post_id):
@@ -1727,9 +1930,6 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
     if not state.get("page_name"):
         state["page_name"] = page_name
         _save_progress(post_id, state)
-    if caption and not state.get("fb_caption"):
-        state["fb_caption"] = caption  # chỉ để làm tiêu đề web (15–35 từ đầu caption); không dùng để so sánh
-        _save_progress(post_id, state)
     parts = state.setdefault("parts", {})
     # Chỉ áp dụng cache nếu bài hiện tại chưa sinh phần nào.
     if not parts:
@@ -1739,8 +1939,6 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
             state["cache_reused"] = True
             _save_progress(post_id, state)
             _telegram_or_defer(post_id, f"♻️ Bài {post_id}: tái sử dụng Part 2–6 từ kho truyện; không gọi OpenAI.", state)
-    _story_t0 = time.time()
-    _need_write = not all(str(n) in parts for n in STORY_PARTS)
     # Lập dàn ý toàn truyện 1 lần trước Part 2 (lưu checkpoint, không lập lại).
     if not all(str(n) in parts for n in STORY_PARTS) and "story_plan" not in state:
         state["story_plan"] = call_openai_story_plan(caption) or ""
@@ -1763,9 +1961,6 @@ def _resume_story(page_name, post_id, caption, alert_text=""):
         _save_progress(post_id, state)  # atomic checkpoint immediately after success
 
     _cache_write(caption, parts)
-    if _need_write:
-        print(f"[STORY-TIME] {post_id}: viết xong dàn ý + {len(STORY_PARTS)} Part trong {(time.time() - _story_t0) / 60:.1f} phút "
-              f"| {sum(_word_count(parts[str(n)]) for n in STORY_PARTS)} từ | model={OPENAI_MODEL}", flush=True)
     story = "\n\n".join((
         ("=" * 60 + "\n\n" if n > 2 else "") + parts[str(n)] + "\n\n" + _ending_block(n)
         for n in STORY_PARTS
@@ -1847,6 +2042,7 @@ def _resume_finish(post_id, state):
             _page6_try_publish_once(post_id)
     story_completed.add(str(post_id))
     save_story_completed(story_completed)
+    _dash_progress(post_id, _load_progress(post_id), done=True)
     resolve_error_alert("story_resume_" + str(post_id), f"Bài {post_id} đã gửi đủ 3 file TXT.")
     resolve_error_alert(f"worker_{post_id}", f"Bài {post_id} đã xử lý xong.")
     print(f"[OPENAI] Bài {post_id}: đã hoàn tất Part 2/3/4, không tạo lại.")
@@ -1883,81 +2079,10 @@ def _web_part_title(base_title, n, page_number):
     return f"{prefix}{title}{page_number} {AUTHOR_CODE}"
 
 
-def _caption_web_title(caption, min_words=15, max_words=35):
-    """Tiêu đề chung trên web = 15–35 từ đầu của caption Facebook (Part 1).
-    Ưu tiên dừng ở cuối câu (15–35 từ); không được thì cắt ở dấu phẩy/chấm phẩy gần nhất, cuối cùng là 35 từ (không thêm "...")."""
-    lines = []
-    for line in str(caption or "").splitlines():
-        # Bỏ dòng mời đọc / CTA ngắn ở đầu caption ("👇 Read full story below", "Part 1"...).
-        if not lines and len(line.split()) <= 8 and re.search(
-                r"(?i)\b(read|full story|below|comments?|link|continue|part\s*\d+)\b|👇", line):
-            continue
-        lines.append(line)
-    text = re.sub(r"https?://\S+|www\.\S+", " ", " ".join(lines))
-    text = re.sub(r"#\w+", " ", text)
-    text = "".join(c if (c.isalnum() or c.isspace() or c in ".,;:!?'\"’‘“”-–—()&%$…") else " " for c in text)
-    text = re.sub(r"\s+", " ", text).strip(" -–—")
-    words = text.split()
-    if not words:
-        return ""
-    if len(words) <= max_words:
-        return text
-    head = words[:max_words]
-    # Dừng ở cuối câu gần mốc 35 từ nhất (nhưng >= 15 từ).
-    ends = [i for i, w in enumerate(head) if i + 1 >= min_words and re.search(r"[.!?…][\"”’)]*$", w)]
-    if ends:
-        return " ".join(head[:ends[-1] + 1])
-    commas = [i for i, w in enumerate(head) if i + 1 >= min_words and re.search(r"[,;:–—]$", w)]
-    cut = head[:commas[-1] + 1] if commas else head
-    # Không thêm "...": bỏ các từ nối/mạo từ treo ở cuối để tiêu đề kết thúc tự nhiên.
-    weak = {"a", "an", "the", "and", "or", "but", "so", "to", "of", "in", "on", "at", "for", "with", "from",
-            "by", "my", "his", "her", "their", "our", "your", "its", "that", "which", "who", "when", "as",
-            "about", "into", "than", "then", "because", "if", "while", "was", "were", "is", "had", "has", "be"}
-    while len(cut) > min_words and re.sub(r"[^a-z']", "", cut[-1].lower()) in weak:
-        cut = cut[:-1]
-    return " ".join(cut).rstrip(",;:–— ")
-
-
-def _part_heading(raw, part):
-    """Lấy dòng "Part n – Tên Part" do model viết; thiếu tên thì chỉ "Part n"."""
-    for line in str(raw or "").splitlines():
-        line = line.strip().strip("*# ")
-        if not line:
-            continue
-        m = re.match(r"(?i)^PART\s*%d(?:\s*\(THE END\))?\s*[:\-–—]\s*(.+)$" % part, line)
-        if m and m.group(1).strip():
-            return f"{_web_part_name(part)} – {m.group(1).strip()}"
-        break
-    return _web_part_name(part)
-
-
-def _web_part_name(part):
-    """Tên Part hiển thị trên web: Part cuối có (The End)."""
-    return f"Part {part} (The End)" if part == LAST_PART else f"Part {part}"
-
-
-def _story_text_without_heading(raw, part):
-    """Thân truyện không kèm dòng tiêu đề "Part n – ..." (tiêu đề được hiển thị riêng ở đầu bài web)."""
-    body = _story_body(raw, part)
-    lines = body.splitlines()
-    if lines and re.match(r"(?i)^\s*[*#]*\s*PART\s*%d\b" % part, lines[0]):
-        body = "\n".join(lines[1:]).strip()
-    return body
-
-
-def _web_heading_html(raw, part):
-    """Đầu mỗi bài web: "Part n – Tên Part" (đậm, lớn) rồi dòng "Part n" (đậm)."""
-    return (f"<h3><strong>{html.escape(_part_heading(raw, part))}</strong></h3>\n"
-            f"<p><strong>{_web_part_name(part)}</strong></p>\n")
-
-
 def _story_body(raw, part):
     raw = _strip_program_endings(raw)
     raw = re.sub(r"(?im)^\s*PART\s+%d(?:\s*\(THE END\))?\s*$" % part, "", raw).strip()
-    if part == 2:
-        lines = raw.splitlines()
-        if lines:
-            raw = "\n".join(lines[1:]).strip()
+    # Giữ nguyên dòng tiêu đề "Part n – Title" cho MỌI phần, kể cả Part 2 (trước đây Part 2 bị cắt mất tiêu đề).
     return raw
 
 
@@ -2332,7 +2457,7 @@ def publish_wordpress_story(post_id):
         state["web_linked"] = [2, 3, 4]
         _save_progress(post_id, state)
     if not state.get("web_links_telegram_sent"):
-        message = "\n".join(f"PART {n}: {records[str(n)]['url']}" for n in STORY_PARTS)
+        message = _link_lines({n: records[str(n)]["url"] for n in STORY_PARTS})
         if not all(records[str(n)].get("url") for n in STORY_PARTS):
             raise RuntimeError("WordPress thiếu link chương")
         if not send_telegram_message(message):
@@ -2429,6 +2554,8 @@ def _mask_secrets(text):
 def send_error_alert(error_key: str, text: str):
     """Mỗi lỗi chỉ báo MỘT lần khi phát sinh (kể cả sau restart). Gửi Telegram NGOÀI khóa để không treo bot."""
     key = str(error_key)
+    # Luôn đồng bộ lỗi lên dashboard (kể cả lỗi đang lặp lại/đã báo Telegram) để trang quản lý thấy nội dung mới nhất.
+    _dash_event("error", key=key, text=_mask_secrets(text)[:1000])
     with _ERROR_LOCK:
         if _error_status.get(key) in ("active", "legacy", "sending"):
             print(f"[LỖI-ĐÃ-BÁO] {key}: {_mask_secrets(text)[:300]}")
@@ -2457,8 +2584,10 @@ def resolve_error_alert(error_key: str, description: str = ""):
         if state == "legacy":
             _error_status.pop(key, None)
             _save_error_status()
+            _dash_event("resolved", key=key, text=_mask_secrets(description or key)[:500])
             return True
         _error_status[key] = "resolving"
+    _dash_event("resolved", key=key, text=_mask_secrets(description or key)[:500])
     now = datetime.now()
     ok = send_telegram_message(
         f"✅ ĐÃ KHẮC PHỤC: {_mask_secrets(description or key)}\n\nThời gian: {now.strftime('%H:%M:%S %d/%m/%Y')}")
@@ -2479,7 +2608,7 @@ def resolve_error_prefix(prefix: str, description: str):
 
 # ==================== CHI TIẾT LỖI FACEBOOK ====================
 _FB_ERROR_HINTS = {
-    190: "Token hết hạn hoặc không còn hợp lệ — lấy token mới và cập nhật USER_ACCESS_TOKEN.",
+    190: "Token hết hạn hoặc không còn hợp lệ — lấy token mới và cập nhật đúng biến token bị lỗi (USER_ACCESS_TOKEN hoặc USER_ACCESS_TOKEN_2).",
     102: "Phiên đăng nhập Facebook hết hạn — lấy token mới.",
     10: "Thiếu quyền — token chưa được cấp quyền cần thiết cho Page này.",
     200: "Thiếu quyền — tài khoản có thể không còn quyền quản lý Page này.",
@@ -2523,6 +2652,41 @@ def _fb_error_detail(resp=None, data=None):
     return " ".join(parts)
 
 
+def _fb_page_access_revoked(data):
+    """True nếu token KHÔNG còn quyền trên Page này (đã bị gỡ khỏi via / mất vai trò admin).
+    Đây là thao tác chủ động của quản trị via, KHÔNG phải sự cố -> bỏ qua Page, không báo lỗi."""
+    err = (data or {}).get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        return False
+    if err.get("error_subcode") == 492:
+        return True
+    msg = str(err.get("message") or "").lower()
+    return err.get("code") in (190, 200) and "administrator, editor, or moderator" in msg
+
+
+# Lỗi cấp TÀI KHOẢN/TOKEN (checkpoint, hết hạn, đổi mật khẩu, chưa xác minh, token thu hồi, app bị gỡ):
+# ảnh hưởng MỌI Page cùng lúc -> gộp báo 1 tin thay vì mỗi Page 1 tin.
+FB_ACCOUNT_ERR_KEY = "fb_account_token"
+_FB_ACCOUNT_SUBCODES = {458, 459, 460, 463, 464, 467}
+
+
+def _fb_account_level_error(data):
+    """True nếu lỗi nằm ở tài khoản/token (ảnh hưởng toàn bộ Page), không phải sự cố riêng 1 Page."""
+    err = (data or {}).get("error") if isinstance(data, dict) else None
+    if not isinstance(err, dict):
+        return False
+    sub = err.get("error_subcode")
+    if sub == 492:            # mất quyền 1 Page -> KHÔNG phải cấp tài khoản (đã bỏ qua riêng)
+        return False
+    if sub in _FB_ACCOUNT_SUBCODES:
+        return True
+    code = err.get("code")
+    msg = str(err.get("message") or "").lower()
+    if code == 190:           # OAuthException token lỗi (checkpoint, hết hạn, thu hồi…)
+        return True
+    return code == 200 and "access blocked" in msg
+
+
 def _page_label(page_id):
     page = next((p for p in (_managed_pages_cache.get("pages") or []) if str(p.get("id")) == str(page_id)), None)
     return f"{page.get('name')} ({page_id})" if page and page.get("name") else str(page_id)
@@ -2530,11 +2694,20 @@ def _page_label(page_id):
 
 # -------------------- Cảnh báo token sắp hết hạn --------------------
 def check_token_expiry():
+    """Kiểm tra hạn của từng token Meta (USER_ACCESS_TOKEN, USER_ACCESS_TOKEN_2, ...)."""
+    for var_name, token in USER_ACCESS_TOKENS:
+        if token:
+            _check_one_token_expiry(var_name, token)
+
+
+def _check_one_token_expiry(var_name="USER_ACCESS_TOKEN", token=None):
     """Tự hỏi Facebook token còn bao lâu hết hạn, cảnh báo nếu sắp hết."""
+    token = USER_ACCESS_TOKEN if token is None else token
+    sfx = "" if var_name == "USER_ACCESS_TOKEN" else "_" + var_name.rsplit("_", 1)[-1]  # token 1 giữ key cảnh báo cũ
     try:
         r = api_get(
             f"{GRAPH_URL}/debug_token",
-            params={"input_token": USER_ACCESS_TOKEN, "access_token": USER_ACCESS_TOKEN},
+            params={"input_token": token, "access_token": token},
         )
         data = r.json().get("data", {})
     except Exception as e:
@@ -2542,11 +2715,11 @@ def check_token_expiry():
         return
 
     if data.get("is_valid", True):
-        resolve_error_alert("token_invalid", "USER_ACCESS_TOKEN đã hợp lệ trở lại.")
+        resolve_error_alert("token_invalid" + sfx, f"{var_name} đã hợp lệ trở lại.")
     if not data.get("is_valid", True):
         send_error_alert(
-            "token_invalid",
-            "USER_ACCESS_TOKEN không còn hợp lệ (có thể đã hết hạn hoặc bị thu hồi)! "
+            "token_invalid" + sfx,
+            f"{var_name} không còn hợp lệ (có thể đã hết hạn hoặc bị thu hồi)! "
             "Hãy lấy token mới và cập nhật vào Railway Variables ngay.",
         )
         return
@@ -2558,14 +2731,14 @@ def check_token_expiry():
     expire_dt = datetime.fromtimestamp(expires_at)
     days_left = (expire_dt - datetime.now()).days
     if days_left > TOKEN_EXPIRY_WARNING_DAYS:
-        resolve_error_alert("token_expiry_warning", "USER_ACCESS_TOKEN đã được gia hạn.")
+        resolve_error_alert("token_expiry_warning" + sfx, f"{var_name} đã được gia hạn.")
     if days_left <= TOKEN_EXPIRY_WARNING_DAYS:
         send_error_alert(
-            "token_expiry_warning",
-            f"USER_ACCESS_TOKEN sắp hết hạn! Còn khoảng {days_left} ngày "
+            "token_expiry_warning" + sfx,
+            f"{var_name} sắp hết hạn! Còn khoảng {days_left} ngày "
             f"(hết hạn lúc {expire_dt.strftime('%H:%M %d/%m/%Y')}).\n"
             "Hãy lấy Long-Lived Token mới tại Graph API Explorer và cập nhật "
-            "vào Railway -> Variables -> USER_ACCESS_TOKEN.",
+            f"vào Railway -> Variables -> {var_name}.",
         )
 
 
@@ -2607,20 +2780,20 @@ def _adaptive_poll_seconds(views: int, comments: int) -> int:
     return POST_POLL_COLD_SECONDS
 
 
-def get_managed_pages():
-    """Lấy toàn bộ Page do via tổng USER_ACCESS_TOKEN quản lý."""
-    now_mono = time.monotonic()
-    cached = _managed_pages_cache.get("pages") or []
-    if cached and now_mono - float(_managed_pages_cache.get("at", 0)) < MANAGED_PAGES_CACHE_SECONDS:
-        return cached
+_managed_pages_by_token = {}  # lần lấy thành công gần nhất của từng token (dùng tạm khi token đó lỗi)
 
+
+def _fetch_pages_for_token(var_name, token):
+    """Lấy danh sách Page của 1 token. Trả (pages, ok)."""
+    sfx = "" if var_name == "USER_ACCESS_TOKEN" else "_" + var_name.rsplit("_", 1)[-1]  # token 1 giữ key cảnh báo cũ
     url = f"{GRAPH_URL}/me/accounts"
     params = {
         "fields": "id,name,access_token",
         "limit": 100,
-        "access_token": USER_ACCESS_TOKEN,
+        "access_token": token,
     }
     pages = []
+    ok = True
 
     while url:
         try:
@@ -2628,32 +2801,57 @@ def get_managed_pages():
             data = r.json()
         except Exception as e:
             note_fb_network_failure(
-                "get_managed_pages_network",
-                f"Không kết nối được Facebook để lấy danh sách Page: {e}",
+                "get_managed_pages_network" + sfx,
+                f"Không kết nối được Facebook để lấy danh sách Page ({var_name}): {e}",
             )
+            ok = False
             break
 
-        note_fb_network_success("get_managed_pages_network")
+        note_fb_network_success("get_managed_pages_network" + sfx)
 
         if "error" in data:
             detail = _fb_error_detail(data=data)
-            print(f"[LỖI] Không lấy được danh sách Page: {_mask_secrets(detail)}")
+            print(f"[LỖI] Không lấy được danh sách Page ({var_name}): {_mask_secrets(detail)}")
             send_error_alert(
-                "get_managed_pages",
-                f"Không lấy được danh sách Page từ USER_ACCESS_TOKEN.\n{detail}",
+                "get_managed_pages" + sfx,
+                f"Không lấy được danh sách Page từ {var_name}.\n{detail}",
             )
+            ok = False
             break
-        resolve_error_alert("get_managed_pages", "Đã lấy lại được danh sách Page Facebook.")
+        resolve_error_alert("get_managed_pages" + sfx, f"Đã lấy lại được danh sách Page Facebook ({var_name}).")
 
         pages.extend(data.get("data", []))
         url = data.get("paging", {}).get("next")
         params = None
+    return pages, ok
 
-    # Khử trùng Page ID nếu Facebook trả lặp qua pagination.
+
+def get_managed_pages():
+    """Lấy toàn bộ Page do via tổng USER_ACCESS_TOKEN (và USER_ACCESS_TOKEN_2... nếu có) quản lý."""
+    now_mono = time.monotonic()
+    cached = _managed_pages_cache.get("pages") or []
+    if cached and now_mono - float(_managed_pages_cache.get("at", 0)) < MANAGED_PAGES_CACHE_SECONDS:
+        return cached
+
+    multi = len(USER_ACCESS_TOKENS) > 1
+    pages = []
+    for var_name, token in USER_ACCESS_TOKENS:
+        got, ok = _fetch_pages_for_token(var_name, token)
+        if multi:
+            if ok:
+                _managed_pages_by_token[var_name] = got
+            elif _managed_pages_by_token.get(var_name):
+                # Token này lỗi tạm thời: dùng lại danh sách Page lần trước để không mất Page của via đó.
+                got = _managed_pages_by_token[var_name]
+                print(f"[FACEBOOK] {var_name} lỗi, tạm dùng {len(got)} Page đã lấy lần trước.")
+            print(f"[FACEBOOK] {var_name}: {len(got)} Page")
+        pages.extend(got)
+
+    # Khử trùng Page ID nếu Facebook trả lặp qua pagination (hoặc 2 token cùng quản lý 1 Page).
     unique = {}
     for page in pages:
         pid = str(page.get("id") or "")
-        if pid:
+        if pid and pid not in unique:
             unique[pid] = page
     pages = list(unique.values())
 
@@ -2663,7 +2861,7 @@ def get_managed_pages():
     _managed_pages_cache["pages"] = pages
     _managed_pages_cache["at"] = time.monotonic()
 
-    print(f"[FACEBOOK] Tổng Page từ USER_ACCESS_TOKEN: {len(pages)}")
+    print(f"[FACEBOOK] Tổng Page từ {'các token' if multi else 'USER_ACCESS_TOKEN'}: {len(pages)}")
     for p in pages:
         pid = str(p.get("id") or "")
         pname = p.get("name") or "(không tên)"
@@ -2689,8 +2887,23 @@ def get_recent_post_ids(page_id: str, page_token: str):
         except ValueError:
             data = None
         if r.status_code != 200 or not isinstance(data, dict) or "error" in data:
+            if _fb_page_access_revoked(data):
+                # Page bị gỡ khỏi via (admin chủ động) -> không coi là lỗi: reset bộ đếm, gỡ cảnh báo cũ nếu có.
+                _fb_network_failures[f"posts_{page_id}"] = 0
+                resolve_error_alert(f"posts_{page_id}",
+                                    f"Page {_page_label(page_id)}: đã gỡ khỏi via (không còn quyền) — bỏ qua, không tính là lỗi.")
+                print(f"[PAGE-SKIP] Page {_page_label(page_id)}: không còn quyền truy cập "
+                      f"(có thể đã bị gỡ khỏi via) -> bỏ qua, không coi là lỗi.", flush=True)
+                return found
+            if _fb_account_level_error(data):
+                # Lỗi cấp tài khoản/token: gộp 1 tin cho cả via thay vì mỗi Page 1 tin.
+                print(f"[FB-ACCOUNT] Page {_page_label(page_id)}: lỗi cấp tài khoản -> gộp báo chung.", flush=True)
+                note_fb_network_failure(FB_ACCOUNT_ERR_KEY,
+                                        f"Tài khoản Facebook gặp sự cố — tất cả Page không lấy được bài.\n{_fb_error_detail(r, data)}")
+                return found
             note_fb_network_failure(f"posts_{page_id}", f"Page {_page_label(page_id)}: không lấy được danh sách bài.\n{_fb_error_detail(r, data)}")
             return found
+        note_fb_network_success(FB_ACCOUNT_ERR_KEY, "Tài khoản Facebook đã truy cập lại bình thường — mọi Page lấy được bài trở lại.")
         note_fb_network_success(f"posts_{page_id}", f"Page {_page_label(page_id)} đã đọc được danh sách bài bình thường.")
         oldest = None
         for post in data.get("data", []):
@@ -3040,6 +3253,7 @@ def enqueue_story(page_name, post_id, message, page_id, page_token, alert_text, 
             return False
         _story_pending.add(post_id)
     STORY_QUEUE.put((page_name, post_id, message, page_id, page_token, alert_text, notified_key))
+    _dash_qualified(page_name, post_id, message, alert_text)
     return True
 
 def story_worker():
@@ -3523,6 +3737,8 @@ def check_all_pages():
                 # Có link thì chỉ SKIP. KHÔNG ghi vào already_notified nữa.
                 # notified phải chỉ mang nghĩa "Telegram alert thực sự đã được gửi".
                 print(f"[{ts}] [{page_name}] {post_id}: đã có link rồi, bỏ qua không báo.")
+                # Bài đã gắn link: không cần quét lại mỗi phút (tốn CPU/RAM/egress Railway), 30 phút xem lại 1 lần.
+                _post_next_check[str(post_id)] = time.monotonic() + LINKED_RECHECK_SECONDS
                 continue
 
             # Tới đây đã xác minh chắc chắn: bài đạt ngưỡng + CHƯA có link.
@@ -3536,9 +3752,6 @@ def check_all_pages():
                 progress = _load_progress(post_id)
                 has_saved_progress = bool(progress and (
                     progress.get("parts") or progress.get("sent") or progress.get("caption")
-                    # Bài đã qua worker của bản mới (đã báo / đang viết) dù AI lỗi chưa ra Part nào:
-                    # vẫn là checkpoint thật -> KHÔNG xóa notified, tránh báo "BÀI ĐANG LÊN" lặp lại mỗi vòng.
-                    or progress.get("alert_key") or progress.get("fb_caption") or "story_plan" in progress
                 ))
 
                 if has_saved_progress:
@@ -3697,6 +3910,12 @@ def _web_rejection(status, text):
         host = urlparse(WEB_BASE_URL).hostname
         return WebRejected(f"Website {host} đang bị Cloudflare chặn bot (trang 'Just a moment', HTTP {status}); "
                            f"chưa tạo bài, bot sẽ tự thử lại.", cloudflare=True)
+    if status in (521, 522, 523, 525, 526, 530):
+        # Cloudflare KHÔNG kết nối được tới máy chủ web (web sập/quá tải) -> request chưa tới web, chắc chắn chưa tạo bài.
+        # (Không gồm 520/524: khi đó request có thể đã tới web.)
+        host = urlparse(WEB_BASE_URL).hostname
+        return WebRejected(f"Website {host} đang sập/không phản hồi (Cloudflare HTTP {status}: không kết nối được máy chủ web); "
+                           f"chưa tạo bài, bot sẽ tự thử lại.")
     if 400 <= status < 500 and status not in (408, 409):
         body = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text or "")).strip()[:250]
         return WebRejected(f"BioBlog từ chối HTTP {status}: {body}")
@@ -3875,8 +4094,8 @@ def _page6_publish_chapter_batch(post_id, state):
         _save_progress(post_id, state)
     posts = state["page6_chapter_posts"]
     if not state.get("page6_api_links_sent") and not _links_deferred(post_id):
-        message = f"🧪 PAGE {_page6_number_for_post(post_id)} — BioBlog CHAPTER TEST\n" + "\n".join(
-            f"PART {n}: {posts[str(n)]['url']}" for n in STORY_PARTS)
+        message = f"🧪 PAGE {_page6_number_for_post(post_id)} — BioBlog CHAPTER TEST\n" + _link_lines(
+            {n: posts[str(n)]["url"] for n in STORY_PARTS})
         message += "\n⚠️ Kiểm tra nút Previous/Next trên giao diện BioBlog trước khi bật chính thức."
         if not send_telegram_message(message):
             raise RuntimeError("Gửi link Telegram chưa thành công")
@@ -3932,18 +4151,9 @@ def publish_page6_bioblog_test(post_id):
     _save_progress(post_id, state)
     posts = state["page6_api_posts"]
     base_title = _story_title(state["parts"]["2"])
-    slug_titles = {n: _web_part_title(base_title, n, page_number) for n in STORY_PARTS}
-    # Slug (link web) GIỮ NGUYÊN cách tạo cũ: theo tiêu đề Part, bỏ hậu tố AUTHOR_CODE (server ghép author vào slug cuối).
-    slugs = {n: _page6_permalink(slug_titles[n]) for n in STORY_PARTS}
-    # Tiêu đề HIỂN THỊ chung cho mọi Part = 15–35 từ đầu caption Facebook + mã NV (chỉ đổi chữ hiển thị, không đổi link).
-    # Bài đã đăng dở bằng bản cũ thì giữ tiêu đề cũ cho đồng bộ.
-    if "web_display_title" not in state:
-        started = any((posts.get(str(n)) or {}) for n in STORY_PARTS)
-        caption_title = "" if started else _caption_web_title(state.get("fb_caption") or state.get("caption", ""))
-        state["web_display_title"] = f"**{caption_title}** {AUTHOR_CODE}" if caption_title else ""  # ** ** cho nổi bật
-        _save_progress(post_id, state)
-    display_title = state.get("web_display_title") or ""
-    titles = {n: (display_title or slug_titles[n]) for n in STORY_PARTS}
+    titles = {n: _web_part_title(base_title, n, page_number) for n in STORY_PARTS}
+    # Slug nguồn như bản đầu: theo tiêu đề, bỏ hậu tố AUTHOR_CODE (server ghép author vào slug cuối).
+    slugs = {n: _page6_permalink(titles[n]) for n in STORY_PARTS}
     if len(set(slugs.values())) != len(STORY_PARTS):
         raise RuntimeError("Trùng permalink giữa các Part")
 
@@ -3969,11 +4179,7 @@ def publish_page6_bioblog_test(post_id):
         print(f"[PAGE6-TEST] {post_id}: đã xử lý ảnh đại diện dùng chung các Part")
 
     def _base_body(n):
-        raw = state["parts"][str(n)]
-        if display_title:
-            return (_web_heading_html(raw, n) + _to_html(_story_text_without_heading(raw, n))
-                    + "\n" + _to_html(_ending_block(n)))
-        return _to_html(_story_body(raw, n)) + "\n" + _to_html(_ending_block(n))
+        return _to_html(_story_body(state["parts"][str(n)], n)) + "\n" + _to_html(_ending_block(n))
 
     # Tạo theo thứ tự Part 2 -> 3 -> 4, mỗi bài gửi prev_chapter = slug bài trước (API hỗ trợ).
     for n in STORY_PARTS:
@@ -3982,9 +4188,8 @@ def publish_page6_bioblog_test(post_id):
             continue
         if posts.get(k, {}).get("request_started"):
             raise RuntimeError(f"Part {n} đã gọi POST nhưng chưa rõ kết quả; kiểm tra thủ công trước khi tiếp tục")
-        # Gửi prev_chapter = slug Part trước để web hiện nút Previous/Next (tắt bằng WEB_LINK_CHAPTERS=false).
-        prev_slug = (posts[str(n - 1)].get("slug") or "") if (n > 2 and WEB_LINK_CHAPTERS) else ""
-        if n > 2 and WEB_LINK_CHAPTERS and not prev_slug:
+        prev_slug = posts[str(n - 1)]["slug"] if n > 2 else ""
+        if n > 2 and not prev_slug:
             raise RuntimeError(f"Part {n-1} thiếu slug để làm prev_chapter")
         # Link chữ PREVIOUS/NEXT cuối bài (như "PREVIOUS: PART 2 | NEXT: PART 4(THE END)"):
         # Part đã tạo thì dùng link thật, Part chưa tạo thì dùng link đoán trước theo quy tắc slug.
@@ -4016,7 +4221,6 @@ def publish_page6_bioblog_test(post_id):
     # Chuỗi chương do SERVER tự đồng bộ 2 chiều: gửi prev_chapter=slug bài trước khi tạo thì bài trước
     # tự có next_chapter trỏ lại (theo tài liệu API). Không cần PUT admin nữa.
     _page6_check_author(post_id, posts["2"])
-    _page6_detach_series(post_id, state, titles, image_url, _base_body)
 
     # Chỉ gửi MỘT tin Telegram chứa đủ 3 URL sau khi tạo và nối chương xong.
     # Lưu checkpoint để retry/redeploy không gửi lại.
@@ -4040,60 +4244,6 @@ def publish_page6_bioblog_test(post_id):
             state["page6_422_recovery_notified"] = True
             _save_progress(post_id, state)
     return True
-
-# Website tự gom các Part nối chương (prev_chapter) thành 1 "series". Sau khi đăng đủ, bot sửa từng Part qua trang
-# quản trị: GIỮ prev/next (nút ← Previous / Next →) nhưng gỡ series (series_id = trống), giống thao tác sửa tay.
-# Cần WEB_ADMIN_EMAIL + WEB_ADMIN_PASSWORD. Railway WEB_DETACH_SERIES=false để tắt.
-WEB_DETACH_SERIES = os.getenv("WEB_DETACH_SERIES", "true").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _page6_series_of(slug):
-    """Đọc (chỉ đọc) bài theo slug, trả series nếu API có trả về; None nếu không có/không đọc được."""
-    try:
-        resp = requests.get(WEB_BASE_URL + "/api/posts/" + str(slug).lstrip("/"),
-            headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN, "Accept": "application/json"}, timeout=40)
-        obj = resp.json() if resp.status_code == 200 else {}
-    except (requests.RequestException, ValueError):
-        return None
-    data = obj.get("data", obj) if isinstance(obj, dict) else {}
-    if isinstance(data, dict) and isinstance(data.get("post"), dict):
-        data = data["post"]
-    if not isinstance(data, dict):
-        return None
-    return data.get("series_id") or data.get("series") or None
-
-
-def _page6_detach_series(post_id, state, titles, image_url, base_body):
-    """Gỡ series web tự tạo, giữ nguyên liên kết chương. Lỗi không chặn thông báo/link (chỉ báo 1 lần)."""
-    if (not WEB_DETACH_SERIES or not WEB_LINK_CHAPTERS or state.get("page6_series_detached")
-            or not WEB_ADMIN_EMAIL or not WEB_ADMIN_PASSWORD):
-        return
-    posts = state["page6_api_posts"]
-    actual = {m: posts[str(m)]["url"] for m in STORY_PARTS}
-    try:
-        session = _web_login()
-        for n in STORY_PARTS:
-            rec = posts[str(n)]
-            if not rec.get("id"):
-                rec["id"] = _page6_bioblog_lookup_id(rec["slug"])
-                _save_progress(post_id, state)
-            _web_update_chapter(session, rec, titles[n], base_body(n) + "\n" + _page6_navigation(n, actual), image_url,
-                                prev_slug=posts[str(n - 1)]["slug"] if n > 2 else "",
-                                next_slug=posts[str(n + 1)]["slug"] if n < LAST_PART else "")
-        state["page6_series_detached"] = True
-        _save_progress(post_id, state)
-        left = _page6_series_of(posts[str(STORY_PARTS[0])]["slug"])
-        print(f"[SERIES] {post_id}: đã gỡ series, giữ nút Previous/Next"
-              + (f" — CẢNH BÁO: web vẫn báo series={left!r}" if left else ""), flush=True)
-        resolve_error_alert("web_detach_series", "Gỡ series tự tạo trên web đã hoạt động lại.")
-    except Exception as exc:
-        print(f"[SERIES] {post_id}: chưa gỡ được series: {exc}", flush=True)
-        send_error_alert("web_detach_series",
-                         f"Bài {post_id}: đã đăng đủ Part (có nút Previous/Next) nhưng chưa gỡ được series web tự tạo: "
-                         f"{str(exc)[:200]}. Link truyện vẫn dùng bình thường; có thể gỡ series tay trong trang quản trị.")
-        state["page6_series_detached"] = True  # không thử lại liên tục; bài vẫn đọc bình thường
-        _save_progress(post_id, state)
-
 
 def _page6_fix_text_nav(post_id, state, titles, image_url, base_body):
     """Đối chiếu link PREVIOUS/NEXT đã chèn với link thật. Nếu web đặt slug khác dự đoán (ví dụ trùng tên),
@@ -4119,8 +4269,8 @@ def _page6_fix_text_nav(post_id, state, titles, image_url, base_body):
                 if not rec.get("id"):
                     rec["id"] = _page6_bioblog_lookup_id(rec["slug"])
                 _web_update_chapter(session, rec, titles[n], base_body(n) + "\n" + _page6_navigation(n, actual), image_url,
-                                    prev_slug=posts[str(n - 1)]["slug"] if (n > 2 and WEB_LINK_CHAPTERS) else "",
-                                    next_slug=posts[str(n + 1)]["slug"] if (n < LAST_PART and WEB_LINK_CHAPTERS) else "")
+                                    prev_slug=posts[str(n - 1)]["slug"] if n > 2 else "",
+                                    next_slug=posts[str(n + 1)]["slug"] if n < LAST_PART else "")
                 rec["nav_used"] = {str(m): actual[m] for m in STORY_PARTS if m != n}
                 _save_progress(post_id, state)
         except Exception as exc:
@@ -4147,6 +4297,77 @@ def _page6_try_publish_once(post_id):
     finally:
         with _web_publishing_mutex:
             _web_publishing_now.discard(str(post_id))
+
+
+def _page6_reconcile_unknown(post_id, state):
+    """Bài bị khóa vì 'chưa rõ kết quả' (HTTP 502/504/520/524 / timeout): GET /api/posts/{slug dự đoán} (chỉ đọc).
+    404 hai lần (cách nhau >= 5 phút, lần đầu sau >= 10 phút) -> gỡ khóa đăng lại; 200 -> nhận bài đã có. Trả True nếu đã gỡ khóa."""
+    reason = str(state.get("page6_test_blocked", ""))
+    if not (re.search(r"BioBlog HTTP (502|504|520|524)\b", reason) or "timed out" in reason.lower() or "timeout" in reason.lower()):
+        return False
+    posts = state.get("page6_api_posts") or {}
+    pending = [k for k, r in posts.items() if r.get("request_started") and not r.get("url")]
+    if len(pending) != 1 or not (state.get("parts") or {}).get("2"):
+        return False
+    k = pending[0]
+    try:
+        started = datetime.fromisoformat(str(posts[k].get("started_at"))).timestamp()
+    except Exception:
+        started = 0
+    now = time.time()
+    if now - started < 600 or now < float(state.get("page6_reconcile_after", 0)):
+        return False
+    try:
+        base_title = _story_title(state["parts"]["2"])
+        permalink = _page6_permalink(_web_part_title(base_title, int(k), _page6_number_for_post(post_id)))
+        slug = _bioblog_predicted_url(permalink).rsplit("/blog/", 1)[1]
+        resp = requests.get(WEB_BASE_URL + "/api/posts/" + slug,
+            headers={"Authorization": "Bearer " + BIOBLOG_API_TOKEN, "Accept": "application/json"}, timeout=40)
+    except Exception as exc:
+        print(f"[PAGE6-RECONCILE] {post_id}: chưa kiểm tra được Part {k} ({exc}); thử lại sau", flush=True)
+        state["page6_reconcile_after"] = now + 300
+        _save_progress(post_id, state)
+        return False
+    if resp.status_code == 200:
+        try:
+            obj = resp.json()
+        except ValueError:
+            obj = {}
+        data = obj.get("data", obj) if isinstance(obj, dict) else {}
+        if isinstance(data, dict) and isinstance(data.get("post"), dict):
+            data = data["post"]
+        web_title = str(data.get("title") or "").strip() if isinstance(data, dict) else ""
+        want_title = _web_part_title(base_title, int(k), _page6_number_for_post(post_id))
+        if web_title and _page6_permalink(web_title) != _page6_permalink(want_title):
+            print(f"[PAGE6-RECONCILE] {post_id}: slug {slug!r} trên web là bài khác ({web_title[:80]!r}); giữ khóa, kiểm tra tay", flush=True)
+            state["page6_reconcile_after"] = now + 3600
+            _save_progress(post_id, state)
+            return False
+        real_slug = (data.get("slug") if isinstance(data, dict) else None) or slug
+        posts[k] = {"id": (data.get("postId") or data.get("post_id") or data.get("id")) if isinstance(data, dict) else None,
+                    "slug": real_slug, "url": WEB_BASE_URL + "/blog/" + str(real_slug).lstrip("/"),
+                    "author_sent": BIOBLOG_AUTHOR_USERNAME, "permalink_sent": permalink, "reconciled": True}
+        print(f"[PAGE6-RECONCILE] {post_id}: Part {k} ĐÃ có trên web ({posts[k]['url']}) -> dùng bài này, không tạo lại", flush=True)
+    elif resp.status_code == 404:
+        if not state.get("page6_reconcile_404"):
+            state["page6_reconcile_404"] = now  # xác nhận lần 2 sau 5 phút cho chắc
+            state["page6_reconcile_after"] = now + 300
+            _save_progress(post_id, state)
+            print(f"[PAGE6-RECONCILE] {post_id}: Part {k} chưa thấy trên web; kiểm tra lại sau 5 phút", flush=True)
+            return False
+        posts.pop(k, None)
+        print(f"[PAGE6-RECONCILE] {post_id}: Part {k} không có trên web (đã kiểm tra 2 lần) -> đăng lại", flush=True)
+    else:
+        state["page6_reconcile_after"] = now + 300
+        _save_progress(post_id, state)
+        print(f"[PAGE6-RECONCILE] {post_id}: web trả HTTP {resp.status_code} khi kiểm tra Part {k}; thử lại sau 5 phút", flush=True)
+        return False
+    state.pop("page6_test_blocked", None)
+    state.pop("page6_reconcile_404", None)
+    state.pop("page6_reconcile_after", None)
+    _save_progress(post_id, state)
+    resolve_error_alert(f"web_publish_unknown_{post_id}", f"Bài {post_id}: đã tự đối chiếu với web, tiếp tục đăng.")
+    return True
 
 
 def _page6_try_publish_once_unlocked(post_id):
@@ -4178,6 +4399,12 @@ def _page6_try_publish_once_unlocked(post_id):
             state.pop("page6_test_blocked", None)
             _save_progress(post_id, state)
             print(f"[PAGE6-RECOVERY] {post_id}: gỡ khóa do web từ chối (HTTP {_m.group(1)}); sẽ đăng tiếp", flush=True)
+    if state.get("page6_test_blocked"):
+        # Khóa do web trả 520/524 hoặc timeout (yêu cầu CÓ THỂ đã tới web): tự đối chiếu trên web (chỉ đọc)
+        # sau >= 10 phút. Không thấy bài -> chắc chắn chưa tạo, mở khóa đăng tiếp; thấy bài -> dùng bài đó, không tạo lại.
+        _reconciled = _page6_reconcile_unknown(post_id, state)
+        if _reconciled:
+            state = _load_progress(post_id)
     if state.get("page6_test_blocked"):
         # Khóa cũ do lỗi XẢY RA TRƯỚC KHI gọi POST tạo bài (ví dụ web 500 lúc tải ảnh) thì chưa có bài nào -> mở khóa, đăng lại.
         _recs = state.get("page6_api_posts") or {}
@@ -4280,53 +4507,8 @@ def page6_test_recovery_worker():
         time.sleep(60)
 
 
-def _ai_selftest():
-    """Khi dùng nhà cung cấp AI khác OpenAI: gửi 1 câu thử ngắn theo vài cách gọi, tự chọn cách CHẠY ĐƯỢC.
-    In rõ phản hồi của server vào Deploy Logs để biết lỗi nằm ở đâu (key / model / kiểu API / reasoning)."""
-    global OPENAI_API_STYLE, _REASONING, _reasoning_extra, OPENAI_MAX_OUTPUT_TOKENS, _PLAN_REASONING, _plan_extra
-    if not OPENAI_API_KEY:
-        return
-    host = urlparse(OPENAI_BASE_URL).hostname or ""
-    if host == "api.openai.com" and os.getenv("OPENAI_SELFTEST", "").strip().lower() not in ("1", "true", "yes", "on"):
-        return
-    other = "chat" if OPENAI_API_STYLE == "responses" else "responses"
-    combos = [(OPENAI_API_STYLE, _REASONING), (other, _REASONING)]
-    if _REASONING:
-        combos += [(OPENAI_API_STYLE, {}), (other, {})]
-    saved = (OPENAI_API_STYLE, _REASONING)
-    report = []
-    for style, reasoning in combos:
-        OPENAI_API_STYLE, _REASONING = style, reasoning
-        label = f"API={style} reasoning={reasoning.get('reasoning_effort', 'off')}"
-        try:
-            resp = _ai_request("Reply with exactly one word: OK", 64 + (3000 if reasoning else 0))
-            data = resp.json() if resp.status_code == 200 else {}
-            choice = ((data.get("choices") or [{}])[0]) if isinstance(data, dict) else {}
-            text = str((choice.get("message") or {}).get("content") or "").strip()
-            raw = str(getattr(resp, "text", ""))[:300]
-        except Exception as exc:
-            text, raw, resp = "", f"lỗi mạng: {exc}", None
-        code = getattr(resp, "status_code", "-")
-        print(f"[AI-TEST] {label} -> HTTP {code} | trả lời={text[:40]!r} | server: {raw}", flush=True)
-        report.append(f"• {label}: HTTP {code} — {text[:30] or raw[:160]}")
-        if text:
-            _reasoning_extra = _REASONING_EXTRA.get(reasoning.get("reasoning_effort", "off"), 9000) if reasoning else 0
-            OPENAI_MAX_OUTPUT_TOKENS = 5500 + _reasoning_extra
-            if not reasoning:  # server không nhận reasoning -> dàn ý cũng không gửi
-                _PLAN_REASONING, _plan_extra = {}, 0
-            print(f"[AI-TEST] ✅ Dùng cách gọi: {label}", flush=True)
-            resolve_error_alert("ai_selftest_failed", f"AI viết truyện đã gọi được ({label}).")
-            return
-    OPENAI_API_STYLE, _REASONING = saved
-    send_error_alert("ai_selftest_failed",
-                     f"Không gọi được AI viết truyện ({host}, model={OPENAI_MODEL}) bằng mọi cách thử:\n"
-                     + "\n".join(report)
-                     + "\n👉 Kiểm tra: key còn hạn (trang check), tên model đúng như trang hướng dẫn, gói có model này.")
-
-
 def main():
     print("Bắt đầu theo dõi bài viết trên tất cả các Page... (Ctrl+C để dừng)")
-    _ai_selftest()
     # Không gắn Railway Volume vào /data thì mỗi lần deploy mất hết trạng thái -> báo trùng, nhắc trùng.
     if not os.path.ismount("/data"):
         print("[DATA-WARN] /data KHÔNG phải Railway Volume: mỗi lần deploy sẽ quên bài đã báo.", flush=True)
@@ -4335,13 +4517,10 @@ def main():
                               "Sửa: Railway → service → Settings/Volumes → Add Volume, Mount path: /data")
     if PUBLISH_PLATFORM == "wordpress":
         threading.Thread(target=_wp_repair_requested_once, name="wp-repair", daemon=True).start()
+    start_dashboard_reporter()
     for _i in range(STORY_WORKERS):
         threading.Thread(target=story_worker, name=f"story-worker-{_i + 1}", daemon=True).start()
     print(f"[CONFIG] Số luồng viết truyện song song: {STORY_WORKERS}", flush=True)
-    if _IGNORED_AI_ENV:
-        print(f"[CONFIG] Bỏ qua biến Railway {', '.join(_IGNORED_AI_ENV)} — AI cố định trong code (OpenAI {OPENAI_MODEL}). "
-              f"Có thể xóa các biến này.", flush=True)
-    print(f"[CONFIG] AI viết truyện: {urlparse(OPENAI_BASE_URL).hostname} | model={OPENAI_MODEL} | API={OPENAI_API_STYLE}{' (stream)' if _RESP_ADAPT['stream'] and OPENAI_API_STYLE == 'responses' else ''} | reasoning={_REASONING.get('reasoning_effort', 'off')} (dàn ý: {_PLAN_REASONING.get('reasoning_effort', 'off')}) | giới hạn {OPENAI_MAX_OUTPUT_TOKENS} token/Part", flush=True)
     if ENABLE_PAGE6_WEB_TEST:
         threading.Thread(target=page6_test_recovery_worker, name="page6-web-test", daemon=True).start()
     while True:
